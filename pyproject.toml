@@ -1,0 +1,40 @@
+[project]
+name = "swarmd"
+version = "0.1.0"
+description = "Multi-agent orchestration runtime: staged pipelines, checkpoint/resume recovery, quality gates, durable HITL, full tracing."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "Arsh Zakee Chowhan" }]
+dependencies = [
+    # Phase 1 core is asyncio stdlib. Added per phase, each justified in an ADR:
+    # Phase 2: httpx, asyncpg | Phase 4: none beyond stdlib for mock provider
+    # Phase 6: opentelemetry-sdk, prometheus-client
+]
+
+[project.scripts]
+swarmd = "swarmd.cli:main"
+
+[project.optional-dependencies]
+otel = ["opentelemetry-sdk>=1.25", "opentelemetry-exporter-otlp>=1.25"]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.5",
+    "mypy>=1.10",
+]
+
+[build-system]
+requires = ["uv_build>=0.7,<1.0"]
+build-backend = "uv_build"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.mypy]
+strict = true
