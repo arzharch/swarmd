@@ -73,6 +73,77 @@ reversible → decision block here; one-way door → ADR.
 
 ---
 
+## 2026-08-25 · Kernel core + LLM provider layer
+
+- **Kernel:** Event bus, Task/Checkpoint models, agent lifecycle state machine,
+  priority scheduler, and the runtime worker pool with lease-based recovery —
+  all committed individually with tests (36 passing).
+
+  DECISION: lease/heartbeat requeue modeled on Kafka consumer-group leases +
+  Temporal's event-sourced replay
+  ALTERNATIVES: whole-task retries on failure · central dispatcher reassignment
+  WHY THIS: checkpoint-at-step-boundary + lease expiry means completed work is
+  never redone and dead agents are detected without any health-check chatter;
+  replacement agents skip completed steps deterministically.
+  TRADE-OFF ACCEPTED: a lease that's too short can double-execute an in-flight
+  step; mitigated by requiring steps to be idempotent-by-construction (their
+  outputs live in checkpoints keyed by step name).
+
+  DECISION: workers respawn automatically when killed (pool size invariant)
+  ALTERNATIVES: let pool shrink · require manual restart
+  WHY THIS: chaos kills mid-run must not degrade capacity; the reaper loop
+  replaces dead workers each tick, keeping `concurrency` alive.
+  TRADE-OFF ACCEPTED: slight complexity in `_reap_loop`; worth it because
+  recovery-without-replacement isn't recovery.
+
+  DECISION: AgentHandle state resets per task (worker persists, agent instance
+  is per-task)
+  ALTERNATIVES: one handle per worker lifetime with DONE as terminal
+  WHY THIS: terminal states make illegal transitions loud, but a long-lived
+  worker must be able to start fresh work after finishing a task; separating
+  "worker process" from "agent instance" keeps both properties.
+  TRADE-OFF ACCEPTED: two concepts where one might do; documented in agent.py.
+
+- **LLM providers:** Provider interface + deterministic MockProvider +
+  OpenRouter adapter restricted to free models (`:free` suffix) with a
+  health-sorted fallback chain, plus FallbackRouter across providers. httpx added.
+
+  DECISION: OpenRouter free-model chain with mock as last resort
+  ALTERNATIVES: single model · paid models with budget caps
+  WHY THIS: free-tier models keep demo costs at zero; the chain gives real
+  resilience (rate limits/outages on one free model fall through to the next);
+  mock last-resort guarantees the pipeline never hard-fails in demos.
+  TRADE-OFF ACCEPTED: free models have lower rate limits and quality variance;
+  acceptable for a resume project where correctness of orchestration, not model
+  IQ, is the product.
+
+  ANATOMY: temperature (LLMRequest.temperature, default 0.7)
+    Controls sampling randomness. Low (~0.2) = near-deterministic output, right
+    for extraction/QA stages where verifiers need reproducible pass/fail; high
+    (~0.9) = diverse output for draft ideation. The mock provider buckets it into
+    its hash so different temperatures yield different deterministic outputs —
+    mirroring how real models behave without costing anything.
+
+  ANATOMY: max_tokens (LLMRequest.max_tokens, default 512)
+    Hard cap on response length. Bounds cost and latency; too low truncates
+    structured JSON outputs mid-field (which verifiers then catch), too high
+    wastes tokens on rambling. 512 fits our stage outputs comfortably.
+
+  ANATOMY: OPENROUTER_API_KEY (env var)
+    Auth for the OpenRouter adapter. Absent key -> OpenRouterProvider refuses to
+    construct (fail fast) but make_router("openrouter") degrades gracefully to
+    mock so demos never crash.
+
+### Gate evidence
+
+```
+tests/kernel: 26 passed · tests/router: 10 passed · ruff clean · mypy strict clean
+Kill-and-resume proven: kill agent mid-step → lease expires → task requeued WITH
+checkpoint → replacement skips completed steps → output identical to clean run.
+```
+
+---
+
 ## Next up
 
 - [x] Phase 1.1: toolchain bring-up — git init, uv lock, venv sync, .gitignore

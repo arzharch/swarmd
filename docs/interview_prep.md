@@ -57,25 +57,93 @@ A: Approval is a durable pipeline state (AWAITING_APPROVAL), not an in-memory ca
 Kill the process at review time, restart, state is intact; approve/reject via CLI; every
 decision audited. And outreach never auto-sends — that's a hard product boundary.
 
-## Section 2: Phase 1 — Kernel (populate as you build)
+## Section 2: Kernel (answered as built)
 
 **Q: Walk me through the checkpoint contract.**
-A: (to fill — what's in a checkpoint, how resume skips steps deterministically)
+A: Every agent task is a list of named steps. After each step completes, the runtime
+saves a Checkpoint — an ordered list of completed step names plus each step's output,
+with a schema_version so old on-disk checkpoints are rejected rather than silently
+misread. The checkpoint is advanced purely (with_step returns a new object), persisted
+BEFORE the next step starts, and the claim's lease is refreshed at the same moment.
+Resume = load checkpoint, skip every step already in completed_steps, continue from the
+first missing one. Because steps are pure functions of (checkpoint data, task payload),
+the skip is deterministic: same inputs, same outputs, no double side effects.
 
 **Q: How does heartbeat expiry avoid double-processing?**
-A: (to fill — atomic claims, lease timing, idempotent effects)
+A: Each claimed task has a lease (`expires_at`). The worker refreshes it after every
+step; a reaper loop expires claims whose deadline passed and requeues them with their
+checkpoint intact. Double-processing is possible only if a worker is slow-but-alive
+past its lease while another claims the work — so the lease must exceed worst-case
+step duration. Even then, effects stay idempotent because step outputs are keyed by
+step name in the checkpoint: the slower writer's result simply overwrites the faster
+one's identical value. This mirrors Kafka consumer-group leases and Temporal's replay.
 
-## Section 3: Phase 2 — Pipeline & harnesses (populate as you build)
+**Q: What happens when an agent is killed mid-run?**
+A: Three mechanisms engage: (1) the cancelled worker's claim stays registered until
+its lease expires — exactly like a crashed process leaving a stale lock; (2) the
+reaper requeues the task with its checkpoint and emits TASK_REQUEUED; (3) the reaper
+also notices the dead worker and respawns one to keep pool size at `concurrency`.
+Tests prove the final output equals a clean run's output byte-for-byte.
+
+**Q: Why an explicit state machine for agent lifecycle instead of flags?**
+A: Illegal transitions raise immediately (SPAWNED→DONE, DONE→anything), turning "how
+did it get into that state?" debugging sessions into loud test failures. KILLED vs
+FAILED is semantic, not cosmetic: KILLED means external force mid-work → requeue
+expected; FAILED means the agent exhausted retries → dead-letter path.
+
+**Q: Why did you hand-roll the scheduler instead of using Celery/asyncio primitives?**
+A: The scheduler IS the product. A min-heap over (priority, seq) tuples gives priority
+ordering with FIFO fairness within a priority level; an asyncio.Semaphore gives bounded
+capacity with blocking backpressure (producers wait rather than drop work). That's ~60
+auditable lines of stdlib. Celery brings a broker, serialization boundaries, and ops
+overhead that would obscure the recovery story this project exists to demonstrate.
+
+## Section 3: LLM providers & routing
+
+**Q: How do you handle LLM provider failures?**
+A: Two layers of fallback. Inside OpenRouterProvider, models are tried in health-sorted
+order — an EWMA error score with recency weighting demotes failing models for future
+requests automatically. Across providers, FallbackRouter tries each provider's whole
+chain before giving up. Typical production config: [OpenRouter free chain, Mock] —
+real model first, deterministic guarantee last, so the pipeline never hard-fails.
+
+**Q: Why free models only on OpenRouter?**
+A: Cost control by construction rather than by policy: every default model ends in
+":free", enforced by a test. For this project's purpose — demonstrating orchestration
+correctness under chaos — model IQ variance matters less than zero marginal cost and
+unlimited CI runs. Paid models would add budget plumbing without strengthening the
+core story.
+
+**Q: Why is the mock provider deterministic, and why does that matter?**
+A: Response text is derived from a SHA-256 hash of (prompt, temperature bucket) — same
+input, same output, forever. This makes chaos-test integrity hashes comparable across
+runs (a requirement for the Phase gate: chaos run output == clean run output), makes
+tests free and hermetic, and lets me demo offline. Real providers can't offer this;
+that's precisely why the interface abstracts them.
+
+**Q: What does temperature actually do, and what do you set it to?**
+A: It scales how randomly the model samples next tokens. Near 0 the model becomes
+near-deterministic — right for extraction/QA where verifiers need reproducible
+pass/fail decisions. Higher values trade determinism for diversity — right for draft
+ideation. We default 0.7 for drafts and would pin ~0.2 for verifier stages. The mock
+provider buckets temperature into its hash so tests exercise different-temperature
+paths deterministically.
+
+**Q: max_tokens — why cap it?**
+A: Bounds latency and cost per call. Too low truncates structured JSON mid-field
+(which downstream verifiers catch as schema failures); too high wastes tokens on
+rambling. 512 comfortably fits our stage outputs.
+
+
+## Section 4: Pipeline & harnesses (populate as built)
 
 **Q: What exactly is a harness vs an agent vs a stage?**
 A: (to fill — harness = toolset+prompt+loop policy; agent = running instance; stage = pool + verifier + policy)
 
-## Section 4: Phase 3 — Quality & HITL (populate as you build)
-
 **Q: What happens when a verifier is wrong?**
 A: (to fill — dead-letter visibility, repair loop bounds, supervisor escalation)
 
-## Section 5: Phase 4 — Model routing (populate as you build)
+## Section 5: Semantic cache & budgets (populate as built)
 
 **Q: How does semantic caching avoid wrong hits?**
 A: (to fill — threshold choice, false-hit cost analysis)
