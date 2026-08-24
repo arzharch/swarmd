@@ -238,7 +238,7 @@ class Runtime:
             if step_name in cp.completed_steps:
                 continue  # deterministic skip: work already done pre-kill
             fn = self._step_fns[(task_type, step_name)]
-            step_input = cp.data.get(step_name)
+            step_input: Any = cp.data.get(step_name)
             output = await fn(step_input, task.payload)
             cp = cp.with_step(step_name, output)
             handle.save_checkpoint(cp)
