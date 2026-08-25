@@ -41,5 +41,6 @@ def test_postgres_store_constructs_without_network() -> None:
     """Lazy connect: construction must not touch the network."""
     from swarmd.harnesses.store import PostgresStore
 
-    store = PostgresStore("postgres://user:pw@localhost:5432/db")
+    # Port 5434 = swarmd's compose mapping; never the shared 5432/5433.
+    store = PostgresStore("postgres://user:pw@localhost:5434/db")
     assert store._pool is None

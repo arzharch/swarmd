@@ -76,6 +76,13 @@ def main(argv: list[str] | None = None) -> int:
         "the drop-in format Langfuse-style observability backends ingest. "
         "Combine with OTel for dual-backend tracing.",
     )
+    leadops.add_argument(
+        "--otel",
+        action="store_true",
+        help="export spans to OpenTelemetry (Jaeger at localhost:4318 via "
+        "docker compose up jaeger). Needs the otel extra; degrades to a warning "
+        "without it.",
+    )
 
     approve = sub.add_parser("approve", help="approve a pending draft (HITL)")
     approve.add_argument("request_id")
@@ -111,10 +118,21 @@ def main(argv: list[str] | None = None) -> int:
         router = make_router(args.provider)
 
         trace_sink = None
+        sinks = []
         if args.trace_jsonl:
             from swarmd.observability.tracing import JsonlTraceSink
 
-            trace_sink = JsonlTraceSink(args.trace_jsonl)
+            sinks.append(JsonlTraceSink(args.trace_jsonl))
+        if getattr(args, "otel", False):
+            from swarmd.observability.otel_bridge import make_sink
+
+            sinks.append(make_sink("otel"))
+        if len(sinks) > 1:
+            from swarmd.observability.tracing import CompositeSink
+
+            trace_sink = CompositeSink(*sinks)
+        elif sinks:
+            trace_sink = sinks[0]
 
         pipe = LeadOpsPipeline(router, trace_sink=trace_sink)
         leads = load_leads()[: args.limit]

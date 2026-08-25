@@ -33,4 +33,7 @@ services:
       POSTGRES_PASSWORD: swarmd_dev
       POSTGRES_DB: leadops
     ports:
-      - "5432:5432"
+      # Host port 5434 (NOT the default 5432/5433) so swarmd never collides with
+      # other projects' Postgres instances on this machine. Inside the compose
+      # network it's still plain 5432.
+      - "5434:5432"
