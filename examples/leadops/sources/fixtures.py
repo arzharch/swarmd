@@ -14,6 +14,9 @@ from pathlib import Path
 FIXTURES_PATH = Path(__file__).parent / "leads.json"
 
 
-def load_leads() -> list[dict]:
+def load_leads() -> list[dict[str, object]]:
     """Load raw fixture leads."""
-    return json.loads(FIXTURES_PATH.read_text(encoding="utf-8"))
+    leads: list[dict[str, object]] = json.loads(
+        FIXTURES_PATH.read_text(encoding="utf-8")
+    )
+    return leads
