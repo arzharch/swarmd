@@ -17,9 +17,22 @@ from __future__ import annotations
 import argparse
 import asyncio
 import sys
+from pathlib import Path
 from typing import Any
 
 from swarmd.demo import demo_kernel
+
+
+def _ensure_examples_importable() -> None:
+    """Make examples/ importable when running from an installed console script.
+
+    examples/ is deliberately NOT a package dependency (kernel purity, ADR-002):
+    the flagship app must be embeddable-by-example, not bundled. When the CLI
+    runs from source checkout, we add the repo root to sys.path.
+    """
+    root = Path(__file__).resolve().parents[2]  # src/swarmd/cli.py -> repo root
+    if (root / "examples").is_dir() and str(root) not in sys.path:
+        sys.path.insert(0, str(root))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -82,6 +95,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if result["match"] else 1
 
     if args.command == "leadops":
+        _ensure_examples_importable()
         from examples.leadops.pipeline import LeadOpsPipeline
         from examples.leadops.sources.fixtures import load_leads
         from swarmd.router.providers import make_router

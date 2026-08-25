@@ -35,6 +35,11 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 pythonpath = ["."]
 
+[tool.swarmd]
+# examples/ is not an installed package (kernel purity, ADR-002); the CLI adds
+# the repo root to sys.path at runtime so `swarmd leadops` can import it.
+
+
 [tool.ruff]
 line-length = 100
 target-version = "py312"
