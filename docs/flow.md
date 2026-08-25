@@ -256,6 +256,76 @@ tests: 89 passed (kernel 26, router 19, pipeline 15+8+9, harnesses 12+) · ruff 
 
 ---
 
+## 2026-08-25 · LeadOps flagship + CoT tracing
+
+- **LeadOps flagship** (`examples/leadops/`): INGEST → ENRICH → DEDUPE → SCORE →
+  DRAFT → QA → REVIEW over committed messy fixtures (20 leads, 3 duplicate pairs).
+  Runs fully offline via mock; `--provider openrouter` swaps in the free-model chain.
+
+  DECISION: dedupe by canonical key (lowercase alnum) keeping richest record
+  ALTERNATIVES: embedding similarity clustering · LLM-pairwise confirmation
+  WHY THIS: fixtures' duplicates are case/spacing variants — a canonical key is
+  deterministic, free, and explainable. Embedding clustering is Phase-5+ work if
+  duplicates get fuzzier; the key approach documents the baseline honestly.
+  TRADE-OFF ACCEPTED: genuinely different names for the same company slip through.
+
+  DECISION: mock provider gained a JSON mode (schema-aware deterministic payloads)
+  ALTERNATIVES: skip structured stages offline · hand-stub each stage
+  WHY THIS: LLMHarness.structured asks for JSON schemas in prompts; the mock now
+  synthesizes valid payloads from those schemas (ints within declared bounds via
+  pydantic Field ge/le). Every stage runs offline with realistic shapes — no
+  special-casing anywhere.
+  TRADE-OFF ACCEPTED: mock responses are schema-shaped but semantically empty;
+  fine for orchestration testing, not for judging model quality.
+
+  BUGS FOUND BY TESTS: (1) enrich overwrote company names with mock output,
+  destroying the dedupe key — identity fields must survive enrichment;
+  (2) repair fns referenced a nonexistent 'lead' field; (3) lead keys were
+  case-sensitive while fixture emails mix casing.
+
+- **Supervisor agent** (ADR-005): samples gate dead-letters, proposes versioned
+  prompt patches, applies with rollback. Patch history is an auditable artifact.
+
+- **CoT tracing layer** (`observability/tracing.py`): provider-agnostic TraceSink
+  protocol with InMemory (debug), JSONL (Langfuse-style ingest), and Composite
+  (fan-out to OTel + Langfuse simultaneously) backends.
+
+  DECISION: own span model + sink protocol instead of binding to OTel SDK
+  ALTERNATIVES: OTel-only · Langfuse SDK directly
+  WHY THIS: one instrumentation point feeds every backend; OTel export becomes
+  just another sink (Phase 6), Langfuse-style JSONL another. Kernel stays
+  dependency-free; tracing can never break a run (sink errors log & swallow).
+  TRADE-OFF ACCEPTED: no OTel-native features (samplers, exporters) yet — the
+  bridge sink comes in Phase 6.
+
+  ANATOMY: --trace-jsonl PATH (swarmd leadops flag)
+    Exports every span as JSONL: stage spans, llm spans (prompt_chars,
+    system_hash, tokens_in/out, response_preview), approval spans, plus the CoT
+    thought chain with global tick ordering. This is the file you point a
+    Langfuse-style tool at; trace_id ties it to Jaeger when OTel lands.
+
+  ANATOMY: record_thought(decision, reasoning=...) 
+    CoT capture primitive. Stamps a monotonic tick so thoughts from parent and
+    child spans interleave into one true chronological decision chain — sorting
+    by span alone scrambles order because parents close after children.
+
+  BUG FOUND BY TESTS: iter_thoughts sorted by span entry seq, but a parent's
+  post-child thought ("queued_for_human") still landed out of order — fixed by
+  stamping each thought at record time.
+
+### Gate evidence
+
+```
+tests: 115 passed (kernel 26, router 19, pipeline 32, harnesses 12+, leadops 17, observability 8)
+swarmd leadops --provider mock:
+  leads_in=20 enriched=20 deduped=18 scored=18 drafted=18 qa_passed=18
+  awaiting_review=18 dead_lettered=0 integrity_hash=ee682347087edafe
+  review_queue_pending=18 (outreach never auto-sends)
+--trace-jsonl: every LLM call exported with prompt/tokens/response_preview + CoT ticks
+```
+
+---
+
 ## Next up
 
 - [x] Kernel (Phases 1.1–1.8): events, task models, lifecycle, scheduler, runtime
