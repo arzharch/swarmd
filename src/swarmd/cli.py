@@ -68,6 +68,14 @@ def main(argv: list[str] | None = None) -> int:
     leadops.add_argument(
         "--limit", type=int, default=20, help="max leads to process from fixtures"
     )
+    leadops.add_argument(
+        "--trace-jsonl",
+        default=None,
+        metavar="PATH",
+        help="export every span (stages, LLM calls, CoT decisions) as JSONL — "
+        "the drop-in format Langfuse-style observability backends ingest. "
+        "Combine with OTel for dual-backend tracing.",
+    )
 
     approve = sub.add_parser("approve", help="approve a pending draft (HITL)")
     approve.add_argument("request_id")
@@ -101,7 +109,14 @@ def main(argv: list[str] | None = None) -> int:
         from swarmd.router.providers import make_router
 
         router = make_router(args.provider)
-        pipe = LeadOpsPipeline(router)
+
+        trace_sink = None
+        if args.trace_jsonl:
+            from swarmd.observability.tracing import JsonlTraceSink
+
+            trace_sink = JsonlTraceSink(args.trace_jsonl)
+
+        pipe = LeadOpsPipeline(router, trace_sink=trace_sink)
         leads = load_leads()[: args.limit]
         res = asyncio.run(pipe.run(leads))
 
@@ -114,6 +129,9 @@ def main(argv: list[str] | None = None) -> int:
         if res.taxonomy:
             print(f"failure_taxonomy={res.taxonomy}")
         print(f"integrity_hash={res.integrity_hash}")
+        print(f"trace_id={res.trace_id}")
+        if args.trace_jsonl:
+            print(f"trace_exported={args.trace_jsonl} (JSONL spans incl. LLM calls + CoT)")
         pending = asyncio.run(_pending_count(pipe))
         print(f"review_queue_pending={pending} (outreach never auto-sends)")
         return 0
