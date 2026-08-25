@@ -43,9 +43,25 @@ class Score(BaseModel):
     reason: str
 
 
-async def test_llm_structured_output_with_mock() -> None:
-    # The mock returns prose without JSON; the repair loop should fail loudly.
+async def test_llm_structured_output_with_mock_json_mode() -> None:
+    """The mock synthesizes schema-valid JSON when the prompt asks for it."""
     h = LLMHarness(MockProvider(), temperature=0.2)
+    out = await h.structured("score this", Score)
+    assert 0 <= out.score <= 100
+    assert isinstance(out.reason, str)
+
+
+async def test_llm_structured_output_fails_loudly_on_garbage() -> None:
+    """A provider that returns non-JSON despite the schema request must fail loud."""
+
+    class ProseProvider(MockProvider):
+        name = "prose"
+
+        @staticmethod
+        def _json_for_schema(prompt: str, n: int) -> str:
+            return "no json here at all"
+
+    h = LLMHarness(ProseProvider(), temperature=0.2)
     with pytest.raises(ValueError, match="structured output failed"):
         await h.structured("score this", Score)
 

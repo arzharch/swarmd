@@ -77,6 +77,11 @@ class MockProvider(Provider):
 
     Same (prompt, temperature-bucket) always yields the same text — required for
     reproducible benchmarks and chaos-test integrity hashes.
+
+    JSON mode: when the prompt requests a JSON schema (as LLMHarness.structured
+    does), the mock synthesizes a deterministic VALID payload for that schema —
+    strings from hash words, ints within the schema's declared bounds. This lets
+    structured-output stages run fully offline with realistic shapes.
     """
 
     name = "mock"
@@ -90,10 +95,13 @@ class MockProvider(Provider):
         digest = hashlib.sha256(
             f"{request.prompt}|{round(request.temperature, 2)}".encode()
         ).hexdigest()
-        # Deterministic pseudo-prose so downstream stages have realistic shapes.
-        words = ["alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta", "iota", "kappa"]
         n = int(digest[:8], 16)
-        text = " ".join(words[(n >> i) % len(words)] for i in range(0, 40, 4))
+        if "Respond with ONLY a JSON object" in request.prompt:
+            text = self._json_for_schema(request.prompt, n)
+        else:
+            # Deterministic pseudo-prose so downstream stages have realistic shapes.
+            words = ["alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta", "iota", "kappa"]
+            text = " ".join(words[(n >> i) % len(words)] for i in range(0, 40, 4))
         return LLMResponse(
             text=text,
             provider=self.name,
@@ -102,6 +110,39 @@ class MockProvider(Provider):
             tokens_in=len(request.prompt.split()),
             tokens_out=10,
         )
+
+    @staticmethod
+    def _json_for_schema(prompt: str, n: int) -> str:
+        """Build a deterministic valid payload for the last JSON schema in prompt."""
+        import json as _json
+        import re
+
+        match = re.findall(r"\{.*\}", prompt, flags=re.DOTALL)
+        if not match:
+            return "{}"
+        try:
+            schema = _json.loads(match[-1])
+        except _json.JSONDecodeError:
+            return "{}"
+        props = schema.get("properties", {})
+        payload: dict[str, Any] = {}
+        for i, (name, spec) in enumerate(props.items()):
+            t = spec.get("type", "string")
+            shift = (i * 7) % 24
+            if t == "integer":
+                lo = spec.get("minimum", 0)
+                hi = spec.get("maximum", 100)
+                payload[name] = lo + (n >> shift) % max(hi - lo + 1, 1)
+            elif t == "number":
+                payload[name] = round(((n >> shift) % 1000) / 10, 1)
+            elif t == "boolean":
+                payload[name] = bool((n >> shift) & 1)
+            elif t == "array":
+                words = ["signal-a", "signal-b", "signal-c"]
+                payload[name] = [words[(n >> shift) % 3]]
+            else:
+                payload[name] = f"mock-{name}-{(n >> shift) % 97}"
+        return _json.dumps(payload)
 
 
 class _ModelHealth:

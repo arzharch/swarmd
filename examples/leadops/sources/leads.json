@@ -1,0 +1,22 @@
+[
+  {"id": "L001", "company": "Acme Robotics", "contact_name": "Priya Sharma", "email": "priya@acmerobotics.io", "website": "https://acmerobotics.io", "employees": 45, "notes": "Series A robotics startup, warehouse automation"},
+  {"id": "L002", "company": "acme robotics", "contact_name": "P. Sharma", "email": "priya@acmerobotics.io", "website": "https://www.acmerobotics.io", "employees": null, "notes": ""},
+  {"id": "L003", "company": "BlueRiver Analytics", "contact_name": "Tom Okafor", "email": "tom.okafor@blueriver.dev", "website": "https://blueriver.dev", "employees": 120, "notes": "Data platform for fintech; hiring data engineers"},
+  {"id": "L004", "company": "Blue River Analytics", "contact_name": "", "email": "info@blueriver.dev", "website": "", "employees": 118, "notes": "generic inbox"},
+  {"id": "L005", "company": "Cinder Labs", "contact_name": "Mai Nguyen", "email": "mai@cinderlabs.ai", "website": "https://cinderlabs.ai", "employees": 12, "notes": "AI research lab, small team, publishes papers"},
+  {"id": "L006", "company": "Delta Freight", "contact_name": "Carlos Ruiz", "email": "carlos@deltafreight.com", "website": "https://deltafreight.com", "employees": 800, "notes": "Logistics company, legacy stack, modernizing"},
+  {"id": "L007", "company": "delta freight co", "contact_name": "C. Ruiz", "email": "c.ruiz@deltafreight.com", "website": "http://deltafreight.com", "employees": null, "notes": ""},
+  {"id": "L008", "company": "Ember Health", "contact_name": "Dr. Lena Fischer", "email": "lena@emberhealth.org", "website": "https://emberhealth.org", "employees": 60, "notes": "Telehealth, HIPAA constraints, growing fast"},
+  {"id": "L009", "company": "Foxglove Security", "contact_name": "Jade Marsh", "email": "jade@foxglove.sec", "website": "", "employees": 25, "notes": "Security audits and pentesting boutique"},
+  {"id": "L010", "company": "Glowstack", "contact_name": "Omar Haddad", "email": "omar@glowstack.app", "website": "https://glowstack.app", "employees": 8, "notes": "Early SaaS, pre-revenue, two founders"},
+  {"id": "L011", "company": "Harbor Legal Group", "contact_name": "Susan Wright", "email": "swright@harborlegal.com", "website": "https://harborlegal.com", "employees": 35, "notes": "Mid-size law firm, paper-heavy workflows"},
+  {"id": "L012", "company": "Ironwood Manufacturing", "contact_name": "Bill Kowalski", "email": "bkowalski@ironwoodmfg.com", "website": "https://ironwoodmfg.com", "employees": 450, "notes": "Industrial manufacturer, IoT retrofit interest"},
+  {"id": "L013", "company": "Juniper Education", "contact_name": "Aisha Bello", "email": "aisha@juniperedu.org", "website": "https://juniperedu.org", "employees": 90, "notes": "EdTech nonprofit, district customers"},
+  {"id": "L014", "company": "Kestrel Aviation", "contact_name": "Nikolai Petrov", "email": "n.petrov@kestrel.aero", "website": "https://kestrel.aero", "employees": 210, "notes": "Regional airline ops software"},
+  {"id": "L015", "company": "Lumen Fitness", "contact_name": "Grace Kim", "email": "grace@lumenfit.co", "website": "https://lumenfit.co", "employees": 18, "notes": "Boutique gym chain, app in beta"},
+  {"id": "L016", "company": "Mistral Catering", "contact_name": "Hugo Bernard", "email": "hugo@mistralcatering.fr", "website": "", "employees": 40, "notes": "Events catering, seasonal staffing"},
+  {"id": "L017", "company": "Nimbus Cloudworks", "contact_name": "Femi Adeyemi", "email": "femi@nimbuscloud.works", "website": "https://nimbuscloud.works", "employees": 75, "notes": "Managed kubernetes provider"},
+  {"id": "L018", "company": "Orchard Farms", "contact_name": "Rosa Delgado", "email": "rosa@orchardfarms.ag", "website": "https://orchardfarms.ag", "employees": 150, "notes": "AgTech sensors pilot program"},
+  {"id": "L019", "company": "Pinewood Hotels", "contact_name": "Kenji Sato", "email": "kenji@pinewoodhotels.jp", "website": "https://pinewoodhotels.jp", "employees": 320, "notes": "Hotel group, PMS migration planned"},
+  {"id": "L020", "company": "Quartz Semiconductors", "contact_name": "Ingrid Larsen", "email": "ingrid@quartzsemi.com", "website": "https://quartzsemi.com", "employees": 1200, "notes": "Chip fab, long procurement cycles"}
+]
