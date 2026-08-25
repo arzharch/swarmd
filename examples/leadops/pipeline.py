@@ -12,7 +12,7 @@ import asyncio
 import hashlib
 import json
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, cast
 
 from pydantic import BaseModel, Field
 
@@ -24,6 +24,12 @@ from swarmd.harnesses.verify import (
     schema_check,
 )
 from swarmd.hitl.approvals import ApprovalManager, InMemoryApprovalStore
+from swarmd.observability.tracing import (
+    TraceSink,
+    instrument_llm,
+    record_thought,
+    tracer,
+)
 from swarmd.pipeline.gates import QualityGate
 from swarmd.router.providers import Provider
 
@@ -61,6 +67,7 @@ class LeadOpsResult:
     dead_lettered: int = 0
     taxonomy: dict[str, int] = field(default_factory=dict)
     integrity_hash: str = ""
+    trace_id: str = ""
 
 
 def _normalize_key(company: str) -> str:
@@ -79,14 +86,21 @@ def _lead_key(lead: dict[str, Any]) -> str:
 
 
 class LeadOpsPipeline:
-    def __init__(self, provider: Provider) -> None:
+    def __init__(self, provider: Any, trace_sink: TraceSink | None = None) -> None:
+        # provider is Provider or the tracing wrapper (structurally identical).
+        # Every LLM call becomes a traced span (prompt/response/tokens) — visible
+        # in Jaeger AND Langfuse-style backends via the same sink.
+        traced = instrument_llm(provider, trace_sink)
+        # The wrapper is structurally a Provider; cast keeps mypy strict happy.
+        traced_provider = cast(Provider, traced)
         # Verifier stages pin low temperature; draft runs warmer.
-        self.enrich_llm = LLMHarness(provider, temperature=0.2, max_tokens=256,
+        self.enrich_llm = LLMHarness(traced_provider, temperature=0.2, max_tokens=256,
                                      system_prompt="You normalize and enrich company records. Be factual.")
-        self.score_llm = LLMHarness(provider, temperature=0.2, max_tokens=128,
+        self.score_llm = LLMHarness(traced_provider, temperature=0.2, max_tokens=128,
                                     system_prompt="You score B2B leads for ICP fit. Be strict.")
-        self.draft_llm = LLMHarness(provider, temperature=0.7, max_tokens=320,
+        self.draft_llm = LLMHarness(traced_provider, temperature=0.7, max_tokens=320,
                                     system_prompt="You write short, warm first-touch B2B emails.")
+        self.trace_sink = trace_sink
         self.approvals = ApprovalManager(InMemoryApprovalStore())
 
         self.score_gate = QualityGate(
@@ -127,64 +141,89 @@ class LeadOpsPipeline:
     async def run(self, raw_leads: list[dict[str, Any]]) -> LeadOpsResult:
         res = LeadOpsResult(leads_in=len(raw_leads))
 
-        # INGEST: stable keys
-        leads = [{**lead, "_key": _lead_key(lead)} for lead in raw_leads]
+        with tracer("stage", "leadops.run", sink=self.trace_sink, leads=len(raw_leads)):
+            # INGEST: stable keys
+            leads = [{**lead, "_key": _lead_key(lead)} for lead in raw_leads]
+            record_thought("ingest", reasoning="assigned stable identity keys",
+                           count=len(leads))
 
-        # ENRICH (concurrently, via the kernel's step model)
-        enriched = await asyncio.gather(*(self._enrich(l) for l in leads))
-        res.enriched = len(enriched)
+            # ENRICH (concurrently)
+            with tracer("stage", "enrich", sink=self.trace_sink):
+                enriched = await asyncio.gather(*(self._enrich(l) for l in leads))
+                record_thought("enrich_done", reasoning="normalized companies + extracted signals",
+                               enriched=len(enriched))
+            res.enriched = len(enriched)
 
-        # DEDUPE: canonical-key merge, keep richest record
-        by_key: dict[str, dict[str, Any]] = {}
-        for lead in enriched:
-            k = _normalize_key(lead["company"])
-            existing = by_key.get(k)
-            if existing is None or self._richness(lead) > self._richness(existing):
-                by_key[k] = lead
-        deduped = list(by_key.values())
-        res.deduped = len(deduped)
+            # DEDUPE: canonical-key merge, keep richest record
+            with tracer("stage", "dedupe", sink=self.trace_sink):
+                by_key: dict[str, dict[str, Any]] = {}
+                for lead in enriched:
+                    k = _normalize_key(lead["company"])
+                    existing = by_key.get(k)
+                    if existing is None or self._richness(lead) > self._richness(existing):
+                        by_key[k] = lead
+                deduped = list(by_key.values())
+                record_thought("dedupe_done",
+                               reasoning="merged case/spacing variants by canonical key",
+                               merged_from=len(enriched), kept=len(deduped))
+            res.deduped = len(deduped)
 
-        # SCORE with quality gate
-        scored_items: list[dict[str, Any]] = []
-        for lead in deduped:
-            score = await self.score_llm.structured(
-                f"Score ICP fit 0-10 for a B2B automation seller.\n"
-                f"Company: {lead['company']}\nSignals: {lead.get('signals', [])}\n"
-                f"Employees: {lead.get('employees')}",
-                Score,
-            )
-            item = {**lead, **score.model_dump()}
-            outcome = await self.score_gate.check(item)
-            if outcome.ok:
-                scored_items.append(outcome.item)
-            else:
-                res.dead_lettered += 1
-        res.scored = len(scored_items)
+            # SCORE with quality gate
+            with tracer("stage", "score", sink=self.trace_sink):
+                scored_items: list[dict[str, Any]] = []
+                for lead in deduped:
+                    score = await self.score_llm.structured(
+                        f"Score ICP fit 0-10 for a B2B automation seller.\n"
+                        f"Company: {lead['company']}\nSignals: {lead.get('signals', [])}\n"
+                        f"Employees: {lead.get('employees')}",
+                        Score,
+                    )
+                    item = {**lead, **score.model_dump()}
+                    outcome = await self.score_gate.check(item)
+                    if outcome.ok:
+                        scored_items.append(outcome.item)
+                    else:
+                        res.dead_lettered += 1
+                record_thought("score_done", reasoning="gated scores; failures dead-lettered",
+                               passed=len(scored_items))
+            res.scored = len(scored_items)
 
-        # DRAFT (concurrent outreach agents)
-        drafts = await asyncio.gather(*(self._draft(item) for item in scored_items))
-        res.drafted = len(drafts)
+            # DRAFT (concurrent outreach agents)
+            with tracer("stage", "draft", sink=self.trace_sink):
+                drafts = await asyncio.gather(*(self._draft(item) for item in scored_items))
+                record_thought("draft_done", reasoning="personalized first-touch emails",
+                               drafted=len(drafts))
+            res.drafted = len(drafts)
 
-        # QA gate
-        qa_passed: list[dict[str, Any]] = []
-        for item in drafts:
-            outcome = await self.qa_gate.check(item)
-            if outcome.ok:
-                qa_passed.append(outcome.item)
-            else:
-                res.dead_lettered += 1
-        res.qa_passed = len(qa_passed)
+            # QA gate
+            with tracer("stage", "qa", sink=self.trace_sink):
+                qa_passed: list[dict[str, Any]] = []
+                for item in drafts:
+                    outcome = await self.qa_gate.check(item)
+                    if outcome.ok:
+                        qa_passed.append(outcome.item)
+                    else:
+                        res.dead_lettered += 1
+                record_thought("qa_done", reasoning="compliance checks; banned language blocked",
+                               passed=len(qa_passed))
+            res.qa_passed = len(qa_passed)
 
-        # REVIEW QUEUE: durable HITL state — never auto-send (ADR-003)
-        for item in qa_passed:
-            await self.approvals.submit(item, stage="review_queue")
-        res.awaiting_review = len(qa_passed)
-        res.taxonomy = {
-            **self.score_gate.taxonomy,
-            **{f"qa:{k}": v for k, v in self.qa_gate.taxonomy.items()},
-        }
-        res.integrity_hash = self._integrity_hash(qa_passed)
-        return res
+            # REVIEW QUEUE: durable HITL state — never auto-send (ADR-003)
+            with tracer("approval", "review_queue_submit", sink=self.trace_sink,
+                        items=len(qa_passed)):
+                for item in qa_passed:
+                    await self.approvals.submit(item, stage="review_queue")
+                record_thought("queued_for_human", reasoning="ADR-003: outreach never auto-sends")
+            res.awaiting_review = len(qa_passed)
+
+            res.taxonomy = {
+                **self.score_gate.taxonomy,
+                **{f"qa:{k}": v for k, v in self.qa_gate.taxonomy.items()},
+            }
+            res.integrity_hash = self._integrity_hash(qa_passed)
+            from swarmd.observability.tracing import current_trace_id
+            res.trace_id = current_trace_id()
+            return res
 
     async def _enrich(self, lead: dict[str, Any]) -> dict[str, Any]:
         try:
