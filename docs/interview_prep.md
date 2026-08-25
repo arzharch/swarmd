@@ -85,6 +85,26 @@ reaper requeues the task with its checkpoint and emits TASK_REQUEUED; (3) the re
 also notices the dead worker and respawns one to keep pool size at `concurrency`.
 Tests prove the final output equals a clean run's output byte-for-byte.
 
+**Q: How do you prove chaos didn't corrupt anything?**
+A: The demo runs the same workload twice — clean and under seeded chaos — and hashes
+the sorted set of completed task outputs. Task IDs are excluded (they're random UUIDs
+that legitimately differ); the guarantee is about work done. At kill-rate 0.9 we've
+measured 300+ kills and 200+ requeues with a byte-identical hash to the clean run.
+
+**Q: Chaos found real bugs? Give an example.**
+A: Two. First, after a resume-skip, steps received their own previous output instead
+of the previous step's output — the skip path didn't track chain position, so any task
+that survived a kill mid-pipeline computed wrong downstream data. Only visible when a
+kill landed between specific steps; the integrity hash caught it. Second, the original
+demo tuned step latency (10ms) faster than the chaos tick (50ms), so runs finished
+before the first kill fired — chaos was silently a no-op. Both are exactly the class
+of bug chaos testing exists to surface.
+
+**Q: How is chaos kept deterministic?**
+A: Seeded RNG. Same seed + same workload = identical kill sequence. That converts
+"chaos output == clean output" from a probabilistic hope into a hard assertion, and
+means CI never flakes on wall-clock luck.
+
 **Q: Why an explicit state machine for agent lifecycle instead of flags?**
 A: Illegal transitions raise immediately (SPAWNED→DONE, DONE→anything), turning "how
 did it get into that state?" debugging sessions into loud test failures. KILLED vs

@@ -144,6 +144,54 @@ checkpoint → replacement skips completed steps → output identical to clean r
 
 ---
 
+## 2026-08-25 · Chaos harness + demo CLI — kernel gate PASSED
+
+- **Chaos harness:** seeded `ChaosHook` (kill/latency injection) + `ChaosRunner`
+  kill loop attached to the runtime. Seeded RNG means chaos is reproducible —
+  same seed kills the same agents, so integrity comparisons are meaningful and
+  CI never flakes on wall-clock luck.
+
+- **Demo CLI:** `swarmd demo kernel --kill-rate F --tasks N --seed I` runs the
+  pipeline clean vs under chaos, prints both output hashes, exits 0 iff equal.
+
+  DECISION: integrity hash over task OUTPUTS, not task IDs
+  ALTERNATIVES: hash including IDs · ordered hash of results list
+  WHY THIS: task IDs are random UUIDs that legitimately differ between runs;
+  the guarantee is about work done (which tasks finished with what output),
+  not internal identifiers. Sorting makes it order-independent.
+  TRADE-OFF ACCEPTED: two tasks with identical payloads are indistinguishable
+  in the hash; acceptable because payload uniqueness is a caller concern.
+
+  ANATOMY: --kill-rate F (default 0.3)
+    Probability a live agent is killed per chaos tick. 0 = clean run; 0.3 hits
+    every recovery path in seconds while progress stays visible; 0.9 proves
+    recovery under extreme pressure (hundreds of kills) but slows throughput
+    dramatically — workers die faster than they complete steps. Above ~0.95
+    with this tick rate the run effectively livelocks.
+  ANATOMY: --seed I (default 42)
+    Chaos RNG seed. Same seed + same workload = identical kill sequence, which
+    is what makes "chaos output == clean output" a deterministic assertion
+    rather than a probabilistic one.
+
+  BUG FOUND BY THE GATE (and fixed):
+    1. Steps received their OWN previous output instead of the PREVIOUS STEP's
+       output after a resume-skip — the skip path didn't track chain position.
+       Fixed by carrying prev_output across skipped steps in _run_steps.
+    2. Demo steps slept 10ms while the chaos tick fired every 50ms: the whole
+       run finished before the first kill. Chaos was a no-op, not a test.
+       Fixed by tuning step latency (150ms) vs tick (500ms) vs lease (2s).
+
+### Gate evidence
+
+```
+swarmd demo kernel --kill-rate 0.3   -> clean dfe1f2286da7d426 == chaos dfe1f2286da7d426 (13 kills, 13 requeues)
+swarmd demo kernel --kill-rate 0.7   -> MATCH (97 kills, 69 requeues)
+swarmd demo kernel --kill-rate 0.9   -> MATCH (317 kills, 201 requeues)
+tests: 42 passed · ruff clean · mypy strict clean
+```
+
+---
+
 ## Next up
 
 - [x] Phase 1.1: toolchain bring-up — git init, uv lock, venv sync, .gitignore
