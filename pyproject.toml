@@ -11,6 +11,7 @@ dependencies = [
     # Phase 2: httpx, asyncpg | Phase 4: none beyond stdlib for mock provider
     # Phase 6: opentelemetry-sdk, prometheus-client
     "httpx>=0.28.1",
+    "pydantic>=2.13.4",
 ]
 
 [project.scripts]
