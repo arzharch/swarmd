@@ -155,18 +155,65 @@ A: Bounds latency and cost per call. Too low truncates structured JSON mid-field
 rambling. 512 comfortably fits our stage outputs.
 
 
-## Section 4: Pipeline & harnesses (populate as built)
+## Section 4: Pipeline & harnesses (answered as built)
 
 **Q: What exactly is a harness vs an agent vs a stage?**
-A: (to fill — harness = toolset+prompt+loop policy; agent = running instance; stage = pool + verifier + policy)
+A: Harness = a reusable capability bundle (tools + system prompt + loop policy) —
+e.g. the LLM harness with temperature 0.2 for verifiers. Agent = a running instance
+executing steps with a lifecycle and checkpoints. Stage = a node in the pipeline DAG:
+a named pool of agents doing one kind of work, with a quality gate at its output.
+Harnesses are the "what agents can do", stages are "where work flows", agents are
+"who's executing right now".
+
+**Q: Why does your DAG execute level-by-level instead of streaming per item?**
+A: Two reasons, one discovered by a deadlock. Streaming needs end-of-stream signals;
+with multi-worker pools only one worker ever received the sentinel and the rest hung
+forever — my first design did exactly this. Level barriers make stage completion
+well-defined (queue drained = done) and give clean per-stage gate reporting. Cost:
+downstream waits for full upstream batches, negligible at our scale.
+
+**Q: How does structured LLM output stay reliable on free models?**
+A: Pydantic schema in the prompt, JSON extraction from the reply, validation, and one
+repair round that re-asks with the validation error appended. Provider-agnostic — no
+reliance on native function calling that free OpenRouter models may lack. After the
+retry it fails loudly; silent garbage is worse than a dead-letter.
 
 **Q: What happens when a verifier is wrong?**
-A: (to fill — dead-letter visibility, repair loop bounds, supervisor escalation)
+A: Three layers of protection. A verifier exception is caught and treated as a failure
+reason (never crashes the pipeline). The item goes through bounded repair, then to the
+dead-letter queue WITH the verifier's reason attached — so a systematically broken
+verifier shows up as a taxonomy spike ("schema" failures everywhere), visible in the
+run report rather than silently eating items.
 
-## Section 5: Semantic cache & budgets (populate as built)
+**Q: Why bounded repair loops?**
+A: Unbounded repair is a livelock dressed up as diligence — a bad item never exits.
+The bound converts every item into a terminal outcome: passed, repaired, or
+dead-lettered with full context. All three are countable, which is what makes the
+quality report honest.
 
-**Q: How does semantic caching avoid wrong hits?**
-A: (to fill — threshold choice, false-hit cost analysis)
+**Q: How does HITL survive a process restart?**
+A: AWAITING_APPROVAL is persisted through a store protocol, not held in memory. On
+restart a fresh manager over the same store lists pending requests and the pipeline
+resumes. Decisions are immutable — deciding twice raises — and the audit trail is
+append-only, so the evidence chain can't be rewritten.
+
+**Q: Semantic cache threshold — why 0.95?**
+A: It's the precision/recall knob. Below ~0.9 you serve semantically adjacent but
+factually different answers — a wrong cache hit is strictly worse than a miss because
+it's invisible. Above ~0.98 you've rebuilt exact matching with extra overhead. 0.95
+catches paraphrase-level duplication while keeping false hits rare.
+
+## Section 5: Stores & budgets
+
+**Q: Why is the Postgres store lazy-connecting?**
+A: Construction never touches the network — importing/configuring it in tests is free,
+and CI never needs Postgres unless a test explicitly exercises it. Connection happens
+on first use; schema creation is idempotent.
+
+**Q: What happens when the token budget runs out mid-run?**
+A: BudgetExceeded raises immediately — fail-loud accounting. Callers convert that into
+a clean PARTIAL run with a report showing what completed and what didn't. Silent
+truncation mid-item would corrupt outputs while looking successful.
 
 ## Section 6: Phase 5 — LeadOps (populate as you build)
 

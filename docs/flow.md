@@ -192,6 +192,70 @@ tests: 42 passed · ruff clean · mypy strict clean
 
 ---
 
+## 2026-08-25 · Pipeline, harnesses, gates, HITL, router completion
+
+- **Stage DAG executor:** dependency levels execute in order; stages within a
+  level run concurrently with bounded pools. Cycle/unknown-dep detection at
+  definition time.
+
+  DECISION: level-by-level execution vs fully-streaming DAG
+  ALTERNATIVES: per-item streaming (stage N+1 starts as soon as any item arrives)
+  WHY THIS: level barriers make stage completion well-defined without end-of-
+  stream sentinels — the sentinel approach deadlocked with multi-worker pools
+  (only one worker ever saw the _END marker; the rest waited forever). Level
+  semantics also make quality-gate reporting per-stage trivial.
+  TRADE-OFF ACCEPTED: downstream stages wait for full upstream batches; fine at
+  our scale where stages are seconds, not hours.
+
+  BUG FOUND BY TESTS: initial sentinel-based design hung on the very first test.
+  Replaced with queue.join() + task cancellation per level.
+
+- **Harnesses:** base contract (tools+prompt+loop policy), LLM structured output
+  with one-round JSON repair, robots-aware allowlisted fetch with token-bucket
+  rate limits, composable verifiers, deterministic draft envelope rendering,
+  pluggable store (in-memory / lazy Postgres via asyncpg).
+
+  DECISION: LLM structured output uses pydantic schema + repair round
+  ALTERNATIVES: function-calling APIs · regex parsing · no validation
+  WHY THIS: provider-agnostic (works over OpenRouter free models that lack
+  native function calling); the repair round (re-ask with validation error)
+  fixes most malformed JSON; loud failure after retry beats silent garbage.
+  TRADE-OFF ACCEPTED: one extra LLM call on repairable failures.
+
+- **Quality gates:** verifier -> bounded repair -> requeue -> dead-letter, with
+  a failure taxonomy (schema/range/content/other) accumulated per run.
+
+  DECISION: bounded repair loop (max_repairs) instead of unlimited fixing
+  ALTERNATIVES: repair until pass · no repair, straight to dead-letter
+  WHY THIS: unbounded repair is a livelock dressed up as diligence; zero repair
+  wastes recoverable items. The bound converts bad input into a countable,
+  visible outcome either way.
+  TRADE-OFF ACCEPTED: some fixable-in-3-tries items dead-letter at 1; the
+  taxonomy shows if that's happening at scale.
+
+- **Durable HITL:** AWAITING_APPROVAL persisted via a store protocol; decisions
+  immutable (double-decision raises); append-only audit trail; restart survival
+  proven by test (new manager instance over same store sees pending state).
+
+- **Router completion:** semantic cache (hash-trigram embedder default, cosine
+  threshold 0.95, TTL+LRU) and TokenBudget with fail-loud breach semantics.
+
+  ANATOMY: SemanticCache.threshold (default 0.95)
+    Minimum cosine similarity to serve a cached response. Too low serves wrong
+    answers (a near-miss hit is worse than a miss); too high degenerates to
+    exact matching. 0.95 is the standard compromise for short prompts.
+  ANATOMY: TokenBudget.budget_tokens
+    Hard ceiling per scope. Breach raises BudgetExceeded -> callers produce a
+    clean PARTIAL report, never silent truncation mid-item.
+
+### Gate evidence
+
+```
+tests: 89 passed (kernel 26, router 19, pipeline 15+8+9, harnesses 12+) · ruff clean · mypy strict clean
+```
+
+---
+
 ## Next up
 
 - [x] Phase 1.1: toolchain bring-up — git init, uv lock, venv sync, .gitignore
