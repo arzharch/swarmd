@@ -41,6 +41,10 @@ target-version = "py312"
 [tool.mypy]
 strict = true
 
+[[tool.mypy.overrides]]
+module = "asyncpg"
+ignore_missing_imports = true
+
 [dependency-groups]
 dev = [
     "pytest-timeout>=2.4.0",
