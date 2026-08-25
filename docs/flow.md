@@ -258,9 +258,12 @@ tests: 89 passed (kernel 26, router 19, pipeline 15+8+9, harnesses 12+) · ruff 
 
 ## Next up
 
-- [x] Phase 1.1: toolchain bring-up — git init, uv lock, venv sync, .gitignore
-- [ ] Phase 1.2: event bus (`events.py`) — decision block due: queue fan-out vs callbacks
-- [ ] Phase 1.3–1.8: Task/Checkpoint models → AgentHandle → Scheduler → heartbeat
-      requeue → chaos hook → demo CLI (order per PLAN.md §1)
-- [ ] Phase 1 gate: `pytest tests/kernel -q` + `swarmd demo kernel --kill-rate 0.3`
-      hash equality
+- [x] Kernel (Phases 1.1–1.8): events, task models, lifecycle, scheduler, runtime
+      recovery, chaos, demo CLI — gate PASSED (hash equality at kill-rate 0.9)
+- [x] Pipeline phase: DAG executor, harnesses, quality gates, durable HITL,
+      store harness, semantic cache + token budgets
+- [ ] Phase 5: LeadOps flagship — fixtures, INGEST→ENRICH→DEDUPE→SCORE→DRAFT→QA→
+      REVIEW pipeline over the kernel, supervisor agent, chaos integration,
+      integrity checker
+- [ ] Phase 6: OTel tracing + Prometheus metrics + Grafana dashboards + bench suite
+- [ ] Phase 7: packaging & release
