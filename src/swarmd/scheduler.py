@@ -50,9 +50,16 @@ class Scheduler:
         self._not_empty.set()
 
     async def claim(self) -> Task:
-        """Atomically take the highest-priority task; waits if empty."""
+        """Atomically take the highest-priority task; waits if empty.
+
+        The event may be consumed by a competing worker between wake and pop,
+        so re-check emptiness after waking (standard condition-variable pattern).
+        """
         while True:
             await self._not_empty.wait()
+            if not self._heap:
+                self._not_empty.clear()
+                continue
             entry = heapq.heappop(self._heap)
             self._capacity.release()
             if not self._heap:

@@ -234,15 +234,20 @@ class Runtime:
         cp = claim.checkpoint
         task_type = str(task.payload.get("type", "default"))
 
-        for step_name in claim.steps:
+        prev_output: Any = None
+        for idx, step_name in enumerate(claim.steps):
             if step_name in cp.completed_steps:
-                continue  # deterministic skip: work already done pre-kill
+                # Deterministic skip: work already done pre-kill. Reconstruct the
+                # chain position so the next new step still receives the output
+                # of the step immediately before it.
+                prev_output = cp.data[step_name]
+                continue
             fn = self._step_fns[(task_type, step_name)]
-            step_input: Any = cp.data.get(step_name)
-            output = await fn(step_input, task.payload)
+            output = await fn(prev_output, task.payload)
             cp = cp.with_step(step_name, output)
             handle.save_checkpoint(cp)
             claim.checkpoint = cp
+            prev_output = output
             # Refresh the lease after each step: proof of life.
             claim.expires_at = time.monotonic() + self.lease_s
             self._emit(EventType.CHECKPOINT_SAVED, task_id=task.task_id, step=step_name)
