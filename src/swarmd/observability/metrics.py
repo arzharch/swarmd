@@ -113,6 +113,17 @@ def _build() -> tuple[Any, dict[str, Any]]:
         "cache_hits": counter(
             "cache_hits_total", "Requests served from the semantic cache", ["stage"]
         ),
+        "batched_calls": counter(
+            "batched_calls_total",
+            "Batched generations issued, by stage. One call, K candidates.",
+            ["stage"],
+        ),
+        "batch_calls_saved": counter(
+            "batch_calls_saved_total",
+            "Provider requests avoided by batching. Requests, not dollars, are "
+            "the scarce resource on a pooled free tier.",
+            ["stage"],
+        ),
         # --- golden signal: errors ----------------------------------------
         "llm_errors": counter(
             "llm_errors_total",
@@ -271,6 +282,12 @@ def record_kill(*, source: str) -> None:
 
 def record_requeue(*, stage: str) -> None:
     metric("requeues").labels(stage=stage).inc()
+
+
+def record_batch(*, stage: str, saved: int) -> None:
+    metric("batched_calls").labels(stage=stage).inc()
+    if saved > 0:
+        metric("batch_calls_saved").labels(stage=stage).inc(saved)
 
 
 def record_ceiling_abort() -> None:

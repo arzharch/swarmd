@@ -25,6 +25,7 @@ from typing import Any
 
 from swarmd.ledger import CostAccount, InMemoryLedger, JsonlLedger
 from swarmd.observability import metrics
+from swarmd.swarm.batch import Batch, generate_batch
 from swarmd.swarm.criteria import Candidate
 from swarmd.swarm.economy import Economy
 from swarmd.swarm.planner import (
@@ -72,7 +73,7 @@ PROFILES = {
 
 
 # Pool bounds. See SwarmRun._pool_size for why each number is what it is.
-ADVISORY_POOL = 16
+ADVISORY_POOL = 32
 HARD_POOL = 64
 
 
@@ -353,11 +354,13 @@ class SwarmRun:
           node before it will propose a skill, so a pool of one makes the
           learning loop structurally dead no matter what else is configured.
 
-        ANATOMY: ADVISORY_POOL (16)
-          What the currently implemented capacity levers support. The 500-agent
-          figure in CAPACITY.md assumes batched generation and the semantic
-          cache; without them every agent is a real call, and a large pool
-          reaches the cost ceiling instead of the answer.
+        ANATOMY: ADVISORY_POOL (32)
+          What the implemented capacity levers support. Generation is now
+          batched -- one call per node regardless of pool size -- so the pool no
+          longer costs a call per agent. REPAIRS are still one call each,
+          because a repair prompt carries one candidate's specific failures, so
+          the worst case remains linear in pool size at max_repairs per agent.
+          32 is where that worst case still fits the ceiling.
 
           An explicit agent count from the operator OVERRIDES this, because a
           cap that cannot be overridden is a lie about who is in control -- and
@@ -390,6 +393,70 @@ class SwarmRun:
             )
         return min(HARD_POOL, budget)
 
+    async def _batch_generate(
+        self, task: str, node: PlanNode, context: WorkerContext, k: int
+    ) -> Batch:
+        """One call producing K candidate solutions for this node.
+
+        WHY THE BATCH IS NOT CHARGED TO THE AGENTS. The first version divided
+        its cost by K and debited each agent's allowance, on the reasoning that
+        work the market does not price is work the market cannot select on.
+        That was wrong twice over.
+
+        It changes no ordering: every agent in the pool receives the same
+        subsidy, so a uniform debit shifts all balances equally and the
+        selection is identical.
+
+        And it broke a detector. `BudgetSiphon` fires when an agent burns most
+        of its allowance with nothing verified; pre-debiting a share left too
+        little allowance for that threshold to be reachable, so a seeded siphon
+        went bankrupt uncaught -- the exact failure this detector had already
+        been fixed for once. A subsidy that eats the headroom a safety
+        threshold depends on is not a neutral accounting choice.
+
+        The dollars are not lost: the batch call goes through the provider
+        pool, so it lands in the ledger like every other call. What the economy
+        prices is what agents choose to do -- repairs -- which is where they
+        actually differ.
+        """
+        from swarmd.swarm.worker import WORKER_SYSTEM, GenericWorker
+
+        # Skills retrieved ONCE for the batch rather than per agent. Every
+        # agent in a pool queries the same library with the same node text, so
+        # per-agent retrieval returned identical results and differed only in
+        # how many times it ran.
+        skills = (
+            context.skills.retrieve(f"{task} {node.instruction}")
+            if context.skills
+            else []
+        )
+        prompt = GenericWorker("batch", context).build_prompt(task, node, skills, ())
+
+        batch = await generate_batch(
+            provider=self.provider,
+            prompt=prompt,
+            k=k,
+            max_tokens=context.max_tokens,
+            temperature=context.temperature,
+            system=WORKER_SYSTEM,
+            stage=node.name,
+        )
+        if batch.variants:
+            metrics.record_batch(stage=node.name, saved=batch.saved_calls)
+            self._emit(
+                "batch_generated",
+                node=node.name,
+                requested=k,
+                variants=len(batch.variants),
+                calls=batch.calls,
+                saved_calls=batch.saved_calls,
+            )
+        else:
+            # No variants: the pool falls back to generating individually. The
+            # saving is lost, the node is not.
+            self._emit("batch_failed", node=node.name, requested=k)
+        return batch
+
     async def _execute(
         self, task: str, plan: Plan, criterion: FrozenCriterion
     ) -> list[WorkerResult]:
@@ -420,7 +487,7 @@ class SwarmRun:
             self._emit("level_started", nodes=level)
             metrics.set_queue_depth(stage="plan", depth=len(level))
 
-            async def run_agent(name: str) -> WorkerResult:
+            async def run_agent(name: str, draft: str = "") -> WorkerResult:
                 node = plan.node(name)
                 account = self.economy.spawn(traits={"node": name})
                 if self.rogues is not None and len(self.rogues.assigned) < len(
@@ -445,7 +512,19 @@ class SwarmRun:
                 #
                 # This is what makes "completed work is never redone" true of
                 # the flagship and not only of the kernel demo.
+                # A pre-generated variant arrives as a COMPLETED checkpoint
+                # step. The worker's resume path then skips generating and
+                # charges nothing for it -- the same mechanism that stops a
+                # killed agent redoing its work, used here to stop K agents
+                # duplicating one call.
                 carried: Checkpoint | None = None
+                if draft:
+                    carried = Checkpoint(
+                        task_id=name,
+                        agent_id=account.agent_id,
+                        completed_steps=["generate:1"],
+                        data={"generate:1": draft},
+                    )
                 attempts_left = self.max_recoveries
 
                 while True:
@@ -532,8 +611,20 @@ class SwarmRun:
             # successes on the same node before proposing a skill -- could never
             # fire. The learning loop was structurally dead.
             pool = self._pool_size(plan)
+
+            # One batched call per node, then the pool grades its variants.
+            batches: dict[str, Batch] = {}
+            for name in level:
+                batches[name] = await self._batch_generate(
+                    task, plan.node(name), context, pool
+                )
+
             level_results = await asyncio.gather(
-                *(run_agent(name) for name in level for _ in range(pool)),
+                *(
+                    run_agent(name, batches[name].for_agent(index))
+                    for name in level
+                    for index in range(pool)
+                ),
                 return_exceptions=True,
             )
             for item in level_results:

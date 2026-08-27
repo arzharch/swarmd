@@ -148,6 +148,8 @@ def _synthesize(prompt: str, n: int) -> str:
         return _criterion(n)
     if '"nodes"' in prompt and "schema" in prompt:
         return _plan(n)
+    if "===CANDIDATE===" in prompt:
+        return _batched_worker_output(prompt, n)
     if "STEP:" in prompt and "REQUIRED:" in prompt:
         return _worker_output(prompt, n)
     if "Respond with ONLY a JSON object" in prompt:
@@ -210,6 +212,23 @@ def _plan(n: int) -> str:
                          "checked independently",
             "nodes": variants[n % len(variants)],
         }
+    )
+
+
+def _batched_worker_output(prompt: str, n: int) -> str:
+    """K distinct candidates in one response.
+
+    Distinct is the load-bearing word. A stub that returned the same candidate
+    K times would make every batched run look successful while destroying the
+    population diversity batching exists to preserve -- and the pool would then
+    be K agents grading one answer, which is not a search.
+    """
+    import re as _re
+
+    match = _re.search(r"Produce (\d+) SEPARATE", prompt)
+    k = int(match.group(1)) if match else 1
+    return "\n===CANDIDATE===\n".join(
+        _worker_output(prompt, n + i * 7919) for i in range(k)
     )
 
 

@@ -385,13 +385,57 @@ async def test_pool_size_is_floored_so_distillation_always_has_evidence():
 
 
 async def test_pool_size_is_capped_so_a_run_does_not_always_abort():
-    """The 500-agent figure assumes batching and caching, neither implemented.
-    Uncapped, every run would breach the ceiling instead of finishing."""
+    """Batching removed the per-agent generation call; repairs are still one
+    call each, so the worst case stays linear and the cap stays finite."""
     from swarmd.swarm.planner import PlanNode, validate
+    from swarmd.swarm.run import ADVISORY_POOL
 
     run = SwarmRun(ScriptedProvider(), profile="standard")
     plan = validate([PlanNode(name="only", instruction="produce x.json")])
-    assert run._pool_size(plan) <= 16
+    assert run._pool_size(plan) == ADVISORY_POOL
+
+
+async def test_an_explicit_agent_count_overrides_the_advisory_cap():
+    """A cap the operator cannot override is a lie about who is in control.
+
+    The cost ceiling is the real protection: the run aborts on budget with an
+    itemised report rather than silently costing more than it was allowed.
+    """
+    from swarmd.swarm.planner import PlanNode, validate
+    from swarmd.swarm.run import ADVISORY_POOL, HARD_POOL
+
+    plan = validate([PlanNode(name="only", instruction="produce x.json")])
+    run = SwarmRun(ScriptedProvider(), profile="standard", agents=200)
+    assert run._pool_size(plan) > ADVISORY_POOL
+    assert run._pool_size(plan) <= HARD_POOL
+
+
+async def test_exceeding_the_advisory_cap_emits_a_warning_not_a_silent_grant():
+    """An expensive run should be a decision, not a surprise."""
+    from swarmd.swarm.planner import PlanNode, validate
+
+    seen = []
+    run = SwarmRun(
+        ScriptedProvider(), profile="standard", agents=200,
+        on_event=lambda e: seen.append(e),
+    )
+    run._pool_size(validate([PlanNode(name="only", instruction="produce x.json")]))
+    assert any(e["kind"] == "pool_above_advisory" for e in seen)
+
+
+async def test_a_small_explicit_count_still_floors_at_two():
+    """One agent per node makes distillation structurally impossible: it needs
+    two independent verified successes on the same node."""
+    from swarmd.swarm.planner import PlanNode, validate
+
+    run = SwarmRun(ScriptedProvider(), profile="smoke", agents=1)
+    plan = validate([PlanNode(name="only", instruction="produce x.json")])
+    assert run._pool_size(plan) == 2
+
+
+async def test_a_zero_agent_run_is_refused():
+    with pytest.raises(ValueError, match="at least 1"):
+        SwarmRun(ScriptedProvider(), profile="smoke", agents=0)
 
 
 async def test_a_pool_produces_the_evidence_distillation_requires(tmp_path):
