@@ -1,0 +1,207 @@
+---
+# Control plane: HTTP API, WebSocket fan-out to the dashboard, run submission.
+#
+# Stateless by design. Every piece of state a run depends on -- checkpoints,
+# ledger, approvals, frozen criteria -- lives in Postgres, and quota lives in
+# Redis (ADR-011). That is what makes rolling updates safe: a pod can be
+# replaced mid-run without the run losing anything.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: swarmd-control-plane
+  labels:
+    app.kubernetes.io/name: swarmd
+    app.kubernetes.io/component: control-plane
+spec:
+  replicas: 2
+  revisionHistoryLimit: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0   # never drop below the PDB floor during a deploy
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: swarmd
+      app.kubernetes.io/component: control-plane
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: swarmd
+        app.kubernetes.io/component: control-plane
+      annotations:
+        # Roll pods when config changes. Without this a ConfigMap edit is
+        # invisible to running pods and the cluster silently serves stale
+        # config until something unrelated triggers a restart.
+        checksum/config: "REPLACED_BY_KUSTOMIZE_CONFIGMAP_HASH"
+    spec:
+      serviceAccountName: swarmd
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      # Long, because a run in flight should finish its current step and
+      # checkpoint rather than being cut off. Recovery would handle the cut,
+      # but paying for recovery when a clean exit was available is waste.
+      terminationGracePeriodSeconds: 120
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: swarmd
+              app.kubernetes.io/component: control-plane
+      containers:
+        - name: swarmd
+          image: swarmd:latest   # overlays pin a digest
+          imagePullPolicy: IfNotPresent
+          args: ["swarmd", "serve", "--host", "0.0.0.0", "--port", "8000"]
+          ports:
+            - name: http
+              containerPort: 8000
+            - name: metrics
+              containerPort: 9464
+          env:
+            - name: SWARMD_POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: SWARMD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          envFrom:
+            - configMapRef:
+                name: swarmd-config
+            - secretRef:
+                name: swarmd-provider-keys
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              # No CPU limit on purpose. CFS throttling on a latency-sensitive
+              # asyncio loop causes tail-latency spikes that look exactly like
+              # provider slowness, which sends you debugging the wrong system.
+              # The request reserves the floor; the namespace quota caps the top.
+              memory: 1Gi
+          startupProbe:
+            # Generous: first start opens Postgres and Redis connections and
+            # probes providers. Failing that as a liveness problem would
+            # crashloop a pod that was merely starting normally.
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 5
+            failureThreshold: 24   # up to 2 minutes
+          readinessProbe:
+            # Distinct from liveness: readiness goes false when the provider
+            # pool has no capacity, so a saturated pod stops receiving new runs
+            # WITHOUT being killed and losing the runs it already has.
+            httpGet: { path: /readyz, port: http }
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 15
+            failureThreshold: 4
+          lifecycle:
+            preStop:
+              # Let the endpoints controller remove this pod from the Service
+              # before the process starts shutting down. Without the pause,
+              # in-flight requests land on a pod that is already draining.
+              exec:
+                command: ["sleep", "10"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: ledger
+              mountPath: /var/lib/swarmd
+      volumes:
+        # readOnlyRootFilesystem is on, so anything that writes needs an
+        # explicit mount. Being forced to enumerate them is the point.
+        - name: tmp
+          emptyDir: { sizeLimit: 256Mi }
+        - name: ledger
+          emptyDir: { sizeLimit: 1Gi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: swarmd-control-plane
+  labels:
+    app.kubernetes.io/name: swarmd
+    app.kubernetes.io/component: control-plane
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: swarmd
+    app.kubernetes.io/component: control-plane
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+    - name: metrics
+      port: 9464
+      targetPort: metrics
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: swarmd-control-plane
+spec:
+  # minAvailable rather than maxUnavailable: with replicas=2 a percentage-based
+  # budget rounds in a way that permits taking both pods during a node drain.
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: swarmd
+      app.kubernetes.io/component: control-plane
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: swarmd-control-plane
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: swarmd-control-plane
+  minReplicas: 2
+  maxReplicas: 8
+  metrics:
+    # Scaling on CPU would be wrong: this workload is IO-bound on someone
+    # else's API, so CPU stays flat while queues grow. Queue depth is the
+    # signal that actually corresponds to needing more workers.
+    - type: Pods
+      pods:
+        metric:
+          name: swarmd_queue_depth
+        target:
+          type: AverageValue
+          averageValue: "50"
+  behavior:
+    scaleUp:
+      # Adding pods does NOT add provider quota -- that is fixed per account
+      # (ADR-011). Scaling up past what the quota supports just adds pods that
+      # wait. Deliberately slow for that reason.
+      stabilizationWindowSeconds: 120
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 60
+    scaleDown:
+      # Slow down-scaling: a pod removed mid-run forces recovery work that was
+      # not necessary.
+      stabilizationWindowSeconds: 600
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 120

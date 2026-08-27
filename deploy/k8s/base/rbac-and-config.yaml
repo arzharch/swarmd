@@ -1,0 +1,146 @@
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: swarmd
+# The control plane creates Jobs; it does not need to read cluster state, so
+# it does not get a token mounted by default. Anything that needs the API
+# server asks for it explicitly.
+automountServiceAccountToken: false
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: swarmd-run-launcher
+rules:
+  # Exactly what is needed to launch and observe runs, and nothing else.
+  # No secrets, no configmaps, no cluster scope. A control plane that can read
+  # Secrets can exfiltrate every provider key in the namespace, and it has no
+  # reason to -- its own keys arrive through envFrom at pod start.
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "get", "list", "watch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods", "pods/log"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: swarmd-run-launcher
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: swarmd-run-launcher
+subjects:
+  - kind: ServiceAccount
+    name: swarmd
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: swarmd-config
+data:
+  # Redis presence is what switches quota from in-process buckets to
+  # cluster-wide coordination (ADR-011). Multi-replica without this is the bug
+  # that ADR exists to prevent, so it is set unconditionally in-cluster.
+  SWARMD_REDIS_URL: "redis://swarmd-redis:6379/0"
+  SWARMD_METRICS_PORT: "9464"
+  SWARMD_LOG_FORMAT: "json"
+  SWARMD_COST_CEILING_USD: "0.05"
+  SWARMD_OTEL_ENDPOINT: "http://otel-collector:4318"
+  # Off by default. The Mistral free tier's quota is paid for in data -- see
+  # ADR-006 and the capacity plan. Turning it on is a deliberate act, and doing
+  # it here rather than in code means the decision is visible in a diff.
+  SWARMD_ALLOW_DATA_TRAINING: "false"
+  SWARMD_ALLOW_PAID: "false"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: swarmd-provider-keys
+  annotations:
+    # PLACEHOLDER ONLY. Real environments replace this with an
+    # ExternalSecret (AWS Secrets Manager / Azure Key Vault) -- see
+    # deploy/k8s/overlays/prod. Committing real keys, even base64'd, would put
+    # them in git history forever, where rotation cannot reach them.
+    swarmd.dev/managed-by: "replace-with-external-secrets-operator"
+type: Opaque
+stringData:
+  GROQ_API_KEY: ""
+  GOOGLE_API_KEY: ""
+  CEREBRAS_API_KEY: ""
+  OPENROUTER_API_KEY: ""
+  DATABASE_URL: ""
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: swarmd-default-deny
+spec:
+  # Default deny, then allow explicitly. The opposite order means every new
+  # workload is exposed until someone remembers to restrict it, and nobody
+  # remembers.
+  podSelector: {}
+  policyTypes: ["Ingress", "Egress"]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: swarmd-control-plane
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: swarmd
+  policyTypes: ["Ingress", "Egress"]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: frontend
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+      ports:
+        - port: 8000
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - port: 9464
+  egress:
+    # DNS, or nothing else in this list resolves.
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    # In-cluster dependencies.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: swarmd-redis
+      ports:
+        - port: 6379
+    # Provider APIs and managed Postgres, which are outside the cluster. This
+    # is deliberately the loosest rule here and it is the one worth tightening
+    # first: egress to 443 anywhere is how generated code in the sandbox would
+    # reach the internet if it escaped its subprocess. Narrow it to specific
+    # CIDRs once the provider set is stable.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 169.254.169.254/32   # cloud metadata endpoint: credential theft
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+      ports:
+        - port: 443
+        - port: 5432

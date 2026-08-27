@@ -1,0 +1,111 @@
+---
+# A swarm run is a Job, not a Deployment.
+#
+# The reasoning, which is worth being explicit about: a run has a beginning, an
+# end, and a result. That is a batch workload. Modelling it as a Deployment
+# would mean a process that "finishes" and then gets restarted forever by the
+# controller, and it would make "did this run succeed" a question you answer by
+# reading logs instead of by reading a Job status.
+#
+# One run = one pod. A single run is NOT distributed across pods: PRD section 6
+# lists multi-node execution as a v1 non-goal, and pretending otherwise would
+# mean a distributed scheduler nobody has built. Horizontal scale here means
+# MORE CONCURRENT RUNS, which is the honest claim.
+#
+# This is a template. The control plane creates Jobs from it per submitted run.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: swarmd-run-TEMPLATE
+  labels:
+    app.kubernetes.io/name: swarmd
+    app.kubernetes.io/component: run
+spec:
+  # Zero retries. A run that failed should be inspected, not silently repeated:
+  # re-running burns provider quota that is the scarcest resource in the system,
+  # and the ledger already holds everything needed to diagnose it. Recovery
+  # WITHIN a run is the checkpoint system's job; retrying the whole run is a
+  # human decision.
+  backoffLimit: 0
+  # Reap finished Jobs after a day so the namespace does not fill with them.
+  # A day is long enough to inspect one the morning after an overnight sweep.
+  ttlSecondsAfterFinished: 86400
+  # Hard stop. The `deep` profile is ~40 minutes and `eval` is ~4.5 hours
+  # (docs/CAPACITY.md); 6 hours leaves headroom for the sweep without letting a
+  # wedged run consume quota indefinitely.
+  activeDeadlineSeconds: 21600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: swarmd
+        app.kubernetes.io/component: run
+    spec:
+      restartPolicy: Never
+      serviceAccountName: swarmd
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: swarmd
+          image: swarmd:latest
+          args:
+            - swarm
+            - run
+            - "$(SWARMD_TASK)"
+            - --profile
+            - "$(SWARMD_PROFILE)"
+            - --chaos
+          ports:
+            - name: metrics
+              containerPort: 9464
+          env:
+            - name: SWARMD_RUN_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: SWARMD_TASK
+              value: "PLACEHOLDER"
+            - name: SWARMD_PROFILE
+              value: "demo"
+          envFrom:
+            - configMapRef:
+                name: swarmd-config
+            - secretRef:
+                name: swarmd-provider-keys
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: "1"
+              memory: 2Gi
+            limits:
+              memory: 4Gi
+              # The sandbox harness forks subprocesses for candidate code.
+              # Without a pid cap, a fork bomb from generated code takes down
+              # the node rather than the pod.
+              # (Enforced by the runtime class / kubelet podPidsLimit as well.)
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: sandbox
+              mountPath: /var/lib/swarmd/sandbox
+            - name: ledger
+              mountPath: /var/lib/swarmd/ledger
+      volumes:
+        - name: tmp
+          emptyDir: { sizeLimit: 512Mi }
+        - name: sandbox
+          # Where generated code executes. Size-capped so a runaway write
+          # cannot fill the node's disk, and separate from the ledger mount so
+          # sandboxed code has no path to the run's own records.
+          emptyDir: { sizeLimit: 2Gi }
+        - name: ledger
+          emptyDir: { sizeLimit: 1Gi }

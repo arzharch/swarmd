@@ -1,0 +1,77 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: swarmd
+
+resources:
+  - ../../base
+  - external-secrets.yaml
+
+# Digests, not tags. A tag is a mutable pointer: `swarmd:v1.2.0` can be
+# repointed after it was tested, and then the thing running is not the thing
+# that passed CI. A digest cannot. CI writes the digest here as part of the
+# release, which is also what makes a rollback exact rather than approximate.
+images:
+  - name: swarmd
+    newName: 123456789012.dkr.ecr.us-east-1.amazonaws.com/swarmd
+    digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+  - name: swarmd-frontend
+    newName: 123456789012.dkr.ecr.us-east-1.amazonaws.com/swarmd-frontend
+    digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+
+configMapGenerator:
+  - name: swarmd-config
+    behavior: merge
+    literals:
+      - SWARMD_ENV=prod
+      - SWARMD_LOG_LEVEL=INFO
+      # Paid overflow is enabled in prod and nowhere else. The $0.05 per-run
+      # ceiling still binds; this only decides whether exhausting free capacity
+      # stops the run or spends within the ceiling.
+      - SWARMD_ALLOW_PAID=true
+
+patches:
+  # The placeholder Secret from base is replaced by an ExternalSecret that
+  # syncs from AWS Secrets Manager. Deleting it here rather than leaving it
+  # empty means a misconfigured ExternalSecret fails loudly at pod start
+  # instead of silently mounting blank keys and looking like a provider outage.
+  - target:
+      kind: Secret
+      name: swarmd-provider-keys
+    patch: |
+      $patch: delete
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: swarmd-provider-keys
+
+  - target:
+      kind: Deployment
+      name: swarmd-control-plane
+    patch: |
+      - op: replace
+        path: /spec/replicas
+        value: 3
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/requests/cpu
+        value: "1"
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/requests/memory
+        value: 2Gi
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/limits/memory
+        value: 4Gi
+      - op: replace
+        path: /spec/template/spec/topologySpreadConstraints/0/whenUnsatisfiable
+        value: DoNotSchedule
+
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: swarmd-control-plane
+    patch: |
+      - op: replace
+        path: /spec/minReplicas
+        value: 3
+      - op: replace
+        path: /spec/maxReplicas
+        value: 12

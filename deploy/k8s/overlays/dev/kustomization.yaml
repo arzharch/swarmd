@@ -1,0 +1,44 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: swarmd-dev
+
+resources:
+  - ../../base
+
+# Dev runs one of everything. Two replicas would be honest about production
+# shape but doubles free-tier quota contention for no benefit -- ADR-011's
+# coordination is still exercised because Redis is in the base.
+replicas:
+  - name: swarmd-control-plane
+    count: 1
+  - name: swarmd-frontend
+    count: 1
+
+configMapGenerator:
+  - name: swarmd-config
+    behavior: merge
+    literals:
+      - SWARMD_ENV=dev
+      - SWARMD_LOG_LEVEL=DEBUG
+      # Never in dev: a runaway loop against a paid provider is a bill nobody
+      # is watching for. Exhausting free capacity stops the run instead.
+      - SWARMD_ALLOW_PAID=false
+
+patches:
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: swarmd-control-plane
+    patch: |
+      - op: replace
+        path: /spec/minReplicas
+        value: 1
+      - op: replace
+        path: /spec/maxReplicas
+        value: 2
+  - target:
+      kind: PodDisruptionBudget
+    patch: |
+      - op: replace
+        path: /spec/minAvailable
+        value: 0

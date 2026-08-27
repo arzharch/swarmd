@@ -1,0 +1,48 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: swarmd
+  labels:
+    kubernetes.io/metadata.name: swarmd
+    # Enforce the restricted Pod Security Standard at admission. Every workload
+    # here already satisfies it (non-root, no privilege escalation, dropped
+    # capabilities, seccomp); the label is what stops a future manifest from
+    # quietly not satisfying it.
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: swarmd
+  namespace: swarmd
+spec:
+  hard:
+    # Caps concurrent runs. Provider quota is the real ceiling (~45 req/min
+    # regardless of pod count), so this exists to stop runs consuming cluster
+    # capacity they cannot use -- pods that would sit blocked on the quota.
+    count/jobs.batch: "20"
+    requests.cpu: "24"
+    requests.memory: 48Gi
+    limits.memory: 96Gi
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: swarmd
+  namespace: swarmd
+spec:
+  limits:
+    - type: Container
+      # A container with no request is scheduled as best-effort and is the
+      # first thing evicted under node pressure -- which, for a long run, means
+      # losing work that had no reason to be lost.
+      defaultRequest:
+        cpu: 100m
+        memory: 256Mi
+      default:
+        memory: 1Gi
+      max:
+        memory: 8Gi

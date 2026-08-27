@@ -1,0 +1,136 @@
+---
+# Next.js dashboard. Reads the live event stream over WebSocket from the
+# control plane; it has no database access and no provider credentials, because
+# it renders what happened rather than causing anything to happen.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: swarmd-frontend
+  labels:
+    app.kubernetes.io/name: swarmd
+    app.kubernetes.io/component: frontend
+spec:
+  replicas: 2
+  revisionHistoryLimit: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: swarmd
+      app.kubernetes.io/component: frontend
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: swarmd
+        app.kubernetes.io/component: frontend
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      # Short: the frontend holds WebSockets but no work. Cutting a socket
+      # costs a reconnect, which the client handles.
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: frontend
+          image: swarmd-frontend:latest
+          ports:
+            - name: http
+              containerPort: 3000
+          env:
+            # Same-origin path, proxied by the Ingress. Baking an absolute
+            # backend URL into the client would break every environment that
+            # is not the one it was built for -- and this image is built once
+            # and promoted, not rebuilt per environment.
+            - name: NEXT_PUBLIC_WS_PATH
+              value: "/api/stream"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              memory: 512Mi
+          readinessProbe:
+            httpGet: { path: /api/health, port: http }
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /api/health, port: http }
+            periodSeconds: 20
+            failureThreshold: 3
+          volumeMounts:
+            - name: cache
+              mountPath: /app/.next/cache
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: cache
+          emptyDir: { sizeLimit: 256Mi }
+        - name: tmp
+          emptyDir: { sizeLimit: 64Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: swarmd-frontend
+  labels:
+    app.kubernetes.io/name: swarmd
+    app.kubernetes.io/component: frontend
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: swarmd
+    app.kubernetes.io/component: frontend
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: swarmd-frontend
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: swarmd
+      app.kubernetes.io/component: frontend
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: swarmd
+  annotations:
+    # WebSocket connections are long-lived by design -- the dashboard streams
+    # for the whole run. Default proxy timeouts (60s) would cut them
+    # repeatedly, and the reconnect storm looks like a backend fault.
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+spec:
+  rules:
+    - http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: swarmd-control-plane
+                port:
+                  name: http
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: swarmd-frontend
+                port:
+                  name: http

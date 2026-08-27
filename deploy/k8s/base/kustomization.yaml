@@ -1,0 +1,38 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Base holds what is true in every environment. Anything that differs between
+# dev and prod -- replica counts, image digests, secret sources, resource
+# ceilings -- belongs in an overlay. A base with environment-specific values in
+# it stops being a base and becomes the dev environment with patches bolted on.
+
+namespace: swarmd
+
+commonLabels:
+  app.kubernetes.io/part-of: swarmd
+  app.kubernetes.io/managed-by: kustomize
+
+resources:
+  - namespace.yaml
+  - rbac-and-config.yaml
+  - redis-and-monitoring.yaml
+  - control-plane.yaml
+  - frontend.yaml
+  # run-job.yaml is a TEMPLATE the control plane instantiates per run, not a
+  # resource to apply. Applying it would create one permanently-named Job.
+
+images:
+  - name: swarmd
+    newTag: latest
+  - name: swarmd-frontend
+    newTag: latest
+
+# Roll pods automatically when config changes. The generator appends a content
+# hash to the ConfigMap name, which changes the pod spec, which triggers a
+# rollout. Without it, a config edit applies to the object and is never read by
+# the running pods.
+configMapGenerator:
+  - name: swarmd-config
+    behavior: merge
+    literals:
+      - SWARMD_ENV=base
