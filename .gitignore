@@ -13,9 +13,12 @@ venv/
 .ruff_cache/
 .coverage
 
-# Env / secrets
+# Env / secrets. Ignore every .env variant, then un-ignore the template --
+# `.env.*` would otherwise swallow .env.example and the one file meant to be
+# shared is the one that silently never gets committed.
 .env
 .env.*
+!.env.example
 
 # OS
 .DS_Store
