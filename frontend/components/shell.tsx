@@ -13,13 +13,21 @@ import type { ConnectionState } from "@/lib/types";
  * to this screen asking.
  */
 
-export type ViewId = "run" | "decisions" | "cost" | "trace";
+export type ViewId =
+  | "run"
+  | "decisions"
+  | "cost"
+  | "trace"
+  | "evals"
+  | "harness";
 
 export const VIEWS: Array<{ id: ViewId; label: string; question: string }> = [
   { id: "run", label: "Live run", question: "what is it doing right now" },
   { id: "decisions", label: "Decisions", question: "what did it decide, and why" },
   { id: "cost", label: "Cost & safety", question: "what did it spend, what was contained" },
   { id: "trace", label: "Traceability", question: "where did that number come from" },
+  { id: "evals", label: "Evals & sessions", question: "is it actually improving" },
+  { id: "harness", label: "Harness", question: "what is it configured to do" },
 ];
 
 type Theme = "light" | "dark" | "system";

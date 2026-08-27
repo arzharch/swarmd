@@ -17,9 +17,22 @@ import {
   ProvenancePanel,
   ReasoningTape,
 } from "@/components/trace";
+import {
+  EvalPanel,
+  EvalReportPanel,
+  HarnessPanel,
+  ProviderPanel,
+  ReviewPanel,
+  SessionPanel,
+} from "@/components/control";
 import { Rail, TopBar, type ViewId } from "@/components/shell";
 import { useRunStream } from "@/lib/useRunStream";
-import type { CostView, LedgerResponse, RunSummary } from "@/lib/types";
+import type {
+  CostView,
+  JobSummary,
+  LedgerResponse,
+  RunSummary,
+} from "@/lib/types";
 
 export default function Dashboard() {
   const stream = useRunStream();
@@ -98,11 +111,38 @@ export default function Dashboard() {
     }
   };
 
+  // Jobs are polled rather than derived from the stream: a session is hours
+  // long and its progress events are coarse, so a periodic read is both
+  // simpler and enough.
+  const [jobs, setJobs] = useState<JobSummary[]>([]);
+  useEffect(() => {
+    let cancelled = false;
+    const load = () =>
+      fetch("/api/jobs")
+        .then((r) => (r.ok ? r.json() : null))
+        .then((body) => {
+          if (!cancelled && body) setJobs(body.jobs as JobSummary[]);
+        })
+        .catch(() => undefined);
+    load();
+    const timer = setInterval(load, 4000);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, []);
+
+  const activeJobs = jobs.filter(
+    (j) => j.state === "running" || j.state === "queued",
+  ).length;
+
   const counts: Record<string, number> = {
     run: stream.agents.length,
     decisions: (stream.criterion ? 1 : 0) + (stream.plan ? 1 : 0),
     cost: stream.containments.length,
     trace: 0,
+    evals: activeJobs,
+    harness: 0,
   };
 
   return (
@@ -184,6 +224,26 @@ export default function Dashboard() {
               <ReasoningTape events={stream.events} />
             </div>
           </>
+        )}
+
+        {view === "evals" && (
+          <>
+            <div className="board cols-2">
+              <EvalPanel jobs={jobs} />
+              <SessionPanel jobs={jobs} />
+            </div>
+            <div className="board cols-2" style={{ paddingTop: 0 }}>
+              <EvalReportPanel jobs={jobs} />
+              <ReviewPanel />
+            </div>
+          </>
+        )}
+
+        {view === "harness" && (
+          <div className="board cols-2">
+            <HarnessPanel />
+            <ProviderPanel />
+          </div>
         )}
 
         {view === "cost" && (

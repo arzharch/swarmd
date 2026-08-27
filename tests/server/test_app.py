@@ -41,6 +41,18 @@ class FakeProvider:
     def status(self):
         return [{"provider": "fake", "available": self._available}]
 
+    async def probe(self):
+        """Same surface as ProviderPool, so the fake exercises the real path."""
+        return [
+            {
+                "provider": "fake",
+                "tier": "free",
+                "ok": self._available,
+                "model": "fake-v1",
+                "latency_s": 0.01,
+            }
+        ]
+
     async def complete(self, request):
         if "checks" in request.prompt and "schema" in request.prompt:
             text = json.dumps(CRITERION)

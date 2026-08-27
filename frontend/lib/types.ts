@@ -154,3 +154,86 @@ export interface LedgerResponse {
 }
 
 export type ConnectionState = "connecting" | "open" | "closed";
+
+/* --- service control ---------------------------------------------------- */
+
+export interface JobSummary {
+  job_id: string;
+  kind: "run" | "eval" | "session";
+  label: string;
+  state: "queued" | "running" | "completed" | "failed" | "cancelled";
+  submitted_ts: number;
+  duration_s: number;
+  /** Counts, not a percentage: 50% hides whether it is 1 of 2 or 500 of 1000. */
+  done: number;
+  total: number;
+  error: string;
+  params?: Record<string, unknown>;
+  report?: Record<string, unknown>;
+}
+
+export interface ArmSummary {
+  runs: number;
+  solved: number;
+  success_rate: number;
+  cost_per_solved: number | null;
+  first_pass_rate: number;
+}
+
+export interface EvalReport {
+  total_runs: number;
+  repeats: number;
+  duration_s: number;
+  simulated: boolean;
+  arms: Record<
+    string,
+    {
+      treatment: ArmSummary;
+      control: ArmSummary;
+      comparison: { verdict: string; note?: string; reason?: string };
+    }
+  >;
+}
+
+export interface ProviderRow {
+  provider: string;
+  tier: string;
+  credential?: string;
+  available?: boolean;
+  ok?: boolean;
+  reason?: string;
+  rate_limits?: number;
+  simulated?: boolean;
+}
+
+export interface ConfigResponse {
+  adjustable: {
+    default_profile: string;
+    default_ceiling_usd: number;
+    chaos_kill_rate: number;
+    sandbox_timeout_s: number;
+    sandbox_memory_mb: number;
+    allow_paid: boolean;
+  };
+  fixed: {
+    ceiling_max_usd: number;
+    profiles: Record<
+      string,
+      { agents: number; target_calls: number; description: string }
+    >;
+    notes: string[];
+  };
+}
+
+export interface PendingApproval {
+  request_id: string;
+  stage: string;
+  item: Record<string, unknown>;
+  waited_s: number;
+}
+
+export interface SkillsResponse {
+  stats: { total: number; approved: number; pending: number; retired: number };
+  pending: Array<Record<string, unknown>>;
+  approved: Array<Record<string, unknown>>;
+}

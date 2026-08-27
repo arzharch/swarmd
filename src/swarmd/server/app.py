@@ -39,8 +39,9 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 
 from swarmd.observability import logs, metrics
-from swarmd.server import middleware
+from swarmd.server import control, middleware
 from swarmd.server.hub import EventHub
+from swarmd.server.jobs import JobRegistry
 from swarmd.swarm.run import PROFILES, RunResult, SwarmRun
 
 logger = logging.getLogger(__name__)
@@ -123,6 +124,12 @@ def create_app(
     app.state.registry = RunRegistry()
     app.state.provider_factory = provider_factory or _default_provider_factory
     app.state.skills_path = skills_path or os.environ.get("SWARMD_SKILLS_PATH")
+    # Evals and sessions are long-running work of the same shape as runs, so
+    # they share one registry: one status endpoint, one cancel semantic, one
+    # progress event, rather than three of each.
+    app.state.jobs = JobRegistry(hub=app.state.hub)
+    app.state.config = control.HarnessConfig()
+    control.register(app, registry=app.state.jobs, config=app.state.config)
 
     # -- probes -------------------------------------------------------------
 
