@@ -107,6 +107,7 @@ export interface RunSummary {
   started?: number;
   finished?: number;
   report?: {
+    run?: { integrity_hash?: string };
     cost: CostView;
     economy: Record<string, number | null>;
     redteam: { contained: number; flagged: number; by_pattern: Record<string, number> };
@@ -114,6 +115,41 @@ export interface RunSummary {
     leaderboard: Array<Record<string, unknown>>;
     skills: Record<string, number> | null;
     ablation: { skills_enabled: boolean };
+  };
+}
+
+export interface LedgerRow {
+  run_id: string;
+  seq: number;
+  ts: number;
+  kind: string;
+  agent_id: string;
+  stage: string;
+  provider: string;
+  model: string;
+  tokens_in: number;
+  tokens_out: number;
+  cost_usd: number;
+  would_have_cost: number;
+  /** True when this row came from the simulated provider (ADR-012). */
+  simulated: boolean;
+  detail: Record<string, unknown>;
+}
+
+export interface LedgerResponse {
+  run_id: string;
+  rows: LedgerRow[];
+  total: number;
+  kinds: string[];
+  /** Memory-vs-disk reconciliation. A mismatch means a torn write. */
+  verify: {
+    durable: boolean;
+    rows_in_memory?: number;
+    rows_on_disk?: number;
+    cost_in_memory?: number;
+    cost_on_disk?: number;
+    match?: boolean;
+    reason?: string;
   };
 }
 

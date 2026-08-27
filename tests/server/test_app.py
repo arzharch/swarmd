@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 
 import pytest
 from fastapi.testclient import TestClient
@@ -300,3 +301,56 @@ def test_deciding_an_unknown_skill_is_404(client):
 
 def test_an_invalid_skill_action_is_refused(client):
     assert client.post("/api/skills/x/maybe").status_code == 400
+
+
+# --- traceability ----------------------------------------------------------
+
+
+def _completed_run(client):
+    run_id = client.post(
+        "/api/runs",
+        json={"task": "summarise the records", "profile": "smoke", "chaos": False},
+    ).json()["run_id"]
+    # The run executes as a background task; poll until the report lands.
+    for _ in range(80):
+        body = client.get(f"/api/runs/{run_id}").json()
+        if body.get("status") not in (None, "running"):
+            return run_id
+        time.sleep(0.05)
+    raise AssertionError("run did not finish")
+
+
+def test_the_ledger_is_exposed_for_traceability(client):
+    """Every reported number is an aggregate over these rows (ADR-007), so
+    serving them is what makes a figure checkable rather than trusted."""
+    run_id = _completed_run(client)
+    body = client.get(f"/api/runs/{run_id}/ledger").json()
+    assert body["total"] > 0
+    assert body["rows"]
+    # The decisions that gate everything downstream must be traceable to a row.
+    assert "criterion_frozen" in body["kinds"]
+    assert "plan_selected" in body["kinds"]
+
+
+def test_ledger_rows_can_be_filtered_by_kind(client):
+    run_id = _completed_run(client)
+    body = client.get(f"/api/runs/{run_id}/ledger?kind=gate").json()
+    assert body["rows"]
+    assert {r["kind"] for r in body["rows"]} == {"gate"}
+
+
+def test_the_ledger_carries_its_reconciliation_status(client):
+    """A mismatch between memory and disk means a torn write, and the
+    traceability view must be able to say so rather than imply completeness."""
+    run_id = _completed_run(client)
+    assert "verify" in client.get(f"/api/runs/{run_id}/ledger").json()
+
+
+def test_the_run_summary_excludes_the_ledger(client):
+    """It is the largest field and the summary is polled far more often."""
+    run_id = _completed_run(client)
+    assert "ledger" not in client.get(f"/api/runs/{run_id}").json()
+
+
+def test_the_ledger_of_an_unknown_run_is_404(client):
+    assert client.get("/api/runs/nope/ledger").status_code == 404

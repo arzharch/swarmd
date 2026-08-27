@@ -24,6 +24,7 @@ import contextlib
 import logging
 import os
 import time
+from dataclasses import asdict
 from typing import Any
 
 # Imported at MODULE scope, not inside create_app(). With
@@ -45,6 +46,11 @@ from swarmd.swarm.run import PROFILES, RunResult, SwarmRun
 logger = logging.getLogger(__name__)
 
 START_TS = time.time()
+
+# Ledger rows retained per run in the in-process index. Why 5000: enough to
+# reconstruct a standard run end to end, bounded so a deep run does not pin
+# tens of thousands of rows in a long-lived control plane.
+LEDGER_ROWS_KEPT = 5000
 
 
 class RunRequest(BaseModel):
@@ -209,11 +215,22 @@ def create_app(
             try:
                 result = await run.run(request.task)
             finally:
-                app.state.registry.record(
-                    run.run_id, {"finished": time.time()}
-                )
+                app.state.registry.record(run.run_id, {"finished": time.time()})
             app.state.registry.record(
-                run.run_id, {"status": result.status, "report": run.report(result)}
+                run.run_id,
+                {
+                    "status": result.status,
+                    "report": run.report(result),
+                    # Ledger rows are kept so the traceability view can show the
+                    # actual audit record rather than a prettier log. Capped:
+                    # a deep run writes tens of thousands and the registry is a
+                    # convenience index, not the durable store -- the JSONL file
+                    # and Postgres hold the complete record.
+                    "ledger": [asdict(row) for row in run.account.ledger.rows()][
+                        -LEDGER_ROWS_KEPT:
+                    ],
+                    "verify": run.account.verify(),
+                },
             )
             return result
 
@@ -235,7 +252,33 @@ def create_app(
         record = app.state.registry.runs.get(run_id)
         if record is None:
             raise HTTPException(404, f"unknown run: {run_id}")
-        return JSONResponse(record)
+        # The ledger is served separately: it is by far the largest field, and
+        # the summary is polled while the traceability view is not open.
+        return JSONResponse({k: v for k, v in record.items() if k != "ledger"})
+
+    @app.get("/api/runs/{run_id}/ledger")
+    async def get_ledger(run_id: str, kind: str = "", limit: int = 500) -> JSONResponse:
+        """The append-only record a result is traceable to (ADR-007).
+
+        Every number in every report is an aggregate over these rows, so this
+        endpoint is what makes a reported figure checkable rather than trusted.
+        """
+        record = app.state.registry.runs.get(run_id)
+        if record is None:
+            raise HTTPException(404, f"unknown run: {run_id}")
+        rows = record.get("ledger", [])
+        if kind:
+            rows = [r for r in rows if r.get("kind") == kind]
+        return JSONResponse(
+            {
+                "run_id": run_id,
+                "rows": rows[-limit:],
+                "total": len(record.get("ledger", [])),
+                "kinds": sorted({r.get("kind", "") for r in record.get("ledger", [])}),
+                # memory-vs-disk reconciliation; a mismatch means a torn write
+                "verify": record.get("verify", {}),
+            }
+        )
 
     @app.delete("/api/runs/{run_id}")
     async def cancel_run(run_id: str) -> JSONResponse:

@@ -11,9 +11,15 @@ import {
   RedTeamPanel,
   SummaryPanel,
 } from "@/components/panels";
+import {
+  LedgerPanel,
+  ObservabilityLinks,
+  ProvenancePanel,
+  ReasoningTape,
+} from "@/components/trace";
 import { Rail, TopBar, type ViewId } from "@/components/shell";
 import { useRunStream } from "@/lib/useRunStream";
-import type { CostView, RunSummary } from "@/lib/types";
+import type { CostView, LedgerResponse, RunSummary } from "@/lib/types";
 
 export default function Dashboard() {
   const stream = useRunStream();
@@ -49,6 +55,25 @@ export default function Dashboard() {
 
   const cost: CostView | null = summary?.report?.cost ?? null;
 
+  // Fetched once per finished run so Provenance can report whether the
+  // in-memory view reconciles with what actually reached disk.
+  const [ledgerVerify, setLedgerVerify] = useState<
+    LedgerResponse["verify"] | undefined
+  >(undefined);
+  useEffect(() => {
+    if (!stream.activeRun || stream.runStatus === "running") return;
+    let cancelled = false;
+    fetch(`/api/runs/${stream.activeRun}/ledger?limit=1`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((body) => {
+        if (!cancelled && body) setLedgerVerify((body as LedgerResponse).verify);
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, [stream.activeRun, stream.runStatus]);
+
   const selectedAgent = useMemo(
     () => stream.agents.find((a) => a.agent_id === selected) ?? null,
     [stream.agents, selected],
@@ -77,6 +102,7 @@ export default function Dashboard() {
     run: stream.agents.length,
     decisions: (stream.criterion ? 1 : 0) + (stream.plan ? 1 : 0),
     cost: stream.containments.length,
+    trace: 0,
   };
 
   return (
@@ -139,6 +165,25 @@ export default function Dashboard() {
             <CriterionPanel criterion={stream.criterion} />
             <PlanPanel plan={stream.plan} agents={stream.agents} />
           </div>
+        )}
+
+        {view === "trace" && (
+          <>
+            <div className="board cols-2">
+              <ProvenancePanel
+                runId={stream.activeRun}
+                criterion={stream.criterion}
+                plan={stream.plan}
+                integrityHash={summary?.report?.run?.integrity_hash}
+                verify={ledgerVerify}
+              />
+              <ObservabilityLinks />
+            </div>
+            <div className="board cols-2" style={{ paddingTop: 0 }}>
+              <LedgerPanel runId={stream.activeRun} />
+              <ReasoningTape events={stream.events} />
+            </div>
+          </>
         )}
 
         {view === "cost" && (

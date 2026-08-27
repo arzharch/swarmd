@@ -174,6 +174,35 @@ def main(argv: list[str] | None = None) -> int:
     ev.add_argument("--json", default=None, metavar="PATH",
                     help="write the full report as JSON")
 
+    ledger = sub.add_parser("ledger", help="read an append-only ledger file")
+    ledger_sub = ledger.add_subparsers(dest="ledger_command", required=True)
+    lreport = ledger_sub.add_parser(
+        "report", help="cost and call breakdown, aggregated from rows"
+    )
+    lreport.add_argument("path", help="path to the ledger JSONL file")
+    lreport.add_argument("--ceiling", type=float, default=0.05)
+    lreport.add_argument("--json", action="store_true")
+    lverify = ledger_sub.add_parser(
+        "verify",
+        help="check a ledger for damage. Distinguishes a torn tail (expected "
+        "after a hard kill, surviving rows trustworthy) from sequence gaps "
+        "(rows missing from the middle, aggregates understate the run).",
+    )
+    lverify.add_argument("path")
+    lverify.add_argument("--json", action="store_true")
+
+    runcmd = sub.add_parser("run", help="inspect a completed run")
+    run_sub = runcmd.add_subparsers(dest="run_command", required=True)
+    rinspect = run_sub.add_parser(
+        "inspect", help="criterion, plan, containments and spend from a ledger"
+    )
+    rinspect.add_argument("path", help="path to the ledger JSONL file")
+    rinspect.add_argument("--criterion", action="store_true",
+                          help="print only the frozen criterion")
+    rinspect.add_argument("--containments", action="store_true",
+                          help="print only the containment audit")
+    rinspect.add_argument("--json", action="store_true")
+
     serve = sub.add_parser("serve", help="run the control plane and event stream")
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8000)
@@ -259,6 +288,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "eval":
         return asyncio.run(_eval_command(args))
+
+    if args.command in ("ledger", "run"):
+        return _ledger_command(args)
 
     if args.command == "serve":
         return _serve_command(args)
@@ -441,6 +473,46 @@ async def _eval_command(args: argparse.Namespace) -> int:
             print(f"\nBENCHMARKS.md NOT written: {exc}")
             return 1
     return 0
+
+
+def _ledger_command(args: argparse.Namespace) -> int:
+    """Read a ledger file back. The commands docs/RUNBOOK.md tells you to run."""
+    import json as _json
+
+    from swarmd import ledger_cli
+
+    try:
+        if args.command == "ledger" and args.ledger_command == "report":
+            data = ledger_cli.report(args.path, ceiling=args.ceiling)
+            print(_json.dumps(data, indent=2) if args.json
+                  else ledger_cli.render_report(data))
+            return 0
+
+        if args.command == "ledger" and args.ledger_command == "verify":
+            data = ledger_cli.verify(args.path)
+            print(_json.dumps(data, indent=2) if args.json
+                  else ledger_cli.render_verify(data))
+            # Non-zero on genuine damage so a script can branch on it. A torn
+            # tail is not damage: it is what a hard kill looks like.
+            return 0 if data["intact"] or data["tail_truncated"] else 1
+
+        if args.command == "run" and args.run_command == "inspect":
+            data = ledger_cli.inspect(args.path)
+            if args.criterion:
+                print(_json.dumps(data["criterion"], indent=2))
+            elif args.containments:
+                print(_json.dumps(data["containments"], indent=2))
+            elif args.json:
+                print(_json.dumps(data, indent=2))
+            else:
+                print(ledger_cli.render_inspect(data))
+            return 0
+    except ledger_cli.LedgerNotFound as exc:
+        print(f"{exc}")
+        return 2
+
+    print(f"unknown subcommand for {args.command}")
+    return 2
 
 
 def _serve_command(args: argparse.Namespace) -> int:
