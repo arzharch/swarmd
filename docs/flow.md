@@ -1088,4 +1088,9 @@ kustomize prod: whitelist-source-range present, no LoadBalancer or NodePort on
       with redaction, SECURITY.md, ADR-013
 - [ ] Narrow the egress NetworkPolicy to provider CIDRs (widest control shipped)
 - [ ] Exercise rollback against a real cluster
-- [ ] Debt: FallbackRouter still lists MockProvider as last-resort (ADR-006)
+- [x] Debt cleared: no unmarked mock on any user-facing path. make_router
+      raises instead of downgrading, FallbackRouter no longer recommends a
+      mock tail, and 'mock' now aliases the tainted simulated provider
+- [x] Traceability view + the ledger commands RUNBOOK.md names
+- [ ] Wire skill approval through the HITL queue rather than the library alone
+- [ ] Supervisor consolidation inside the swarm loop (exists for LeadOps only)

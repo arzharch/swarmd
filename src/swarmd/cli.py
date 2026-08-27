@@ -61,11 +61,12 @@ def main(argv: list[str] | None = None) -> int:
     leadops = sub.add_parser("leadops", help="run the LeadOps flagship pipeline")
     leadops.add_argument(
         "--provider",
-        choices=["mock", "openrouter"],
-        default="mock",
-        help="LLM backend. 'mock' is deterministic and offline; 'openrouter' uses "
-        "the free-model fallback chain (needs OPENROUTER_API_KEY, degrades to "
-        "mock without one).",
+        choices=["simulated", "openrouter"],
+        default="simulated",
+        help="LLM backend. 'simulated' is deterministic and offline and marks "
+        "every ledger row it produces as synthetic (ADR-012); it requires "
+        "SWARMD_SIMULATED_PROVIDER=true. 'openrouter' uses free models and "
+        "raises without OPENROUTER_API_KEY rather than quietly downgrading.",
     )
     leadops.add_argument(
         "--limit", type=int, default=20, help="max leads to process from fixtures"

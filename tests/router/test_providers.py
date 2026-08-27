@@ -86,18 +86,38 @@ def test_health_scoring_demotes_errors() -> None:
     assert h_bad.score() > h_ok.score()
 
 
-def test_make_router_modes() -> None:
-    assert make_router("mock").name == "mock"
+def test_simulated_mode_requires_the_explicit_flag(monkeypatch) -> None:
+    """There is no unmarked mock on a user-facing path (ADR-006)."""
+    monkeypatch.delenv("SWARMD_SIMULATED_PROVIDER", raising=False)
+    with pytest.raises(RuntimeError, match="SWARMD_SIMULATED_PROVIDER"):
+        make_router("simulated")
 
-    import os
 
-    saved = os.environ.pop("OPENROUTER_API_KEY", None)
-    try:
-        # No key: graceful degradation to mock instead of crashing.
-        assert make_router("openrouter").name == "mock"
-    finally:
-        if saved is not None:
-            os.environ["OPENROUTER_API_KEY"] = saved
+def test_simulated_mode_returns_the_tainted_provider(monkeypatch) -> None:
+    monkeypatch.setenv("SWARMD_SIMULATED_PROVIDER", "true")
+    assert make_router("simulated").name == "simulated"
+
+
+def test_mock_is_an_alias_that_now_goes_through_the_tainted_path(monkeypatch) -> None:
+    """The frozen LeadOps example still works, but not with an unmarked mock."""
+    monkeypatch.setenv("SWARMD_SIMULATED_PROVIDER", "true")
+    assert make_router("mock").name == "simulated"
+
+
+def test_a_missing_key_raises_rather_than_downgrading_to_mock(monkeypatch) -> None:
+    """A crash is visible; quietly fabricated output is not.
+
+    The previous behaviour degraded to an unmarked mock 'rather than crashing a
+    demo run', which is exactly the trade ADR-006 refuses.
+    """
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    with pytest.raises(RuntimeError, match="OPENROUTER_API_KEY"):
+        make_router("openrouter")
+
+
+def test_an_unknown_mode_is_refused() -> None:
+    with pytest.raises(ValueError, match="unknown router mode"):
+        make_router("wishful")
 
 
 def test_request_serialization_is_stable() -> None:

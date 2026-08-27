@@ -253,8 +253,15 @@ class OpenRouterProvider(Provider):
 class FallbackRouter(Provider):
     """Routes across providers: tries each provider's chain before moving on.
 
-    Typical setup: [MockProvider] for dev/CI, [OpenRouterProvider(free...), Mock]
-    for real runs where the mock is the last-resort guarantee.
+    DO NOT put MockProvider at the end of the chain. An earlier version of this
+    docstring recommended exactly that as a "last-resort guarantee", which meant
+    a total provider outage silently produced synthetic output that nothing
+    downstream marked as synthetic -- the precise failure ADR-006 exists to
+    prevent. A run with no reachable provider must fail loudly.
+
+    Superseded in practice by ProviderPool (ADR-008), which adds per-credential
+    quota, empirical rate-limit discovery, and tier ordering. This remains for
+    the LeadOps example, which is frozen.
     """
 
     name = "router"
@@ -274,26 +281,40 @@ class FallbackRouter(Provider):
         raise ProviderError("all providers failed:\n" + "\n".join(errors))
 
 
-def make_router(mode: str = "mock") -> Provider:
-    """Factory used by CLI/examples.
+def make_router(mode: str = "simulated") -> Provider:
+    """Factory used by the CLI and the LeadOps example.
 
     ANATOMY: mode
-      "mock"     -> deterministic only (default; CI, tests, offline demos)
-      "openrouter" -> free-model chain with mock as last resort. Needs
-                      OPENROUTER_API_KEY; without it falls back to mock with a
-                      warning rather than crashing a demo run.
-    """
-    if mode == "mock":
-        return MockProvider()
-    if mode == "openrouter":
-        try:
-            orp = OpenRouterProvider()
-        except RuntimeError as exc:
-            import logging
+      "simulated"  -> the tainted synthetic provider. Requires
+                      SWARMD_SIMULATED_PROVIDER=true, and every ledger row it
+                      produces is marked simulated (ADR-012).
+      "openrouter" -> free models. Requires OPENROUTER_API_KEY and RAISES
+                      without one.
 
-            logging.getLogger(__name__).warning("%s — using mock", exc)
-            return MockProvider()
-        return FallbackRouter([orp, MockProvider()])
+    Two behaviours here were ADR-006 violations and are now fixed. `mode="mock"`
+    returned an UNMARKED deterministic provider on a user-facing path, so a demo
+    could show synthetic output that nothing identified as synthetic. And a
+    missing API key silently downgraded to that same mock "rather than crashing
+    a demo run" -- which is precisely the trade ADR-006 refuses: a crash is
+    visible, and quietly fabricated output is not.
+
+    `mode="mock"` is still accepted as an alias for "simulated" so the frozen
+    LeadOps example keeps working, but it now goes through the tainted path.
+    """
+    if mode in {"simulated", "mock"}:
+        from swarmd.router.simulated import ENV_FLAG, SimulatedProvider
+
+        try:
+            return SimulatedProvider()
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"{exc}\n\nThere is deliberately no unmarked mock on this "
+                f"path: set {ENV_FLAG}=true to run against synthetic output "
+                f"that is marked as such everywhere it surfaces."
+            ) from exc
+    if mode == "openrouter":
+        # No mock fallback. A run with no reachable provider fails loudly.
+        return OpenRouterProvider()
     raise ValueError(f"unknown router mode: {mode!r}")
 
 
