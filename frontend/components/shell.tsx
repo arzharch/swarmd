@@ -142,6 +142,10 @@ export function TopBar({
   onChaos,
   useSkills,
   onUseSkills,
+  agents,
+  onAgents,
+  seedRogues,
+  onSeedRogues,
   onRun,
   submitting,
   connection,
@@ -155,6 +159,10 @@ export function TopBar({
   onChaos: (v: boolean) => void;
   useSkills: boolean;
   onUseSkills: (v: boolean) => void;
+  agents: string;
+  onAgents: (v: string) => void;
+  seedRogues: string;
+  onSeedRogues: (v: string) => void;
   onRun: () => void;
   submitting: boolean;
   connection: ConnectionState;
@@ -178,6 +186,33 @@ export function TopBar({
         <option value="smoke">smoke · ~2 min</option>
         <option value="standard">standard · 12–18 min</option>
         <option value="deep">deep · ~40 min</option>
+      </select>
+
+      <input
+        className="agents"
+        type="number"
+        min={1}
+        max={2000}
+        value={agents}
+        onChange={(e) => onAgents(e.target.value)}
+        placeholder="agents"
+        aria-label="Agent count"
+        title="How many agents to run. Empty uses the profile's figure. Above 16 per plan node the cost ceiling, not a cap, is what stops the run — batched generation and the semantic cache are not implemented yet."
+      />
+
+      <select
+        value={seedRogues}
+        onChange={(e) => onSeedRogues(e.target.value)}
+        aria-label="Seed rogue agents"
+        title="Inject deliberate misbehaviour. The red-team is not told which agents are seeded; the run reports whether each pattern's own detector caught it."
+      >
+        <option value="">No rogues</option>
+        <option value="all">Seed all 5 rogues</option>
+        <option value="budget_siphon">Rogue: budget siphon</option>
+        <option value="loop">Rogue: loop</option>
+        <option value="criterion_gaming">Rogue: criterion gaming</option>
+        <option value="unsafe_tool_call">Rogue: unsafe tool call</option>
+        <option value="library_poisoning">Rogue: library poisoning</option>
       </select>
 
       <label className="toggle" title="Kill agents mid-run. Recovery is the guarantee this tests.">

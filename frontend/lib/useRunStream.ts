@@ -227,7 +227,14 @@ export function useRunStream() {
   }, []);
 
   const submit = useCallback(
-    async (task: string, profile: string, chaos: boolean, useSkills: boolean) => {
+    async (
+      task: string,
+      profile: string,
+      chaos: boolean,
+      useSkills: boolean,
+      agents: number | null,
+      seedRogues: string,
+    ) => {
       const response = await fetch("/api/runs", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -236,6 +243,10 @@ export function useRunStream() {
           profile,
           chaos,
           use_skills: useSkills,
+          // null, not 0: omitting the field lets the profile decide, which is
+          // a different request from asking for no agents.
+          agents,
+          seed_rogues: seedRogues,
         }),
       });
       if (!response.ok) {

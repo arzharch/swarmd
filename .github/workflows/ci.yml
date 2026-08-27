@@ -100,6 +100,19 @@ jobs:
             "extract and verify the numeric claims in a short report" \
             --profile smoke --chaos --kill-rate 0.3
 
+      - name: red-team gate (SPEC Phase 8)
+        # Five deliberate rogues, injected into a real run. The red-team is not
+        # told which agents are seeded, and the exit code reflects whether each
+        # pattern's OWN detector caught it -- containment by a different
+        # detector fails the gate, because that proves one detector twice and
+        # another not at all.
+        env:
+          SWARMD_SIMULATED_PROVIDER: "true"
+        run: |
+          uv run swarmd swarm run \
+            "extract and verify the numeric claims in a short report" \
+            --profile smoke --seed-rogues all
+
   guards:
     name: deploy + frontend guards
     runs-on: ubuntu-latest

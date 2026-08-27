@@ -337,6 +337,14 @@ a { color: var(--blue); text-decoration: none; }
   flex-wrap: wrap;
 }
 
+/* The agent-count box. Narrow on purpose: it holds at most four digits, and a
+   full-width field next to the task input would read as a second task field. */
+.topbar input.agents {
+  width: 88px;
+  flex: 0 0 auto;
+  text-align: right;
+}
+
 /* ============================================================
    Controls
    ============================================================ */
