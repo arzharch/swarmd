@@ -17,6 +17,7 @@ Design notes:
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -53,16 +54,46 @@ class OtelSink:
         self._open: dict[str, Any] = {}  # span_id -> OTel span handle
 
     def export(self, span: Any) -> None:  # Span; typed loosely to avoid import cycle
-        """Export one finished swarmd span as an OTel span.
+        """Export one finished swarmd span as an OTel span WITH tree structure.
 
-        swarmd spans arrive complete (end_ts set), so we recreate timing via
-        start/end timestamps rather than relying on context-manager lifetime.
-        Parent linkage uses the stored parent_id.
+        BUG THIS FIXES: exporting each span without parent context made Jaeger
+        show N single-span traces instead of one tree. We derive deterministic
+        OTel IDs from swarmd's IDs and pass an explicit parent SpanContext, so
+        all spans sharing a swarmd trace_id land in ONE Jaeger trace with real
+        parent/child links.
         """
-        otel_span = self._tracer.start_span(
-            name=f"{span.kind}.{span.name}",
+        from opentelemetry.trace import NonRecordingSpan, SpanContext, set_span_in_context
+
+        trace_id_int = int(span.trace_id, 16) & ((1 << 128) - 1)
+        own_span_id = self._stable_span_id(span)
+
+        # Parent context: a NonRecordingSpan carrying the parent's span id so
+        # the SDK records proper references. Root spans get NO parent context —
+        # self-parenting is invalid and made Jaeger drop earlier attempts.
+        parent_ctx = None
+        if span.parent_id:
+            parent_id_int = int(span.parent_id, 16) & ((1 << 64) - 1)
+            if parent_id_int != own_span_id:  # guard against self-reference
+                parent_ctx = set_span_in_context(
+                    NonRecordingSpan(
+                        SpanContext(
+                            trace_id=trace_id_int,
+                            span_id=parent_id_int,
+                            is_remote=False,
+                        )
+                    )
+                )
+
+        kwargs: dict[str, Any] = dict(
             attributes=self._attributes(span),
             start_time=self._ns(span.start_ts),
+        )
+        if parent_ctx is not None:
+            kwargs["context"] = parent_ctx
+
+        otel_span = self._tracer.start_span(
+            name=f"{span.kind}.{span.name}",
+            **kwargs,
         )
         if span.end_ts is not None:
             otel_span.end(end_time=self._ns(span.end_ts))
@@ -72,14 +103,30 @@ class OtelSink:
         otel_span.set_attribute("swarmd.trace_id", span.trace_id)
 
     @staticmethod
-    def _ns(monotonic_ts: float) -> int:
-        """Convert monotonic seconds to epoch-ish nanoseconds OTel accepts.
+    def _stable_span_id(span: Any) -> int:
+        """Deterministic 64-bit span id from swarmd's span_id hex."""
+        return int(span.span_id[:16].ljust(16, "0"), 16) & ((1 << 64) - 1)
 
-        OTel wants wall-clock ns; our spans use monotonic. The absolute base is
-        arbitrary for Jaeger display purposes — relative ordering is preserved,
-        which is what matters for debugging.
+    # Monotonic clock has no fixed epoch; anchor it to wall clock once per
+    # process so exported timestamps land in Jaeger's real query window.
+    _mono_anchor: float | None = None
+    _wall_anchor: int | None = None
+
+    @classmethod
+    def _ns(cls, monotonic_ts: float) -> int:
+        """Convert monotonic seconds to wall-clock nanoseconds.
+
+        BUG THIS FIXES: monotonic() counts from boot (~580000s on an old
+        machine), so naive conversion produced timestamps years in the past —
+        Jaeger registered the service but every trace fell outside its default
+        query window. Anchoring once keeps relative ordering exact while making
+        absolute values meaningful.
         """
-        return int(monotonic_ts * 1_000_000_000)
+        if cls._mono_anchor is None or cls._wall_anchor is None:
+            cls._mono_anchor = time.monotonic()
+            cls._wall_anchor = time.time_ns()
+        delta_ns = int((monotonic_ts - cls._mono_anchor) * 1_000_000_000)
+        return cls._wall_anchor + delta_ns
 
     @staticmethod
     def _attributes(span: Any) -> dict[str, Any]:
