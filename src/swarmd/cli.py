@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -231,12 +232,15 @@ async def _providers_command(args: argparse.Namespace) -> int:
 async def _hitl_command(args: argparse.Namespace) -> int:
     """HITL CLI over the same durable store the pipeline writes to.
 
-    NOTE: uses an in-process store; Phase 6 swaps in Postgres so approvals
-    survive across processes. The state machine is identical.
+    `build_approval_store` picks Postgres when DATABASE_URL is set and SQLite
+    otherwise. It never returns the in-memory store: doing so was the defect
+    that made Phase 3's gate pass on paper while approvals silently vanished
+    between processes, since every invocation got its own empty dict.
     """
-    from swarmd.hitl.approvals import ApprovalManager, InMemoryApprovalStore
+    from swarmd.hitl.approvals import ApprovalManager
+    from swarmd.hitl.stores import build_approval_store
 
-    mgr = ApprovalManager(InMemoryApprovalStore())
+    mgr = ApprovalManager(build_approval_store())
 
     if args.command == "list":
         pending = await mgr.pending()
@@ -244,9 +248,10 @@ async def _hitl_command(args: argparse.Namespace) -> int:
             print("no pending approvals")
             return 0
         for req in pending:
-            company = req.item.get("company", "?")
-            subject = req.item.get("subject", "?")
-            print(f"{req.request_id}  [{req.stage}]  {company}: {subject}")
+            summary = _summarise_item(req.item)
+            age_s = int(time.time() - req.created_ts)
+            print(f"{req.request_id}  [{req.stage}]  {_age(age_s):>6}  {summary}")
+        print(f"\n{len(pending)} pending")
         return 0
 
     try:
@@ -261,6 +266,34 @@ async def _hitl_command(args: argparse.Namespace) -> int:
     trail = await mgr.audit()
     print(f"audit entries: {len(trail)} (append-only)")
     return 0
+
+
+def _summarise_item(item: dict[str, Any]) -> str:
+    """One readable line per queued item, whatever shape the item is.
+
+    The review queue holds different things depending on the stage -- an
+    outreach draft, a candidate skill, a contained agent -- so it cannot assume
+    a schema. It shows the first few scalar fields rather than dumping JSON,
+    because a queue nobody can skim is a queue nobody works through.
+    """
+    parts = []
+    for key, value in item.items():
+        if isinstance(value, (str, int, float, bool)):
+            text = str(value)
+            parts.append(f"{key}={text[:40]}")
+        if len(parts) == 3:
+            break
+    return "  ".join(parts) or "<no scalar fields>"
+
+
+def _age(seconds: int) -> str:
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m"
+    if seconds < 86400:
+        return f"{seconds // 3600}h"
+    return f"{seconds // 86400}d"
 
 
 async def _pending_count(pipe: Any) -> int:
