@@ -135,19 +135,44 @@ spec:
               app.kubernetes.io/name: swarmd-redis
       ports:
         - port: 6379
-    # Provider APIs and managed Postgres, which are outside the cluster. This
-    # is deliberately the loosest rule here and it is the one worth tightening
-    # first: egress to 443 anywhere is how generated code in the sandbox would
-    # reach the internet if it escaped its subprocess. Narrow it to specific
-    # CIDRs once the provider set is stable.
+    # Managed Postgres, inside the VPC. Narrow: the database is at a known
+    # address and nothing else in the cluster speaks 5432.
     - to:
         - ipBlock:
-            cidr: 0.0.0.0/0
-            except:
-              - 169.254.169.254/32   # cloud metadata endpoint: credential theft
-              - 10.0.0.0/8
-              - 172.16.0.0/12
-              - 192.168.0.0/16
+            cidr: 10.42.0.0/16          # the VPC CIDR from deploy/terraform
+      ports:
+        - port: 5432
+
+    # Provider APIs. This USED to be 443-to-anywhere, which was the loosest
+    # control shipped and the one docs/PRR.md named as a blocker: it is the
+    # path generated code in the sandbox would take to reach the internet if it
+    # escaped its subprocess.
+    #
+    # Now restricted to the published egress ranges of the providers actually
+    # in the pool. The list is maintained here rather than discovered, because
+    # a NetworkPolicy cannot resolve DNS names -- Kubernetes matches on IP, so
+    # a hostname-based rule is not a thing that exists.
+    #
+    # CONSEQUENCE, stated because it will bite someone: when a provider changes
+    # its egress ranges, calls fail with a transport error rather than a 429,
+    # the pool records it as an error rather than a rate limit, and every
+    # provider eventually looks unhealthy. RUNBOOK.md#providerpoolexhausted
+    # lists "egress blocked" as cause 4 for exactly this reason. Verify from
+    # inside a pod before assuming the provider is down.
+    #
+    # These ranges are checked at each capacity-plan review (docs/CAPACITY.md).
+    - to:
+        # Cloudflare, fronting Groq and OpenRouter.
+        - ipBlock: { cidr: 104.16.0.0/13 }
+        - ipBlock: { cidr: 172.64.0.0/13 }
+        - ipBlock: { cidr: 162.159.0.0/16 }
+        # Google APIs, fronting AI Studio / Gemini.
+        - ipBlock: { cidr: 142.250.0.0/15 }
+        - ipBlock: { cidr: 172.217.0.0/16 }
+        - ipBlock: { cidr: 216.58.192.0/19 }
+        - ipBlock: { cidr: 34.64.0.0/10 }
+        # AWS us-east-1 edge, fronting Cerebras.
+        - ipBlock: { cidr: 3.5.0.0/16 }
+        - ipBlock: { cidr: 52.84.0.0/15 }
       ports:
         - port: 443
-        - port: 5432

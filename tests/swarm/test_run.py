@@ -108,7 +108,10 @@ async def test_a_run_completes_and_reports_everything():
     assert result.status == "completed"
     assert result.criterion is not None
     assert result.plan is not None
-    assert [r.node for r in result.results] == ["gather", "verify"]
+    # A POOL per node, not one agent. Population search, market selection and
+    # distillation evidence all require several agents attempting the same work.
+    assert {r.node for r in result.results} == {"gather", "verify"}
+    assert len(result.results) > 2, "each node must be attempted by a pool"
     assert all(r.passed for r in result.results)
 
 
@@ -345,3 +348,58 @@ async def test_a_broken_event_sink_never_stalls_the_run():
         ScriptedProvider(), profile="smoke", on_event=explode
     ).run("t")
     assert result.status == "completed"
+
+
+# --- the pool --------------------------------------------------------------
+
+
+async def test_each_node_is_attempted_by_a_pool_not_one_agent():
+    """This was a real defect: one agent per node meant --agents was unused,
+    there was no population to select over, and distillation -- which needs two
+    verified successes on a node -- could never fire."""
+    result = await _run().run("summarise the source records")
+    by_node: dict[str, int] = {}
+    for outcome in result.results:
+        by_node[outcome.node] = by_node.get(outcome.node, 0) + 1
+    assert all(count >= 2 for count in by_node.values()), by_node
+
+
+async def test_every_agent_in_the_pool_holds_its_own_budget():
+    """Otherwise the market has nothing to select over."""
+    run = _run()
+    await run.run("t")
+    accounts = run.economy.all()
+    assert len(accounts) >= 4
+    assert all(a.attempts or a.spent for a in accounts if a.alive)
+
+
+async def test_pool_size_is_floored_so_distillation_always_has_evidence():
+    from swarmd.swarm.planner import PlanNode, validate
+
+    run = _run()
+    # The widest plan the validator permits, so the per-node budget is at
+    # its smallest.
+    plan = validate([PlanNode(name=f"n{i}", instruction="produce x.json")
+                     for i in range(12)])
+    assert run._pool_size(plan) >= 2
+
+
+async def test_pool_size_is_capped_so_a_run_does_not_always_abort():
+    """The 500-agent figure assumes batching and caching, neither implemented.
+    Uncapped, every run would breach the ceiling instead of finishing."""
+    from swarmd.swarm.planner import PlanNode, validate
+
+    run = SwarmRun(ScriptedProvider(), profile="standard")
+    plan = validate([PlanNode(name="only", instruction="produce x.json")])
+    assert run._pool_size(plan) <= 16
+
+
+async def test_a_pool_produces_the_evidence_distillation_requires(tmp_path):
+    from swarmd.swarm.skills import SkillLibrary
+
+    library = SkillLibrary(tmp_path / "skills.json")
+    run = SwarmRun(ScriptedProvider(), profile="smoke", skills=library)
+    result = await run.run("summarise the source records")
+
+    assert result.proposed_skills, "a pool should yield repeatable-approach evidence"
+    assert library.pending()

@@ -150,6 +150,33 @@ def main(argv: list[str] | None = None) -> int:
     swarm_run.add_argument("--json", action="store_true",
                            help="emit the full report as JSON")
 
+    swarm_session = swarm_sub.add_parser(
+        "session", help="run many tasks with consolidation and curriculum between"
+    )
+    swarm_session.add_argument("--tasks", type=int, default=10,
+                               help="how many tasks to run from the suite")
+    swarm_session.add_argument("--profile", default="smoke",
+                               choices=["smoke", "standard", "deep", "eval"])
+    swarm_session.add_argument("--skills", default="skills.json", metavar="PATH")
+    swarm_session.add_argument("--ledger", default=None, metavar="PATH")
+    swarm_session.add_argument(
+        "--no-skills", action="store_true",
+        help="the CONTROL ARM: skill retrieval disabled, everything else equal",
+    )
+    swarm_session.add_argument(
+        "--consolidate-every", type=int, default=5,
+        help="runs between consolidation passes. Why 5: pruning needs several "
+        "uses per skill before the record means anything, and consolidating "
+        "after every run retires skills on one bad draw.",
+    )
+    swarm_session.add_argument(
+        "--auto-approve", action="store_true",
+        help="DEVELOPMENT ONLY. Approves distilled skills with no human. The "
+        "gate is what stops the library poisoning itself; every auto-approval "
+        "is recorded with actor 'auto-approve' so the bypass stays visible.",
+    )
+    swarm_session.add_argument("--json", action="store_true")
+
     ev = sub.add_parser("eval", help="run the evaluation suite with a control arm")
     ev.add_argument(
         "--arms", default="both", choices=["both", "public", "custom"],
@@ -209,15 +236,22 @@ def main(argv: list[str] | None = None) -> int:
     serve.add_argument("--port", type=int, default=8000)
     serve.add_argument("--skills", default=None, metavar="PATH")
 
-    approve = sub.add_parser("approve", help="approve a pending draft (HITL)")
+    approve = sub.add_parser("approve", help="approve a pending item (HITL)")
     approve.add_argument("request_id")
     approve.add_argument("--actor", default="cli-user")
+    approve.add_argument(
+        "--skills", default=None, metavar="PATH",
+        help="skill library, for approving a queued skill. Approving a skill "
+        "without it records the decision but leaves the library out of sync.",
+    )
 
-    reject = sub.add_parser("reject", help="reject a pending draft (HITL)")
+    reject = sub.add_parser("reject", help="reject a pending item (HITL)")
     reject.add_argument("request_id")
     reject.add_argument("--actor", default="cli-user")
+    reject.add_argument("--skills", default=None, metavar="PATH")
 
-    sub.add_parser("list", help="list pending approvals (HITL)")
+    listcmd = sub.add_parser("list", help="list pending approvals (HITL)")
+    listcmd.add_argument("--skills", default=None, metavar="PATH")
 
     args = parser.parse_args(argv)
 
@@ -285,6 +319,8 @@ def main(argv: list[str] | None = None) -> int:
         return asyncio.run(_providers_command(args))
 
     if args.command == "swarm":
+        if args.swarm_command == "session":
+            return asyncio.run(_session_command(args))
         return asyncio.run(_swarm_command(args))
 
     if args.command == "eval":
@@ -422,6 +458,69 @@ def _print_event(event: dict[str, Any]) -> None:
                   "containment", "agent_killed", "node_finished"}:
         detail = event.get("hash") or event.get("node") or event.get("reason") or ""
         print(f"  * {kind} {detail}")
+
+
+async def _session_command(args: argparse.Namespace) -> int:
+    """Run many tasks with learning between them."""
+    import json as _json
+
+    _ensure_examples_importable()
+    from examples.tasks.suite import suite
+    from swarmd.harnesses.sandbox import SandboxHarness
+    from swarmd.hitl.approvals import ApprovalManager
+    from swarmd.hitl.stores import build_approval_store
+    from swarmd.router.pool import ProviderPool
+    from swarmd.swarm.run import SwarmRun
+    from swarmd.swarm.session import SwarmSession
+    from swarmd.swarm.skills import SkillLibrary
+
+    try:
+        pool = ProviderPool.from_env()
+    except RuntimeError as exc:
+        print(f"no provider capacity: {exc}")
+        return 2
+
+    library = SkillLibrary(args.skills)
+    approvals = ApprovalManager(build_approval_store())
+    sandbox = SandboxHarness()
+    use_skills = not args.no_skills
+
+    async def run_factory(task: str, index: int) -> Any:
+        run = SwarmRun(
+            pool,
+            profile=args.profile,
+            use_skills=use_skills,
+            skills=library,
+            sandbox=sandbox,
+            approvals=approvals,
+            ledger_path=args.ledger,
+            on_event=_print_event,
+        )
+        result = await run.run(task)
+        return result, run.report(result)
+
+    tasks = [t.prompt for t in suite(arms="both")][: args.tasks]
+    if len(tasks) < args.tasks:
+        # Cycle rather than silently running fewer: a session of 40 that ran 10
+        # would report a curve over a quarter of the requested evidence.
+        tasks = [tasks[i % len(tasks)] for i in range(args.tasks)]
+    print(f"session: {len(tasks)} tasks, profile {args.profile}, "
+          f"arm {'treatment' if use_skills else 'control'}")
+
+    session = SwarmSession(
+        run_factory,
+        library,
+        approvals=approvals,
+        consolidate_every=args.consolidate_every,
+        auto_approve=args.auto_approve,
+        skills_enabled=use_skills,
+    )
+    report = await session.run(tasks)
+    await pool.aclose()
+
+    print()
+    print(_json.dumps(report.to_dict(), indent=2) if args.json else report.render())
+    return 0
 
 
 async def _eval_command(args: argparse.Namespace) -> int:
@@ -564,7 +663,10 @@ async def _hitl_command(args: argparse.Namespace) -> int:
     between processes, since every invocation got its own empty dict.
     """
     from swarmd.hitl.approvals import ApprovalManager
+    from swarmd.hitl.skill_gate import STAGE as SKILL_STAGE
+    from swarmd.hitl.skill_gate import SkillGate
     from swarmd.hitl.stores import build_approval_store
+    from swarmd.swarm.skills import SkillLibrary
 
     mgr = ApprovalManager(build_approval_store())
 
@@ -579,6 +681,32 @@ async def _hitl_command(args: argparse.Namespace) -> int:
             print(f"{req.request_id}  [{req.stage}]  {_age(age_s):>6}  {summary}")
         print(f"\n{len(pending)} pending")
         return 0
+
+    # A skill decision must also reach the library, or the queue and the
+    # library diverge: the audit trail says approved and the skill stays
+    # unusable. Routed through SkillGate so both happen in one place.
+    existing = await mgr.store.get_request(args.request_id)
+    if existing is not None and existing.stage == SKILL_STAGE:
+        gate = SkillGate(mgr, SkillLibrary(args.skills))
+        try:
+            decision = await gate.decide(
+                args.request_id, args.command, actor=args.actor
+            )
+        except KeyError:
+            print(f"unknown request: {args.request_id}")
+            return 1
+        except ValueError as exc:
+            print(f"rejected: {exc}")
+            return 1
+        print(
+            f"{decision.request.request_id} -> {decision.request.state.value} "
+            f"(actor={args.actor})"
+        )
+        print(f"skill: {decision.detail}")
+        if not decision.applied:
+            print("WARNING: the decision is recorded but the library is out of "
+                  "sync. Re-run once the library path is reachable.")
+        return 0 if decision.applied else 1
 
     try:
         req = await mgr.decide(args.request_id, args.command, actor=args.actor)

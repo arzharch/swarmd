@@ -139,6 +139,7 @@ class SwarmRun:
         sandbox: Any = None,
         chaos: Any = None,
         use_skills: bool = True,
+        approvals: Any = None,
         on_event: Any = None,
     ) -> None:
         if profile not in PROFILES:
@@ -160,6 +161,14 @@ class SwarmRun:
         self.use_skills = use_skills
         self.sandbox = sandbox
         self.chaos = chaos
+        # Durable approval queue. When present, a distilled skill is queued
+        # through the SAME store and audit trail as every other human decision
+        # rather than only landing in the library's pending list.
+        self.approvals = approvals
+        # Verified successes required on one node before a skill is proposed.
+        # Why 2: one success can be luck, and a skill distilled from luck is a
+        # superstition every future run inherits.
+        self.min_evidence = 2
         self.redteam = RedTeam(kill=self._contain)
         self.on_event = on_event
 
@@ -250,7 +259,7 @@ class SwarmRun:
             result.criterion = await self._synthesize_criterion(task)
             result.plan = await self._synthesize_plan(task)
             result.results = await self._execute(task, result.plan, result.criterion)
-            result.proposed_skills = self._distill(task, result)
+            result.proposed_skills = await self._distill(task, result)
             result.status = "completed"
         except SynthesisFailed as exc:
             # An honest failure: no criterion survived attack, so there is
@@ -307,6 +316,29 @@ class SwarmRun:
         self._emit("plan_selected", **selection.plan.to_dict())
         return selection.plan
 
+    def _pool_size(self, plan: Plan) -> int:
+        """Agents per plan node.
+
+        ANATOMY: pool size
+          The profile's agent budget spread across the plan's nodes, floored at
+          2 so distillation always has the evidence it needs, and capped at 16
+          per node.
+
+          Why the cap. The capacity plan's 500-agent figure assumes two levers
+          that are NOT yet implemented: batched generation (one call returning K
+          variants) and the semantic cache. Without them every agent is a real
+          call, and 500 agents would blow the $0.05 ceiling long before
+          finishing. The ceiling would stop it safely -- that is what it is for
+          -- but a run that always aborts is not a run. Capping here makes the
+          gap explicit rather than letting it surface as a mysterious abort.
+
+          Raising this to the profile's full agent count is a one-line change
+          once batching lands.
+        """
+        nodes = max(1, len(plan.nodes))
+        budget = max(2, self.profile.agents // nodes)
+        return min(16, budget)
+
     async def _execute(
         self, task: str, plan: Plan, criterion: FrozenCriterion
     ) -> list[WorkerResult]:
@@ -337,7 +369,7 @@ class SwarmRun:
             self._emit("level_started", nodes=level)
             metrics.set_queue_depth(stage="plan", depth=len(level))
 
-            async def run_node(name: str) -> WorkerResult:
+            async def run_agent(name: str) -> WorkerResult:
                 node = plan.node(name)
                 account = self.economy.spawn(traits={"node": name})
                 metrics.set_agents_alive(
@@ -366,8 +398,19 @@ class SwarmRun:
                     self._emit("thought", **thought)
                 return outcome
 
+            # A POOL per node, not one agent. Population is the whole premise:
+            # population search, market selection, and distillation evidence all
+            # need several agents attempting the same work independently.
+            #
+            # This was a real defect. The executor spawned exactly one agent per
+            # node, so `--agents 500` was never used, there was no population to
+            # select over, and distillation -- which requires two verified
+            # successes on the same node before proposing a skill -- could never
+            # fire. The learning loop was structurally dead.
+            pool = self._pool_size(plan)
             level_results = await asyncio.gather(
-                *(run_node(name) for name in level), return_exceptions=True
+                *(run_agent(name) for name in level for _ in range(pool)),
+                return_exceptions=True,
             )
             for item in level_results:
                 if isinstance(item, WorkerResult):
@@ -383,28 +426,84 @@ class SwarmRun:
 
         return results
 
-    def _distill(self, task: str, result: RunResult) -> list[str]:
+    async def _distill(self, task: str, result: RunResult) -> list[str]:
         """Turn verified successes into candidate skills, pending a human.
 
-        Nothing here enters the library. `propose` records a candidate; a human
-        approves it. That gate is the difference between a library that
-        improves and one that compounds its own mistakes.
+        Nothing here enters the library usable. A candidate is recorded and
+        QUEUED; a human approves it. That gate is the difference between a
+        library that improves and one that compounds its own mistakes.
+
+        Requires more than one verified success per node before proposing.
+        A skill distilled from a single win is a superstition, and every future
+        run would inherit it — the red-team's library_poisoning detector flags
+        exactly this, so checking here runs the cheap check before the
+        expensive proposal.
         """
         if self.skills is None or result.criterion is None:
             return []
-        proposed = []
+
+        gate = None
+        if self.approvals is not None:
+            from swarmd.hitl.skill_gate import SkillGate
+
+            gate = SkillGate(self.approvals, self.skills)
+
+        # Group by node: two agents independently succeeding on the same step
+        # is the evidence a skill is a repeatable approach rather than luck.
+        by_node: dict[str, list[Any]] = {}
         for outcome in result.passed:
-            if outcome.contained:
+            if not outcome.contained:
+                by_node.setdefault(outcome.node, []).append(outcome)
+
+        proposed: list[str] = []
+        for node, outcomes in by_node.items():
+            if len(outcomes) < self.min_evidence:
+                self._emit(
+                    "skill_skipped",
+                    node=node,
+                    reason=f"{len(outcomes)} success(es), need {self.min_evidence}",
+                )
                 continue
-            skill = self.skills.propose(
-                name=f"{outcome.node} approach",
-                task_pattern=task,
-                instruction=outcome.candidate.output[:600],
-                run_id=self.run_id,
-                criterion_hash=result.criterion.hash,
-            )
-            proposed.append(skill.skill_id)
-            self._emit("skill_proposed", skill_id=skill.skill_id, name=skill.name)
+
+            instruction = max(
+                (o.candidate.output for o in outcomes), key=len
+            )[:600]
+            try:
+                if gate is not None:
+                    skill, request = await gate.submit(
+                        name=f"{node} approach",
+                        task_pattern=task,
+                        instruction=instruction,
+                        run_id=self.run_id,
+                        criterion_hash=result.criterion.hash,
+                        evidence=len(outcomes),
+                    )
+                    self._emit(
+                        "skill_proposed",
+                        skill_id=skill.skill_id,
+                        name=skill.name,
+                        request_id=request.request_id,
+                        evidence=len(outcomes),
+                    )
+                else:
+                    # No approval store wired: record the candidate so the run
+                    # still reports what it would have proposed, but it stays
+                    # unusable exactly as before.
+                    skill = self.skills.propose(
+                        name=f"{node} approach",
+                        task_pattern=task,
+                        instruction=instruction,
+                        run_id=self.run_id,
+                        criterion_hash=result.criterion.hash,
+                    )
+                    self._emit(
+                        "skill_proposed", skill_id=skill.skill_id, name=skill.name
+                    )
+                proposed.append(skill.skill_id)
+            except Exception as exc:  # noqa: BLE001 - distillation is optional
+                # A skill already approved in an earlier run, or a store
+                # failure. Neither should fail a run that already succeeded.
+                self._emit("skill_skipped", node=node, reason=str(exc)[:160])
         return proposed
 
     # -- reporting ----------------------------------------------------------

@@ -323,6 +323,31 @@ def create_app(
         if action not in {"approve", "reject"}:
             raise HTTPException(400, "action must be approve or reject")
         manager = ApprovalManager(build_approval_store())
+
+        # A skill decision must reach the library too, or the audit trail says
+        # approved while the skill stays unusable.
+        from swarmd.hitl.skill_gate import STAGE as SKILL_STAGE
+        from swarmd.hitl.skill_gate import SkillGate
+        from swarmd.swarm.skills import SkillLibrary
+
+        existing = await manager.store.get_request(request_id)
+        if existing is not None and existing.stage == SKILL_STAGE:
+            gate = SkillGate(manager, SkillLibrary(app.state.skills_path))
+            try:
+                decision = await gate.decide(request_id, action, actor=actor)
+            except KeyError as exc:
+                raise HTTPException(404, str(exc)) from exc
+            except ValueError as exc:
+                raise HTTPException(409, str(exc)) from exc
+            return JSONResponse(
+                {
+                    "request_id": decision.request.request_id,
+                    "state": decision.request.state.value,
+                    "applied": decision.applied,
+                    "detail": decision.detail,
+                }
+            )
+
         try:
             decided = await manager.decide(request_id, action, actor=actor)
         except KeyError as exc:

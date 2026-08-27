@@ -7,6 +7,7 @@ production. A comment saying "don't do X" is not a control; a failing build is.
 
 from __future__ import annotations
 
+import ipaddress
 import pathlib
 
 import pytest
@@ -181,17 +182,37 @@ def test_every_container_requests_resources():
             assert requests.get("cpu"), f"{name}/{container['name']} has no cpu request"
 
 
-def test_egress_policy_blocks_the_cloud_metadata_endpoint():
-    """169.254.169.254 is the standard path from code execution to cloud creds."""
-    found = False
-    for _, doc in _all_deploy_docs():
+def test_no_egress_rule_can_reach_the_cloud_metadata_endpoint():
+    """169.254.169.254 is the standard path from code execution to cloud creds.
+
+    Asserted by checking every permitted CIDR rather than looking for an
+    `except` entry: the policy now ALLOWLISTS provider ranges instead of
+    excepting the metadata address out of 0.0.0.0/0, which is strictly
+    stronger, and a test that only looked for the exception would have gone
+    green while checking nothing.
+    """
+    metadata = ipaddress.ip_address("169.254.169.254")
+    offenders = []
+    for path, doc in _all_deploy_docs():
         if doc.get("kind") != "NetworkPolicy":
             continue
-        for block in _walk(doc, "ipBlock"):
-            for excluded in block.get("except", []):
-                if excluded.startswith("169.254.169.254"):
-                    found = True
-    assert found, "no NetworkPolicy excludes the cloud metadata endpoint"
+        for rule in doc["spec"].get("egress", []):
+            for target in rule.get("to", []):
+                block = target.get("ipBlock")
+                if not block:
+                    continue
+                network = ipaddress.ip_network(block["cidr"])
+                if metadata not in network:
+                    continue
+                excepted = any(
+                    metadata in ipaddress.ip_network(e)
+                    for e in block.get("except", [])
+                )
+                if not excepted:
+                    offenders.append(
+                        f"{path.relative_to(REPO)}: {block['cidr']} reaches metadata"
+                    )
+    assert offenders == [], offenders
 
 
 # --- alert/runbook coupling ------------------------------------------------
@@ -366,3 +387,36 @@ def test_structured_logging_is_configured_in_cluster():
     for doc in yaml.safe_load_all(path.read_text(encoding="utf-8")):
         if doc and doc.get("kind") == "ConfigMap":
             assert doc["data"].get("SWARMD_LOG_FORMAT") == "json"
+
+
+def test_egress_is_not_open_to_the_whole_internet():
+    """443-to-anywhere was the loosest control shipped and the PRR's blocker.
+
+    It is the path generated code in the sandbox would take to reach the
+    internet if it escaped its subprocess.
+    """
+    offenders = []
+    for path, doc in _all_deploy_docs():
+        if doc.get("kind") != "NetworkPolicy":
+            continue
+        for rule in doc["spec"].get("egress", []):
+            for target in rule.get("to", []):
+                cidr = target.get("ipBlock", {}).get("cidr")
+                if cidr == "0.0.0.0/0":
+                    offenders.append(
+                        f"{path.relative_to(REPO)}: {doc['metadata']['name']}"
+                    )
+    assert offenders == [], f"egress open to the internet: {offenders}"
+
+
+def test_egress_still_permits_the_provider_ranges():
+    """A policy so tight nothing can call a provider is an outage, not security."""
+    https_targets = 0
+    for _, doc in _all_deploy_docs():
+        if doc.get("kind") != "NetworkPolicy":
+            continue
+        for rule in doc["spec"].get("egress", []):
+            ports = {p.get("port") for p in rule.get("ports", [])}
+            if 443 in ports:
+                https_targets += len(rule.get("to", []))
+    assert https_targets >= 3, "no egress ranges permitted for provider APIs"
