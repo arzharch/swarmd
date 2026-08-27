@@ -84,6 +84,27 @@ def main(argv: list[str] | None = None) -> int:
         "without it.",
     )
 
+    providers = sub.add_parser("providers", help="inspect the LLM provider pool")
+    providers_sub = providers.add_subparsers(dest="providers_command", required=True)
+    probe = providers_sub.add_parser(
+        "probe",
+        help="send one tiny request per provider to discover what is actually live",
+    )
+    probe.add_argument(
+        "--allow-data-training",
+        action="store_true",
+        help="admit the Mistral Experiment tier, whose free quota is granted in "
+        "exchange for consenting to have submitted prompts used for training. "
+        "Off by default: that tier's price is paid in data, not dollars, and "
+        "that should be a deliberate choice.",
+    )
+    probe.add_argument(
+        "--allow-paid",
+        action="store_true",
+        help="admit the paid overflow tier (GLM 5.3 Flash). Off by default, so "
+        "exhausting free capacity stops the run instead of quietly spending.",
+    )
+
     approve = sub.add_parser("approve", help="approve a pending draft (HITL)")
     approve.add_argument("request_id")
     approve.add_argument("--actor", default="cli-user")
@@ -117,8 +138,10 @@ def main(argv: list[str] | None = None) -> int:
 
         router = make_router(args.provider)
 
-        trace_sink = None
-        sinks = []
+        from swarmd.observability.tracing import TraceSink
+
+        trace_sink: TraceSink | None = None
+        sinks: list[TraceSink] = []
         if args.trace_jsonl:
             from swarmd.observability.tracing import JsonlTraceSink
 
@@ -154,11 +177,55 @@ def main(argv: list[str] | None = None) -> int:
         print(f"review_queue_pending={pending} (outreach never auto-sends)")
         return 0
 
+    if args.command == "providers":
+        return asyncio.run(_providers_command(args))
+
     if args.command in ("approve", "reject", "list"):
         return asyncio.run(_hitl_command(args))
 
     parser.error(f"unknown command: {args.command}")
     return 2
+
+
+async def _providers_command(args: argparse.Namespace) -> int:
+    """Discover live provider capacity by asking the providers.
+
+    Published free-tier limits disagree across sources and change without
+    notice, so the pool treats them as hints and this command replaces them
+    with observation. Exit code is non-zero when nothing is reachable, so it
+    works as a preflight check in a script.
+    """
+    from swarmd.router.pool import ProviderPool
+
+    try:
+        pool = ProviderPool.from_env(
+            allow_data_training=args.allow_data_training,
+            allow_paid=args.allow_paid,
+        )
+    except RuntimeError as exc:
+        print(f"pool unavailable: {exc}")
+        return 2
+
+    rows = await pool.probe()
+    await pool.aclose()
+
+    width = max(len(r["provider"]) for r in rows)
+    for row in sorted(rows, key=lambda r: (not r["ok"], r["provider"])):
+        name = row["provider"].ljust(width)
+        tier = row["tier"].ljust(19)
+        if row["ok"]:
+            print(
+                f"{name}  {tier}  OK    {row['latency_s']:>6.3f}s  {row['model']}"
+            )
+        else:
+            detail = row.get("reason", "")
+            if row.get("retry_after_s") is not None:
+                detail = f"{detail} retry_after={row['retry_after_s']}s"
+            print(f"{name}  {tier}  FAIL  {detail}")
+
+    live = sum(1 for r in rows if r["ok"])
+    print(f"\n{live}/{len(rows)} providers live")
+    return 0 if live else 1
 
 
 async def _hitl_command(args: argparse.Namespace) -> int:

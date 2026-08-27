@@ -84,10 +84,10 @@ class OtelSink:
                     )
                 )
 
-        kwargs: dict[str, Any] = dict(
-            attributes=self._attributes(span),
-            start_time=self._ns(span.start_ts),
-        )
+        kwargs: dict[str, Any] = {
+            "attributes": self._attributes(span),
+            "start_time": self._ns(span.start_ts),
+        }
         if parent_ctx is not None:
             kwargs["context"] = parent_ctx
 
