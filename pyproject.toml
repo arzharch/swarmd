@@ -53,6 +53,11 @@ target-version = "py312"
 
 [tool.mypy]
 strict = true
+# Type-check against the DEPLOYMENT platform, not the development one.
+# The container and CI both run Linux; checking as win32 hides POSIX-only
+# code paths (setrlimit, killpg) behind sys.platform narrowing and reports
+# them as undefined names, which is a false failure for correct code.
+platform = "linux"
 
 [[tool.mypy.overrides]]
 module = ["asyncpg", "redis.*"]
