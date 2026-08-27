@@ -205,8 +205,9 @@ saying so is better than pretending the architecture is cost-optimal.
 
 ## Status
 
-The loop runs end to end with no API key. 708 tests, ruff and mypy clean,
-kernel chaos gate passing at kill-rate 0.9 with matching integrity hashes.
+The loop runs end to end with no API key. 807 tests, ruff and mypy clean,
+kernel chaos gate passing at kill-rate 0.9 with matching integrity hashes, and
+the red-team gate passing with five deliberate rogues injected into a real run.
 
 Checkpoint recovery holds in both halves: the kernel at kill-rate 0.9 with
 byte-identical output, and the swarm flagship, where a killed agent's
@@ -215,10 +216,14 @@ counting provider calls rather than by comparing output, because identical
 output only proves the work was deterministic — not that it was recovered
 instead of repeated.
 
-Not yet done: a real learning curve. That needs volume — 50–200 tasks against
-live providers — and until those numbers exist with their control arm, this
-README does not claim the system improves. That is the whole point of building
-the measurement first.
+Not yet done: anything measured against a real provider. A learning curve
+needs volume — 50–200 tasks — and until those numbers exist with their control
+arm, this README does not claim the system improves. Two more numbers are
+unmeasured for the same reason and worth naming, because both could come back
+worse than hoped: the cache hit rate on genuinely novel tasks (exact keying
+means novel work hits near zero), and whether a real model asked for eight
+distinct approaches returns eight rather than three and five rewordings.
+[STATUS.md](docs/STATUS.md) tracks it as the one remaining gap.
 
 Second domain: [`examples/leadops/`](examples/leadops/) is a sales pipeline on
 the same runtime, retained and green. The `src/` tree did not change by a line

@@ -137,12 +137,23 @@ uv run swarm run "<held-out task>" --agents 500 --chaos --kill-rate 0.2
 
 **Gate**
 ```
-uv run pytest tests/swarm/test_redteam -q
-uv run swarm run "<task>" --seed-rogues all
-# -> all five detected and contained, itemised
+uv run pytest tests/swarm/test_redteam.py tests/swarm/test_rogues.py -q
+uv run swarmd swarm run "<task>" --profile smoke --seed-rogues all
+# -> every pattern seeded, and handled BY ITS OWN DETECTOR
+# -> containment by a different detector FAILS the gate: the agent was
+#    stopped, but the detector under test was never exercised
+# -> a pattern the frozen criterion refused before the red-team saw it is
+#    reported as blocked_upstream, not counted as a detection
 # -> no contained agent's output appears in the run result
-# -> red-team's own LLM spend stays under its cap
+# -> red-team's own LLM spend stays at zero
+# -> exit code is the verdict, so this is usable in CI
 ```
+
+Also runnable as a service call, which is the primary surface:
+`POST /api/runs {"seed_rogues": "all"}`, or the rogue selector in the
+dashboard's top bar. A misspelled pattern is a 400 rather than a clean run:
+a typo that seeds nothing produces zero containments, which is
+indistinguishable from a gate that passed.
 
 ---
 
@@ -154,19 +165,35 @@ uv run swarm run "<task>" --seed-rogues all
   provenance chain back to the run that produced it.
 - `swarm/ledger.py` economy layer on the Phase 5 cost ledger: per-agent allowance, payment
   on verified success only, bankruptcy, cloning of profitable strategies.
-- `swarm/consolidate.py`: between-run pass — prompt rewriting with versioned rollback
-  (extends the existing supervisor), dead-skill pruning, trace compaction.
+- `swarm/consolidate.py`: between-run pass — prompt rewriting with versioned rollback,
+  dead-skill pruning, trace compaction.
+- `swarm/supervisor.py`: fleet self-correction. Reads the criterion's own failure
+  taxonomy, and when failures CLUSTER on one check kind writes a constraint
+  addressing that kind, applied to the worker prompt for the next run.
+
+  The division of labour is deliberate: the supervisor proposes, the consolidator
+  gates. Letting the proposer decide whether its own change helped is the
+  self-assessment failure the criterion-first architecture exists to avoid.
+  Every patch is a hypothesis — measured against the pass rate before it, and
+  reverted when it did not help, so prompts cannot accumulate constraints nobody
+  can attribute an improvement to.
 - `swarm/curriculum.py`: next-task proposal at the measured ability frontier, driven by
   ledger-derived pass rates.
 
 **Gate**
 ```
-uv run pytest tests/swarm/test_skills tests/swarm/test_ledger -q
-uv run swarm session --tasks 40
+uv run pytest tests/swarm/test_skills.py tests/swarm/test_supervisor.py -q
+uv run swarmd swarm session --tasks 40 --supervisor
 # -> library grows; retrieval hits rise; cost per solved task falls
 # -> a poisoned skill proposal is rejected by the human gate and by the control check
+# -> a supervisor patch REACHES the next run's workers, and one that did not
+#    improve the pass rate is rolled back rather than kept
 # -> kill the process mid-session, restart: library, ledger, approvals intact
 ```
+
+`--supervisor` is off by default, and that is not timidity: a patched prompt is
+a confound, so an eval arm must be able to run with the stock prompt and know
+that is what it ran with.
 
 ---
 

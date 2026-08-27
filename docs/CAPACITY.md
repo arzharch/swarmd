@@ -83,23 +83,72 @@ This was chosen for correctness — a prose criterion means the model grades its
 own homework. The capacity win is a consequence, and it is the largest single
 saving available: it removes half of all calls before any optimisation starts.
 
-### 3.2 Batched generation — 8x
+### 3.2 Batched generation — K× per node
+
+*Implemented: `swarm/batch.py`. Verified by counted provider calls, not by
+estimate — `tests/swarm/test_batch.py` asserts a pool of N makes fewer than N
+calls, and a 32-agent run over a 4-node plan issues 8 calls total.*
 
 One call returns K candidate variants rather than one. Population search wants
-many similar candidates, which is exactly the shape a single prompt can produce.
+many candidates for the same step, which is exactly the shape a single prompt
+can produce.
 
-**K = 8.** Below 4 the per-call overhead dominates. Above ~12 the output token
-count starts crowding `max_tokens` and later variants degrade in quality as the
-model loses the thread. 8 sits where quality is still flat.
+**How the variants reach the agents.** The run generates the batch *before*
+spawning the pool and pre-seeds each agent's checkpoint with its variant, marked
+`generate:1`. The worker's resume path then skips the generate step and charges
+nothing for it. Batching and chaos recovery are the same operation seen from two
+sides — work someone else already did — so there is no batching window, no
+coalescing broker, and no timeout to tune.
 
-### 3.3 Semantic cache — ~2.5x
+**K = pool size, bounded.** `ADVISORY_POOL` is 32 and `HARD_POOL` is 64.
+Generation is now O(1) per node, but **repairs are still one call each**, so the
+worst case remains linear in pool size at `max_repairs` per agent. That is what
+the bound is for; it is not a cost bound, since the ceiling handles cost.
 
-Population search generates near-identical prompts by construction, so hit rates
-that would be implausible in a chat product are normal here. Target ≥60%, which
-is the Phase 4 gate the cache was already built against.
+**What it does not batch.** Repairs. A repair prompt carries one candidate's
+specific failures, so two agents repairing different candidates are not asking
+the same question.
+
+### 3.3 Response cache — across runs, exact-keyed
+
+*Implemented: `router/cached.py` wrapping the provider, so every call the system
+makes goes through it rather than the one path someone remembered to
+instrument.*
+
+**Where the repetition actually is.** Not inside a run: each node's prompt
+differs, and each repair prompt carries its own candidate's failures. The
+repetition worth paying for is *across* runs — a session working a curriculum,
+or two operators asking similar things. One cache per process, shared by every
+run it serves. Measured on a live pair of identical runs: the second issued
+zero generation calls and served all four nodes from the first.
+
+**Exact matching, not similarity, and this is the correction that matters.**
+The cache was built for paraphrase-heavy human input. This system's prompts are
+assembled from templates: they share a long envelope and differ in one step name
+and one instruction line. Measured cosine between three genuinely different plan
+nodes: **0.97**, above the 0.95 threshold. Similarity matching therefore served
+the `extract` node's answer to the `verify` node — every node producing the same
+artifact, at a high hit rate and a low cost, while being wrong.
+
+Raising the threshold does not fix it. Similarity here is dominated by shared
+boilerplate and rises with template length, so a longer envelope pushes any two
+prompts above any threshold. `CachedProvider` refuses a cache that is not in
+`exact_only` mode.
+
+**Two things opt out.**
+- *Criterion and plan proposers.* Their whole purpose is independent opinions;
+  serving proposer 1's answer to proposers 2 and 3 manufactures unanimity, and
+  the merge would report full agreement across one opinion. They set
+  `cache: bypass`, and their prompts now differ by angle as well.
+- *Eval runs.* An eval measures variance across repeats. Serving repeat 2 from
+  repeat 1 does not bias the bootstrap interval, it collapses it toward zero
+  width — and a zero-width interval reads as a strong result. `SwarmRun` raises
+  rather than accepting a cache on the `eval` profile.
 
 Every hit writes a zero-cost ledger row carrying what the call *would* have
-cost, so cache savings are a query rather than an estimate (ADR-007).
+cost, so cache savings are a query rather than an estimate (ADR-007). On a free
+tier that figure is $0 and the row still matters: what the cache buys there is
+**requests**, which is the scarce resource.
 
 ### 3.4 Free red-team monitors — saves the safety tax
 
@@ -183,12 +232,20 @@ is worse than no result.
 
 ## 7. Assumptions, stated so they can be falsified
 
-1. **60% cache hit rate.** Measured in Phase 4 against a repeated workload. If
-   real unknown-task runs come in lower, the `standard` profile's call budget rises
-   proportionally and wall clock with it. This is the assumption most likely to
-   be wrong.
-2. **K=8 batching holds quality.** Untested past Phase 7; if variant quality
-   degrades at 8, K drops and wall clock rises.
+1. **60% cache hit rate.** Now the weakest number in this document, and worth
+   stating precisely. Exact keying means the hit rate on a run of *genuinely
+   novel* tasks is near zero: identical prompts are what hit, and unknown tasks
+   do not repeat. The measured 100% on a repeated run is the ceiling, not the
+   expectation. Sessions and curricula sit somewhere between, and nothing has
+   measured where. If it lands near zero for real workloads, the `standard`
+   profile's call budget rises and wall clock with it — batching, which does not
+   depend on repetition, carries the plan on its own.
+2. **K variants hold quality.** The simulated provider returns K genuinely
+   different candidates because it was written to; a real model asked for eight
+   distinct approaches may return three good ones and five rewordings. If it
+   does, population diversity drops without the call count dropping back, and
+   the honest response is a lower K rather than a louder prompt. Untested
+   against a live model.
 3. **1,500 tokens per average call.** If agents carrying many retrieved skills
    push this past ~5,000, TPM becomes the binding constraint instead of RPM and
    this entire document inverts.
