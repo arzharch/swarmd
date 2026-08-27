@@ -151,6 +151,7 @@ class SwarmRun:
         on_event: Any = None,
         seed_rogues: str = "",
         agents: int | None = None,
+        cache: Any = None,
     ) -> None:
         if profile not in PROFILES:
             raise ValueError(f"unknown profile {profile!r}; known: {sorted(PROFILES)}")
@@ -164,6 +165,27 @@ class SwarmRun:
             raise ValueError(f"agents must be at least 1, got {agents}")
         self.agents = agents or self.profile.agents
         self.agents_explicit = agents is not None
+        # Semantic cache, shared across runs by whoever constructs them --
+        # a session, or the control plane. Within ONE run almost nothing
+        # repeats (every node's prompt differs, and a repair prompt carries
+        # that candidate's own failures), so a per-run cache would be a
+        # structural zero dressed up as a feature.
+        #
+        # REFUSED FOR EVAL, and enforced here rather than written in a doc: an
+        # eval measures variance across repeats, and serving repeat 2 from
+        # repeat 1 does not bias the interval, it collapses it. A bootstrap CI
+        # over identical samples has zero width and reads as a strong result.
+        if cache is not None and profile == "eval":
+            raise ValueError(
+                "an eval run cannot use the semantic cache: identical cached "
+                "responses across repeats collapse the bootstrap interval and "
+                "turn a measurement into an artefact of the first sample"
+            )
+        self.cache = cache
+        if cache is not None:
+            from swarmd.router.cached import CachedProvider
+
+            provider = CachedProvider(provider, cache)
         self.provider = provider
         self.run_id = run_id or f"run-{uuid.uuid4().hex[:10]}"
         self.ledger = (
@@ -741,6 +763,11 @@ class SwarmRun:
                 "target_calls": self.profile.target_calls,
             },
             "rogues": self.rogues.report() if self.rogues else None,
+            "cache": (
+                self.provider.report()
+                if self.cache is not None and hasattr(self.provider, "hit_rate")
+                else None
+            ),
             "ablation": {"skills_enabled": self.use_skills},
         }
 

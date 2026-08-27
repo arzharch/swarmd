@@ -363,6 +363,11 @@ def _session_runner(app: FastAPI, request: SessionRequest, registry: JobRegistry
                 skills=library,
                 approvals=approvals,
                 sandbox=sandbox,
+                # A session works through a curriculum of related tasks, which
+                # is where cache repetition actually lives. Eval runs below get
+                # no cache: SwarmRun refuses one, because identical cached
+                # repeats collapse the bootstrap interval.
+                cache=app.state.cache,
                 run_id=f"{job.job_id}-{index:03d}",
                 on_event=app.state.hub.publish,
             )

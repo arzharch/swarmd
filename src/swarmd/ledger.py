@@ -372,10 +372,17 @@ class CostAccount:
         tokens_out: int,
         agent_id: str = "",
         stage: str = "",
+        simulated: bool = False,
     ) -> None:
         """Record a served-from-cache call at zero cost.
 
         The row exists so cache savings are a query, not an estimate.
+
+        `simulated` is not optional in spirit. A cache entry created by the
+        simulated provider and later served into a run carries the same taint
+        the original call did; a hit that recorded simulated=False would
+        launder synthetic output into a report that claims to be real, which is
+        precisely what ADR-012 exists to prevent.
         """
         price = price_for(provider, model)
         self.ledger.append(
@@ -389,6 +396,7 @@ class CostAccount:
                 tokens_out=tokens_out,
                 cost_usd=0.0,
                 would_have_cost=price.cost(tokens_in, tokens_out),
+                simulated=simulated,
             )
         )
 

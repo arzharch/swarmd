@@ -39,6 +39,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 
 from swarmd.observability import logs, metrics
+from swarmd.router.cache import SemanticCache
 from swarmd.server import control, middleware
 from swarmd.server.hub import EventHub
 from swarmd.server.jobs import JobRegistry
@@ -135,6 +136,12 @@ def create_app(
     # Evals and sessions are long-running work of the same shape as runs, so
     # they share one registry: one status endpoint, one cancel semantic, one
     # progress event, rather than three of each.
+    # ONE cache for the process, shared by every run this pod serves. A
+    # per-run cache would never hit: within a single run each node's prompt
+    # differs and each repair prompt carries its own candidate's failures. The
+    # repetition worth paying for is ACROSS runs -- a session working through a
+    # curriculum, or two operators asking similar things.
+    app.state.cache = SemanticCache(ttl_s=3600.0, capacity=2048)
     app.state.jobs = JobRegistry(hub=app.state.hub)
     app.state.config = control.HarnessConfig()
     control.register(app, registry=app.state.jobs, config=app.state.config)
@@ -221,6 +228,7 @@ def create_app(
                 SkillLibrary(app.state.skills_path) if app.state.skills_path else None
             ),
             sandbox=SandboxHarness(),
+            cache=app.state.cache,
             chaos=(
                 ChaosHook(kill_rate=request.kill_rate) if request.chaos else None
             ),
