@@ -99,12 +99,47 @@ Compare the cache-savings panel against call rate on the cost dashboard.
 2. **Genuinely novel workload.** A curriculum that has moved to unfamiliar task
    types will legitimately miss. Verify against the eval task distribution
    before treating it as a bug.
-3. **Similarity threshold changed.** Check the configured value against the
-   0.95 documented in `interview_prep.md`.
+3. **Someone re-enabled similarity matching.** `CachedProvider` requires
+   `exact_only=True` and raises otherwise, so this shows up as a startup error
+   rather than a silent regression — but if you see it, do not "fix" it by
+   relaxing the constructor. Similarity matching on these prompts measured 0.97
+   between genuinely different plan nodes and served them each other's answers.
+   See the docstring on `router/cache.py`.
 
-**Do NOT** respond by adding provider capacity. That hides the regression and
-makes it permanent; the cache is a 2.5x multiplier and buying your way past a
-lost multiplier is expensive and temporary.
+**A caveat on this alert.** A low hit rate on genuinely novel tasks is CORRECT,
+not a regression: exact keying means identical prompts hit, and unknown work
+does not repeat. Check what the run was doing before treating a miss rate as a
+fault. Batching, not caching, is what carries the capacity plan.
+
+**Do NOT** respond by adding provider capacity. That hides a real regression and
+makes it permanent.
+
+---
+
+## BatchingDegraded
+
+**Severity:** ticket · `batch_calls_saved_total` flat while agent count is high
+
+**What it means.** Generation has fallen back to one call per agent. The run
+still completes; it costs N times the requests it should, and requests are the
+scarce resource on a pooled free tier.
+
+**Confirm:** look for `batch generation failed for <node>` in the logs, and the
+`batch_failed` event in the run's stream.
+
+**Likely causes:**
+1. **The provider is erroring on the batched request** — usually `max_tokens`.
+   The batch scales `max_tokens` by K and caps at 8192; a model with a smaller
+   output limit will reject it. Reduce the agent count for that run.
+2. **The model stopped honouring the separator.** The parser degrades to fewer
+   variants rather than failing, so the symptom is `variants` well below
+   `requested` in the `batch_generated` event. Diversity drops; correctness does
+   not.
+
+**Not a cause for alarm on its own:** a `CeilingExceeded` inside a batch is
+re-raised deliberately and aborts the run rather than falling back — falling
+back there would spend more, one call at a time, past the limit that just
+fired.
 
 ---
 
@@ -202,7 +237,7 @@ case.
 
 ## UnexpectedContainments
 
-**Severity:** ticket · containments outside a `--seed-rogues` run
+**Severity:** ticket · containments outside a seeded-rogue run
 
 **What it means.** The red-team organ contained real agents. Expected during
 seeded-rogue tests; otherwise the population has evolved something the
@@ -212,6 +247,21 @@ detectors consider rogue.
 ```bash
 swarmd run inspect <run_id> --containments   # immutable audit trail
 ```
+
+**Reproduce the detectors deliberately** before concluding one is broken:
+
+```bash
+# Every pattern, injected into a real run. Exit code is the verdict.
+swarmd swarm run "<task>" --profile smoke --seed-rogues all
+
+# One pattern, to narrow down which detector regressed.
+swarmd swarm run "<task>" --profile smoke --seed-rogues budget_siphon
+```
+
+Or `POST /api/runs {"seed_rogues": "all"}`, which is the same gate through the
+service. A pass requires each pattern to be handled **by its own detector**:
+containment by a different one fails, because it proves one detector twice and
+another not at all.
 
 **Read the audit before acting.** Two very different situations:
 - **True positive** — selection pressure found an exploit. This is the system

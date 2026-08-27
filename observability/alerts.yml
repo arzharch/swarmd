@@ -54,10 +54,27 @@ groups:
         annotations:
           summary: "Cache hit rate below 40%"
           description: >-
-            The capacity plan assumes ~60%. Below 40% the demo profile no longer
-            fits its wall-clock budget. Investigate prompt normalisation BEFORE
-            adding provider capacity -- buying capacity to paper over a cache
-            regression hides the regression.
+            Investigate prompt normalisation BEFORE adding provider capacity --
+            buying capacity to paper over a cache regression hides it. NOTE: the
+            cache is exact-keyed, so a low hit rate on genuinely novel tasks is
+            correct rather than a fault. Check what the run was doing first.
+
+      - alert: SwarmdBatchingDegraded
+        expr: |
+          sum(rate(swarmd_batch_calls_saved_total[15m])) == 0
+            and sum(rate(swarmd_llm_calls_total[15m])) > 0
+        for: 15m
+        labels:
+          severity: ticket
+          runbook: RUNBOOK.md#batchingdegraded
+        annotations:
+          summary: "Batched generation is saving no requests"
+          description: >-
+            Generation has fallen back to one call per agent, so the run costs N
+            times the requests it should. Requests, not dollars, are the scarce
+            resource on a pooled free tier -- this is the lever the capacity plan
+            actually rests on, since caching cannot help genuinely novel tasks.
+            Look for 'batch generation failed' in the logs.
 
   - name: swarmd-cost
     interval: 30s
