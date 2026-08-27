@@ -39,7 +39,7 @@ a review with no partials has usually been graded generously.
 | Metrics vs. reporting boundary stated | PASS | Prometheus operates; the ledger reports. Written at the top of the module |
 | Dashboards provisioned as code, read-only | PASS | `observability/grafana/`, `allowUiUpdates: false` |
 | Distributed tracing | PASS | OTel bridge with correct parent linkage → one Jaeger trace per run |
-| Structured logs | **PARTIAL** | `SWARMD_LOG_FORMAT=json` is set in the ConfigMap but the handler is not wired; logs are currently plain text |
+| Structured logs | PASS | JSON formatter with `extra` promoted to fields and credential redaction; the ConfigMap setting is now read |
 
 ## 4. Alerting and on-call
 
@@ -50,6 +50,7 @@ a review with no partials has usually been graded generously.
 | Alerts do not fire during healthy operation | PASS | Long `for:` windows. One false positive was found and fixed: kills legitimately exceed requeues, so the gap-threshold alert would have paged during healthy chaos |
 | Page vs. ticket severity separated | PASS | Only pool exhaustion and a dead recovery path page |
 | On-call rotation | **BLOCKED** | Single maintainer. Stated rather than pretended |
+| Request identity for incident reconstruction | PASS | Request id on every response and log line |
 
 ## 5. Reliability
 
@@ -74,6 +75,12 @@ a review with no partials has usually been graded generously.
 | Image scanning in CI | PASS | Trivy, fails on HIGH+, SBOM generated |
 | Sandbox is a real boundary | **PARTIAL** | Defence in depth, not a security boundary against a determined attacker. The container is the actual boundary, and the module says so rather than implying more |
 | Egress restricted to known destinations | **PARTIAL** | Currently 443 to anywhere except RFC1918 and metadata. Should narrow to provider CIDRs — named as the first thing to tighten |
+| Access control on the run API | PASS | Operator token on every mutating endpoint and the event stream (ADR-013); refuses to start bound off-host without one |
+| Service not publicly routable | PASS | Ingress source allowlist failing closed in the base; no LoadBalancer or NodePort points at the control plane, asserted by a test |
+| Request limits | PASS | Body cap before parsing, sliding-window rate limit as a quota defence, edge limits in the Ingress |
+| Attack surface minimised | PASS | Interactive API docs disabled outside dev — a live client for every endpoint served without the token |
+| Secrets kept out of logs | PASS | Redaction on both formatters; sensitive field names replaced wholesale |
+| Data retention documented | PASS | [SECURITY.md](../SECURITY.md) section 5, per data class |
 
 ## 7. Deployment
 
@@ -121,6 +128,13 @@ Blocking for a real production deployment:
    alerts, not on-call.
 3. **Egress is wider than it should be.** 443-to-anywhere is the loosest control
    in the deployment and the first to narrow.
+
+Explicitly NOT blocking, though it looks like it should be: **no user
+authentication.** That is a decision for a single-tenant operator-run service,
+documented in ADR-013 with compensating controls that are tested rather than
+described. The day a second operator needs access, an authenticating proxy at
+the Ingress is a deployment change rather than a rewrite, because the boundary
+was put at the edge deliberately.
 
 Ready for a **demo and evaluation deployment** now: the loop runs end to end,
 chaos integrity holds, cost is bounded, containment works, and every number

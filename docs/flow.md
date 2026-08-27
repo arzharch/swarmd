@@ -987,6 +987,84 @@ production deploy.
 
 ---
 
+## 2026-08-28 - Reframed from demo to product
+
+DECISION: treat this as a product with a restricted audience, not a demo
+ALTERNATIVES: keep demo framing and accept the gaps
+WHY THIS: "it's a demo" is how a system ends up with no threat model, no
+  retention policy, and an API that turns out to have been reachable for a
+  month. The audience being small is a deployment fact, not a licence to skip
+  the work. Concretely this added an access posture with compensating controls
+  (ADR-013), SECURITY.md with a threat model and per-class retention, edge
+  hardening, structured logs with redaction, and a readiness review that says no.
+TRADE-OFF ACCEPTED: more surface to maintain for an audience of one.
+
+DECISION: no user auth, one operator token (ADR-013)
+ALTERNATIVES: OIDC with users and roles - leave it open and rely on the network
+WHY THIS: there is one principal. Building accounts, sessions and roles is a
+  login for a population of one, and each component is a thing to patch and get
+  wrong. Leaving it open makes a single misconfigured Ingress annotation the
+  entire failure. One shared credential matches the actual threat.
+TRADE-OFF ACCEPTED: no revocation granularity - rotating logs out everything -
+  and the audit trail records a supplied actor string rather than a verified
+  identity. Both stated in SECURITY.md rather than implied away.
+FOLLOW-UPS:
+  Q: Isn't that a hole with a paragraph attached?
+  A: The test is whether the controls match the threat. There is no
+     unauthenticated path to start a run, read a stream, or record a decision;
+     the service refuses to run exposed without a credential; and the network
+     layer means the port is not reachable to begin with. What is absent is
+     multi-user identity, and there are no multiple users.
+  Q: What changes when a second person needs access?
+  A: An authenticating proxy at the Ingress, app unchanged - it already treats
+     the request as pre-authenticated. That is why the boundary is at the edge.
+  Q: Why is /metrics open?
+  A: The alternative gives every Prometheus scraper a token that can also start
+     runs, which is a wider grant than scraping needs.
+
+DECISION: the app refuses to START bound off-host without a token
+ALTERNATIVES: warn and continue - check at first request
+WHY THIS: a service that binds 0.0.0.0 with no credential and only complains
+  when someone finds it has already failed. The entire value of the check is
+  that it happens before exposure.
+
+DECISION: rate limiting is a quota defence, not a DoS defence
+WHY THIS: the scarce resource is ~45 provider requests a minute shared by the
+  whole system. A loop in a script can burn a day's free tier before anyone
+  looks, which is far more likely than a deliberate flood. Sliding window rather
+  than fixed, because a fixed window permits twice the intended rate across its
+  boundary.
+
+DECISION: renamed the `demo` profile to `standard`
+WHY THIS: the name invited the mindset. It is the ordinary run size, derived
+  from the capacity plan, not a showcase.
+
+ANATOMY: SWARMD_API_TOKEN
+  Gates every mutating endpoint and the event stream. Optional on loopback so
+  local work stays frictionless; required to bind any other interface. Compared
+  in constant time, accepted as `Authorization: Bearer` or `X-Swarmd-Token`, and
+  as a query parameter on the websocket because a browser cannot set headers on
+  a handshake. Sourced from Secrets Manager in prod; envFrom is fixed at
+  container start, so rotation needs a restart - documented in the runbook
+  rather than discovered during an incident.
+
+### Gate evidence
+
+```
+pytest: 599 passed, 1 skipped   (+41: hardening 34, deploy guards 7)
+ruff check .   All checks passed
+mypy src       Success: no issues found in 45 source files
+frontend       tsc --noEmit clean
+
+swarmd serve --host 0.0.0.0   (no token)
+  refusing to start: refusing to bind 0.0.0.0 with no SWARMD_API_TOKEN set...
+
+kustomize prod: whitelist-source-range present, no LoadBalancer or NodePort on
+  the control plane, SWARMD_API_TOKEN sourced from ExternalSecret
+```
+
+---
+
 ## Next up
 
 - [x] Kernel, pipeline, harnesses, gates, HITL state machine, router
@@ -1006,7 +1084,8 @@ production deploy.
       cache hit rate against the capacity plan's 60% assumption
 - [ ] The learning curve: 50-200 tasks with the control arm, then and only then
       generate BENCHMARKS.md and make an improvement claim
+- [x] Product posture: operator token, edge allowlist, rate limits, JSON logs
+      with redaction, SECURITY.md, ADR-013
 - [ ] Narrow the egress NetworkPolicy to provider CIDRs (widest control shipped)
-- [ ] Wire structured JSON logging - the ConfigMap sets it, the handler does not
 - [ ] Exercise rollback against a real cluster
 - [ ] Debt: FallbackRouter still lists MockProvider as last-resort (ADR-006)
