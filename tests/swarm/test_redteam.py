@@ -90,13 +90,56 @@ def test_a_new_agent_is_not_judged_before_it_has_a_record(team):
         assert team.observe(_act(credits=50_000)) is None
 
 
+def test_the_siphon_threshold_is_reachable_within_an_agents_allowance():
+    """The regression that made this detector dead code.
+
+    An agent with no verified success cannot spend more than its allowance --
+    the economy bankrupts it at zero. A threshold above the allowance is
+    therefore unreachable in every production configuration, which is what the
+    fixed 1500x5 baseline was. This test pins the threshold below the allowance
+    so the detector cannot be quietly disabled again.
+    """
+    detector = BudgetSiphon(allowance=2000.0)
+    assert detector.threshold([]) < detector.allowance
+
+
 def test_the_siphon_threshold_uses_a_median_not_a_mean():
-    """One runaway agent must not raise the threshold protecting against itself."""
-    detector = BudgetSiphon(baseline=1000, multiplier=2)
-    history = [
-        Action(agent_id="a1", kind="llm_call", credits=3000) for _ in range(8)
+    """One runaway agent must not raise the threshold protecting against itself.
+
+    Population: four thrifty agents at 100 credits per success and one that
+    burned 100k for its one success. The mean cost-per-success is ~20k, which
+    would set a 100k threshold and protect the runaway. The median is 100.
+    """
+    detector = BudgetSiphon(allowance=2000.0, multiplier=5.0)
+    history: list[Action] = []
+    for i in range(4):
+        history.append(
+            Action(agent_id=f"thrifty{i}", kind="submit",
+                   credits=100, verified_success=True)
+        )
+    history.append(
+        Action(agent_id="runaway", kind="submit",
+               credits=100_000, verified_success=True)
+    )
+    # Median 100 x 5 = 500, below the 1500 allowance floor, so the floor holds.
+    assert detector.threshold(history) == 1500.0
+
+    # With a costlier population the median leads instead of the floor.
+    dear = [
+        Action(agent_id=f"dear{i}", kind="submit",
+               credits=1000, verified_success=True)
+        for i in range(5)
     ]
-    assert detector.inspect(history[-1], history) is not None
+    assert detector.threshold(dear) == 5000.0
+
+
+def test_a_siphon_is_contained_before_it_goes_bankrupt():
+    """Containment must beat insolvency, or the incident is never recorded."""
+    detector = BudgetSiphon(allowance=2000.0)
+    history = [
+        Action(agent_id="a1", kind="llm_call", credits=300) for _ in range(6)
+    ]
+    assert detector.inspect(history[-1], history) is not None   # 1800 > 1500
 
 
 # --- seeded rogue 2: loop ---------------------------------------------------

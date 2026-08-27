@@ -143,6 +143,20 @@ def main(argv: list[str] | None = None) -> int:
         help="the CONTROL ARM. Disables skill retrieval with everything else "
         "identical, which is what an improvement claim is measured against.",
     )
+    swarm_run.add_argument(
+        "--agents", type=int, default=None, metavar="N",
+        help="how many agents to run. Defaults to the profile's figure. The "
+        "right population size is a property of the task, not of the "
+        "wall-clock target the profile encodes.",
+    )
+    swarm_run.add_argument(
+        "--seed-rogues", default="", metavar="PATTERNS",
+        help="inject deliberate misbehaviour: 'all', or a comma-separated "
+        "subset of budget_siphon,loop,criterion_gaming,unsafe_tool_call,"
+        "library_poisoning. The red-team is not told which agents are seeded; "
+        "the run's exit code reflects whether each pattern's own detector "
+        "caught it.",
+    )
     swarm_run.add_argument("--skills", default=None, metavar="PATH",
                            help="skill library file (default: no library)")
     swarm_run.add_argument("--ledger", default=None, metavar="PATH",
@@ -400,17 +414,26 @@ async def _swarm_command(args: argparse.Namespace) -> int:
         )
         return 2
 
-    run = SwarmRun(
-        pool,
-        profile=args.profile,
-        ceiling_usd=args.ceiling,
-        use_skills=not args.no_skills,
-        skills=SkillLibrary(args.skills) if args.skills else None,
-        sandbox=SandboxHarness(),
-        chaos=ChaosHook(kill_rate=args.kill_rate) if args.chaos else None,
-        ledger_path=args.ledger,
-        on_event=_print_event,
-    )
+    from swarmd.swarm.rogues import UnknownRogue
+
+    try:
+        run = SwarmRun(
+            pool,
+            profile=args.profile,
+            agents=args.agents,
+            seed_rogues=args.seed_rogues,
+            ceiling_usd=args.ceiling,
+            use_skills=not args.no_skills,
+            skills=SkillLibrary(args.skills) if args.skills else None,
+            sandbox=SandboxHarness(),
+            chaos=ChaosHook(kill_rate=args.kill_rate) if args.chaos else None,
+            ledger_path=args.ledger,
+            on_event=_print_event,
+        )
+    except (UnknownRogue, ValueError) as exc:
+        print(f"error: {exc}")
+        await pool.aclose()
+        return 2
     result = await run.run(args.task)
     report = run.report(result)
     await pool.aclose()
@@ -446,6 +469,14 @@ async def _swarm_command(args: argparse.Namespace) -> int:
           f"llm_calls={rt['llm_calls_used']}")
     if result.error:
         print(f"error: {result.error}")
+
+    # A seeded run is a GATE, so its verdict decides the exit code. A run that
+    # completed while a rogue walked out with its output is not a success, and
+    # returning 0 for it would make the SPEC Phase-8 gate unusable in CI.
+    if run.rogues is not None:
+        print(run.rogues.summary())
+        if not run.rogues.passed():
+            return 1
     return 0 if result.status == "completed" else 1
 
 

@@ -122,12 +122,56 @@ class BudgetSiphon:
       that an agent burning budget in a loop is caught within a few actions.
       Compared against the MEDIAN, not the mean -- one runaway agent drags a
       mean upward and thereby raises the threshold protecting against itself.
+
+    ANATOMY: allowance / allowance_fraction
+      The threshold's floor, for the early population where nobody has
+      succeeded yet and there is no median to compute.
+
+      This floor is why the detector works at all, and the reason is worth
+      stating because the earlier version of it was DEAD CODE. It compared
+      spend against a fixed 1500-credit baseline times the multiplier -- 7500
+      credits -- while the economy hands each agent a 2000-credit allowance and
+      bankrupts it at zero. An agent with no verified success can never spend
+      more than 2000, so the condition was unreachable in every production
+      configuration. It passed its unit tests because they constructed the
+      detector with a baseline low enough to fire.
+
+      Found by implementing rogue seeding: the seeded siphon went bankrupt
+      instead of being contained, which is the difference between a detector
+      that is tested and a detector that works.
+
+      Why 0.75: it fires just before bankruptcy, so a siphon is CONTAINED --
+      recorded, audited, its output dropped -- rather than dying quietly of
+      insolvency with no incident attached to it.
     """
 
     name = "budget_siphon"
     min_actions: int = 6
     multiplier: float = 5.0
-    baseline: float = 1500.0
+    allowance: float = 2000.0
+    allowance_fraction: float = 0.75
+
+    def threshold(self, history: list[Action]) -> float:
+        """Population median cost-per-success, floored by the allowance."""
+        spend: dict[str, float] = defaultdict(float)
+        wins: dict[str, int] = defaultdict(int)
+        for entry in history:
+            spend[entry.agent_id] += entry.credits
+            if entry.verified_success:
+                wins[entry.agent_id] += 1
+        per_success = sorted(
+            spend[agent] / wins[agent] for agent in wins if wins[agent]
+        )
+        floor = self.allowance * self.allowance_fraction
+        if not per_success:
+            return floor
+        mid = len(per_success) // 2
+        median = (
+            per_success[mid]
+            if len(per_success) % 2
+            else (per_success[mid - 1] + per_success[mid]) / 2
+        )
+        return max(median * self.multiplier, floor)
 
     def inspect(self, action: Action, history: list[Action]) -> Detection | None:
         mine = [a for a in history if a.agent_id == action.agent_id]
@@ -137,12 +181,13 @@ class BudgetSiphon:
         successes = sum(1 for a in mine if a.verified_success)
         if successes:
             return None
-        if spent > self.baseline * self.multiplier:
+        limit = self.threshold(history)
+        if spent > limit:
             return Detection(
                 self.name,
                 action.agent_id,
                 f"spent {spent:.0f} credits over {len(mine)} actions with no "
-                f"verified success (threshold {self.baseline * self.multiplier:.0f})",
+                f"verified success (threshold {limit:.0f})",
             )
         return None
 
@@ -415,6 +460,23 @@ class RedTeam:
 
     def is_contained(self, agent_id: str) -> bool:
         return agent_id in self.contained_agents
+
+    def detection_for(self, agent_id: str) -> Detection | None:
+        """Which detector acted on this agent, if any.
+
+        Exists so rogue seeding can check that the RIGHT detector fired.
+        Without it, a seeded budget siphon contained by the loop detector counts
+        as a pass, and the gate reports five detectors working when one of them
+        was never exercised -- which is how the siphon's unreachable threshold
+        survived as long as it did.
+        """
+        for containment in reversed(self.containments):
+            if containment.detection.agent_id == agent_id:
+                return containment.detection
+        for detection in reversed(self.flagged):
+            if detection.agent_id == agent_id:
+                return detection
+        return None
 
     def filter_output(self, results: dict[str, Any]) -> dict[str, Any]:
         """Drop anything produced by a contained agent.

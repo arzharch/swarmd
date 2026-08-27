@@ -35,6 +35,7 @@ from swarmd.swarm.planner import (
     PlanSynthesizer,
 )
 from swarmd.swarm.redteam import RedTeam
+from swarmd.swarm.rogues import RogueSeeder, parse_patterns
 from swarmd.swarm.skills import SkillLibrary
 from swarmd.swarm.synthesis import (
     PROPOSAL_SCHEMA_HINT,
@@ -68,6 +69,11 @@ PROFILES = {
     "deep": Profile("deep", 500, 3, 3, 1800, "enough curve points, ~40 min"),
     "eval": Profile("eval", 500, 3, 2, 600, "one task within a sweep"),
 }
+
+
+# Pool bounds. See SwarmRun._pool_size for why each number is what it is.
+ADVISORY_POOL = 16
+HARD_POOL = 64
 
 
 @dataclass
@@ -142,10 +148,21 @@ class SwarmRun:
         use_skills: bool = True,
         approvals: Any = None,
         on_event: Any = None,
+        seed_rogues: str = "",
+        agents: int | None = None,
     ) -> None:
         if profile not in PROFILES:
             raise ValueError(f"unknown profile {profile!r}; known: {sorted(PROFILES)}")
         self.profile = PROFILES[profile]
+        # How many agents this run is allowed. Defaults to the profile's figure
+        # and is overridable per run, because the right population size is a
+        # property of the TASK -- a three-node extraction does not want the same
+        # population as a paper reproduction -- and the profile only knows about
+        # wall-clock.
+        if agents is not None and agents < 1:
+            raise ValueError(f"agents must be at least 1, got {agents}")
+        self.agents = agents or self.profile.agents
+        self.agents_explicit = agents is not None
         self.provider = provider
         self.run_id = run_id or f"run-{uuid.uuid4().hex[:10]}"
         self.ledger = (
@@ -176,6 +193,12 @@ class SwarmRun:
         # superstition every future run inherits.
         self.min_evidence = 2
         self.redteam = RedTeam(kill=self._contain)
+        # Deliberate misbehaviour, injected into this run. The red-team is NOT
+        # told which agents are seeded: it either notices or the gate fails.
+        # An unknown pattern raises here rather than seeding nothing, because a
+        # typo that produces a clean run reads exactly like a pass.
+        patterns = parse_patterns(seed_rogues)
+        self.rogues = RogueSeeder(patterns) if patterns else None
         self.on_event = on_event
 
         # Wire this run's ledger into the provider pool. Without it the pool
@@ -325,25 +348,47 @@ class SwarmRun:
     def _pool_size(self, plan: Plan) -> int:
         """Agents per plan node.
 
-        ANATOMY: pool size
-          The profile's agent budget spread across the plan's nodes, floored at
-          2 so distillation always has the evidence it needs, and capped at 16
-          per node.
+        ANATOMY: the floor of 2
+          Distillation needs two independent verified successes on the same
+          node before it will propose a skill, so a pool of one makes the
+          learning loop structurally dead no matter what else is configured.
 
-          Why the cap. The capacity plan's 500-agent figure assumes two levers
-          that are NOT yet implemented: batched generation (one call returning K
-          variants) and the semantic cache. Without them every agent is a real
-          call, and 500 agents would blow the $0.05 ceiling long before
-          finishing. The ceiling would stop it safely -- that is what it is for
-          -- but a run that always aborts is not a run. Capping here makes the
-          gap explicit rather than letting it surface as a mysterious abort.
+        ANATOMY: ADVISORY_POOL (16)
+          What the currently implemented capacity levers support. The 500-agent
+          figure in CAPACITY.md assumes batched generation and the semantic
+          cache; without them every agent is a real call, and a large pool
+          reaches the cost ceiling instead of the answer.
 
-          Raising this to the profile's full agent count is a one-line change
-          once batching lands.
+          An explicit agent count from the operator OVERRIDES this, because a
+          cap that cannot be overridden is a lie about who is in control -- and
+          the ceiling is the real protection either way: the run aborts on
+          budget rather than silently costing more than it was allowed. What
+          the operator gets instead of a veto is a warning event naming the
+          reason, so an expensive run is a decision rather than a surprise.
+
+        ANATOMY: HARD_POOL (64)
+          Not about cost -- the ceiling handles cost. This bounds concurrent
+          in-flight work per node so one level cannot open hundreds of
+          simultaneous provider connections and turn a rate-limit into a
+          thundering herd.
         """
         nodes = max(1, len(plan.nodes))
-        budget = max(2, self.profile.agents // nodes)
-        return min(16, budget)
+        budget = max(2, self.agents // nodes)
+        if not self.agents_explicit:
+            return min(ADVISORY_POOL, budget)
+        if budget > ADVISORY_POOL:
+            self._emit(
+                "pool_above_advisory",
+                requested=budget,
+                advisory=ADVISORY_POOL,
+                granted=min(HARD_POOL, budget),
+                reason=(
+                    "batched generation and the semantic cache are not "
+                    "implemented, so every agent is a real model call; the cost "
+                    "ceiling, not this cap, is what will stop the run"
+                ),
+            )
+        return min(HARD_POOL, budget)
 
     async def _execute(
         self, task: str, plan: Plan, criterion: FrozenCriterion
@@ -378,6 +423,15 @@ class SwarmRun:
             async def run_agent(name: str) -> WorkerResult:
                 node = plan.node(name)
                 account = self.economy.spawn(traits={"node": name})
+                if self.rogues is not None and len(self.rogues.assigned) < len(
+                    self.rogues.patterns
+                ):
+                    # One agent per requested pattern, taken in order from the
+                    # front of the run. Sampling at random instead would make
+                    # "all five detected" a coin flip that usually passes, and a
+                    # gate that usually passes teaches people to re-run it
+                    # rather than read it.
+                    self.rogues.assign(account.agent_id)
                 metrics.set_agents_alive(
                     state="running", count=len(self.economy.alive())
                 )
@@ -396,6 +450,36 @@ class SwarmRun:
 
                 while True:
                     worker = GenericWorker(account.agent_id, context)
+
+                    # A seeded rogue misbehaves BEFORE doing its honest work,
+                    # so containment happens while there is still work left to
+                    # lose. Seeding after the node finished would contain an
+                    # agent whose output had already landed, which tests the
+                    # detector and not the guarantee.
+                    seeded = (
+                        self.rogues.behaviour_for(account.agent_id)
+                        if self.rogues is not None
+                        else ""
+                    )
+                    if (
+                        seeded
+                        and self.rogues is not None
+                        and await self.rogues.run(worker, name)
+                    ):
+                        self._emit(
+                            "agent_contained",
+                            agent_id=account.agent_id,
+                            node=name,
+                            pattern=seeded,
+                        )
+                        return WorkerResult(
+                            agent_id=account.agent_id, node=name,
+                            candidate=empty_candidate(), passed=False,
+                            contained=True,
+                            failures=("contained: seeded rogue",),
+                            thoughts=list(worker.thoughts),
+                        )
+
                     if self.chaos is not None and self.chaos.should_kill():
                         # Killed BEFORE finishing. Whatever the worker had
                         # checkpointed survives in `carried`.
@@ -560,9 +644,12 @@ class SwarmRun:
             "skills": self.skills.stats() if self.skills else None,
             "profile": {
                 "name": self.profile.name,
-                "agents": self.profile.agents,
+                "agents": self.agents,
+                "profile_agents": self.profile.agents,
+                "agents_explicit": self.agents_explicit,
                 "target_calls": self.profile.target_calls,
             },
+            "rogues": self.rogues.report() if self.rogues else None,
             "ablation": {"skills_enabled": self.use_skills},
         }
 

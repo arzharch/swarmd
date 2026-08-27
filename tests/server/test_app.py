@@ -229,6 +229,58 @@ def test_submitted_runs_are_listable(client):
     assert any(r["run_id"] == run_id for r in runs)
 
 
+def test_the_agent_count_is_selectable_per_run(client):
+    """The profile encodes a wall-clock target, not the right population size."""
+    run_id = client.post(
+        "/api/runs",
+        json={"task": "t", "profile": "smoke", "chaos": False, "agents": 12},
+    ).json()["run_id"]
+    run = next(
+        r for r in client.get("/api/runs").json()["runs"] if r["run_id"] == run_id
+    )
+    assert run["agents"] == 12
+
+
+def test_an_absurd_agent_count_is_refused(client):
+    """Over HTTP, from a client that may have a typo in it."""
+    response = client.post(
+        "/api/runs", json={"task": "t", "profile": "smoke", "agents": 100_000}
+    )
+    assert response.status_code == 422
+
+
+def test_a_zero_agent_run_is_refused(client):
+    response = client.post(
+        "/api/runs", json={"task": "t", "profile": "smoke", "agents": 0}
+    )
+    assert response.status_code == 422
+
+
+def test_rogues_can_be_seeded_over_the_api(client):
+    """SPEC Phase 8 is runnable as a service call, not only as a CLI flag."""
+    response = client.post(
+        "/api/runs",
+        json={
+            "task": "t", "profile": "smoke", "chaos": False, "seed_rogues": "all",
+        },
+    )
+    assert response.status_code == 202
+
+
+def test_a_misspelled_rogue_pattern_is_refused(client):
+    """400, not a clean run.
+
+    A typo that seeds nothing produces a run with zero containments, which is
+    indistinguishable from a red-team gate that passed.
+    """
+    response = client.post(
+        "/api/runs",
+        json={"task": "t", "profile": "smoke", "seed_rogues": "loops"},
+    )
+    assert response.status_code == 400
+    assert "unknown rogue pattern" in response.json()["detail"]
+
+
 def test_an_unknown_run_is_404(client):
     assert client.get("/api/runs/nope").status_code == 404
 

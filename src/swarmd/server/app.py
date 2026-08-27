@@ -70,6 +70,14 @@ class RunRequest(BaseModel):
     kill_rate: float = Field(default=0.2, ge=0.0, le=1.0)
     use_skills: bool = True
     ceiling_usd: float = Field(default=0.05, gt=0.0, le=10.0)
+    # How many agents to run. None means the profile decides. Bounded at 2000
+    # here rather than left open because this arrives over HTTP from a client
+    # that may have a typo in it, and the validation error is a better outcome
+    # than a run that spends its whole ceiling discovering the same thing.
+    agents: int | None = Field(default=None, ge=1, le=2000)
+    # Deliberate misbehaviour to inject: "all", or a comma-separated subset of
+    # the five patterns. Empty means a clean run.
+    seed_rogues: str = ""
 
 
 class RunRegistry:
@@ -184,6 +192,15 @@ def create_app(
         if request.profile not in PROFILES:
             raise HTTPException(400, f"unknown profile; known: {sorted(PROFILES)}")
 
+        from swarmd.swarm.rogues import UnknownRogue, parse_patterns
+
+        try:
+            parse_patterns(request.seed_rogues)
+        except UnknownRogue as exc:
+            # 400 rather than seeding nothing: a typo that produces a clean run
+            # reads exactly like a red-team gate that passed.
+            raise HTTPException(400, str(exc)) from exc
+
         from swarmd.chaos import ChaosHook
         from swarmd.harnesses.sandbox import SandboxHarness
         from swarmd.swarm.skills import SkillLibrary
@@ -196,6 +213,8 @@ def create_app(
         run = SwarmRun(
             provider,
             profile=request.profile,
+            agents=request.agents,
+            seed_rogues=request.seed_rogues,
             ceiling_usd=request.ceiling_usd,
             use_skills=request.use_skills,
             skills=(
@@ -213,6 +232,8 @@ def create_app(
                 "run_id": run.run_id,
                 "task": request.task,
                 "profile": request.profile,
+                "agents": run.agents,
+                "seed_rogues": request.seed_rogues,
                 "status": "running",
                 "started": time.time(),
             },
