@@ -163,6 +163,14 @@ class SwarmRun:
         self.redteam = RedTeam(kill=self._contain)
         self.on_event = on_event
 
+        # Wire this run's ledger into the provider pool. Without it the pool
+        # holds no account, charges nothing, and the run reports calls=0 while
+        # actually spending -- a cost ceiling that silently never triggers.
+        # Set here rather than at pool construction because the account belongs
+        # to the run, and one pool may serve several runs over its lifetime.
+        if hasattr(self.provider, "account"):
+            self.provider.account = self.account
+
     # -- events -------------------------------------------------------------
 
     def _emit(self, kind: str, **payload: Any) -> None:

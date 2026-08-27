@@ -114,10 +114,7 @@ class SimulatedProvider(Provider):
 
             raise ProviderError(f"{self.name}: simulated failure (seeded)")
 
-        if "Respond with ONLY a JSON object" in request.prompt:
-            text = _json_for_schema(request.prompt, n)
-        else:
-            text = " ".join(PROSE_WORDS[(n >> i) % len(PROSE_WORDS)] for i in range(0, 40, 4))
+        text = _synthesize(request.prompt, n)
 
         return LLMResponse(
             text=text,
@@ -130,6 +127,119 @@ class SimulatedProvider(Provider):
 
     async def aclose(self) -> None:
         return None
+
+
+def _synthesize(prompt: str, n: int) -> str:
+    """Answer by prompt SHAPE, not by generic schema filling.
+
+    A provider that returns schema-shaped noise for every prompt cannot drive
+    this system: criterion synthesis correctly refuses to freeze the garbage it
+    produces, so the run dies at stage zero and nothing downstream is ever
+    exercised. That is the synthesizer working, and it makes a generic stub
+    useless for development.
+
+    So the simulated provider recognises the three prompt shapes the swarm
+    actually issues and returns structurally valid, deterministic answers for
+    each. The output is still entirely synthetic and still marked
+    `simulated=true` on every ledger row (ADR-012) -- what changes is that the
+    pipeline can be built and watched end to end before a key exists.
+    """
+    if "checks" in prompt and "schema" in prompt:
+        return _criterion(n)
+    if '"nodes"' in prompt and "schema" in prompt:
+        return _plan(n)
+    if "STEP:" in prompt and "REQUIRED:" in prompt:
+        return _worker_output(prompt, n)
+    if "Respond with ONLY a JSON object" in prompt:
+        return _json_for_schema(prompt, n)
+    return " ".join(PROSE_WORDS[(n >> i) % len(PROSE_WORDS)] for i in range(0, 40, 4))
+
+
+def _criterion(n: int) -> str:
+    """A criterion strong enough to survive its own adversarial pass.
+
+    Deliberately not the weakest thing that parses: a criterion made only of
+    `output_nonempty` is defeated by the `echo_task` attack, synthesis rejects
+    it, and the run fails at stage zero every time. Requiring structured output
+    with named keys is the smallest criterion that garbage cannot satisfy.
+    """
+    return json.dumps(
+        {
+            "description": "the step emits a structured artifact with the "
+                           "required fields",
+            "checks": [
+                {
+                    "kind": "json_parses",
+                    "params": {"required_keys": ["summary", "value"]},
+                },
+                {"kind": "min_distinct_words", "params": {"min_distinct": 6}},
+            ],
+        }
+    )
+
+
+def _plan(n: int) -> str:
+    """A small, valid, deliberately WIDE plan.
+
+    Width varies with the prompt hash so different tasks decompose differently,
+    and the parallel branch exists so the worker pool has something to be
+    parallel about -- a chain would make every run single-file and hide any
+    scheduling bug.
+    """
+    variants = [
+        [
+            {"name": "gather", "instruction": "produce sources.json", "depends_on": []},
+            {"name": "analyse", "instruction": "produce findings.json",
+             "depends_on": ["gather"]},
+            {"name": "verify", "instruction": "produce verification.json",
+             "depends_on": ["analyse"]},
+        ],
+        [
+            {"name": "read", "instruction": "produce extracted.json", "depends_on": []},
+            {"name": "compute", "instruction": "produce metrics.json",
+             "depends_on": ["read"]},
+            {"name": "crosscheck", "instruction": "produce crosscheck.json",
+             "depends_on": ["read"]},
+            {"name": "report", "instruction": "produce report.json",
+             "depends_on": ["compute", "crosscheck"]},
+        ],
+    ]
+    return json.dumps(
+        {
+            "rationale": "split extraction from verification so they can be "
+                         "checked independently",
+            "nodes": variants[n % len(variants)],
+        }
+    )
+
+
+def _worker_output(prompt: str, n: int) -> str:
+    """Output that satisfies a well-formed criterion without being degenerate.
+
+    Distinct-token ratio is kept high on purpose: repeated padding is exactly
+    what the red-team's criterion_gaming detector contains, so a stub emitting
+    padding would have every simulated run contained and prove nothing.
+    """
+    step = "step"
+    for line in prompt.splitlines():
+        if line.startswith("STEP:"):
+            step = line.split(":", 1)[1].strip()
+            break
+    vocabulary = [
+        "loaded", "normalised", "partitioned", "computed", "validated",
+        "recorded", "compared", "reconciled", "summarised", "documented",
+        "sampled", "verified", "measured", "aggregated", "inspected",
+    ]
+    verbs = [vocabulary[(n >> i) % len(vocabulary)] for i in range(0, 24, 4)]
+    return json.dumps(
+        {
+            "summary": f"{step}: {', '.join(dict.fromkeys(verbs))} the inputs "
+                       f"and wrote the artifact for downstream checks",
+            "value": (n % 900) / 10.0,
+            "step": step,
+            "evidence": sorted(set(verbs)),
+        }
+    )
 
 
 def _json_for_schema(prompt: str, n: int) -> str:

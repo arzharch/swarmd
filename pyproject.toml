@@ -32,6 +32,11 @@ dev = [
     # no-op fallback. A test that only ever runs the fallback proves nothing.
     "prometheus-client>=0.20",
 ]
+serve = [
+    "fastapi>=0.115",
+    "uvicorn>=0.32",
+    "websockets>=13",
+]
 
 [build-system]
 requires = ["uv_build>=0.7,<1.0"]
@@ -65,6 +70,7 @@ ignore_missing_imports = true
 
 [dependency-groups]
 dev = [
+    "httpx>=0.28",
     "prometheus-client>=0.20",
     "pytest-timeout>=2.4.0",
     "pyyaml>=6.0.3",

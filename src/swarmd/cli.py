@@ -106,6 +106,53 @@ def main(argv: list[str] | None = None) -> int:
         "exhausting free capacity stops the run instead of quietly spending.",
     )
 
+    swarm = sub.add_parser("swarm", help="run the generalist swarm on a task")
+    swarm_sub = swarm.add_subparsers(dest="swarm_command", required=True)
+    swarm_run = swarm_sub.add_parser("run", help="run one unknown task end to end")
+    swarm_run.add_argument("task", help="the task, in plain language")
+    swarm_run.add_argument(
+        "--profile",
+        default="demo",
+        choices=["smoke", "demo", "deep", "eval"],
+        help="run size, derived from docs/CAPACITY.md rather than chosen: "
+        "smoke ~2min/60 calls (CI), demo 12-18min/600 calls (the watchable "
+        "run), deep ~40min/1800 calls (enough curve points to mean something).",
+    )
+    swarm_run.add_argument(
+        "--chaos", action="store_true",
+        help="kill agents mid-run. On by default in every deployed environment: "
+        "turning it off would make production the one place the recovery "
+        "guarantee is never tested.",
+    )
+    swarm_run.add_argument(
+        "--kill-rate", type=float, default=0.2,
+        help="probability an agent is killed per scheduling tick. 0.2 hits "
+        "every recovery path within one run while leaving enough survivors to "
+        "prove partial progress is preserved.",
+    )
+    swarm_run.add_argument(
+        "--ceiling", type=float, default=0.05, metavar="USD",
+        help="hard spend limit for the run, checked at the harness boundary. "
+        "Breach aborts cleanly with an itemised report rather than truncating, "
+        "because a truncated run still emits numbers that look like results.",
+    )
+    swarm_run.add_argument(
+        "--no-skills", action="store_true",
+        help="the CONTROL ARM. Disables skill retrieval with everything else "
+        "identical, which is what an improvement claim is measured against.",
+    )
+    swarm_run.add_argument("--skills", default=None, metavar="PATH",
+                           help="skill library file (default: no library)")
+    swarm_run.add_argument("--ledger", default=None, metavar="PATH",
+                           help="write the append-only cost ledger here")
+    swarm_run.add_argument("--json", action="store_true",
+                           help="emit the full report as JSON")
+
+    serve = sub.add_parser("serve", help="run the control plane and event stream")
+    serve.add_argument("--host", default="127.0.0.1")
+    serve.add_argument("--port", type=int, default=8000)
+    serve.add_argument("--skills", default=None, metavar="PATH")
+
     approve = sub.add_parser("approve", help="approve a pending draft (HITL)")
     approve.add_argument("request_id")
     approve.add_argument("--actor", default="cli-user")
@@ -181,6 +228,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "providers":
         return asyncio.run(_providers_command(args))
 
+    if args.command == "swarm":
+        return asyncio.run(_swarm_command(args))
+
+    if args.command == "serve":
+        return _serve_command(args)
+
     if args.command in ("approve", "reject", "list"):
         return asyncio.run(_hitl_command(args))
 
@@ -227,6 +280,105 @@ async def _providers_command(args: argparse.Namespace) -> int:
     live = sum(1 for r in rows if r["ok"])
     print(f"\n{live}/{len(rows)} providers live")
     return 0 if live else 1
+
+
+async def _swarm_command(args: argparse.Namespace) -> int:
+    """Run one unknown task end to end and print what happened."""
+    import json as _json
+
+    from swarmd.chaos import ChaosHook
+    from swarmd.harnesses.sandbox import SandboxHarness
+    from swarmd.router.pool import ProviderPool
+    from swarmd.swarm.run import SwarmRun
+    from swarmd.swarm.skills import SkillLibrary
+
+    try:
+        pool = ProviderPool.from_env()
+    except RuntimeError as exc:
+        print(f"no provider capacity: {exc}")
+        print(
+            "\nSet a provider key, or SWARMD_SIMULATED_PROVIDER=true "
+            "to develop without one (results are marked simulated)."
+        )
+        return 2
+
+    run = SwarmRun(
+        pool,
+        profile=args.profile,
+        ceiling_usd=args.ceiling,
+        use_skills=not args.no_skills,
+        skills=SkillLibrary(args.skills) if args.skills else None,
+        sandbox=SandboxHarness(),
+        chaos=ChaosHook(kill_rate=args.kill_rate) if args.chaos else None,
+        ledger_path=args.ledger,
+        on_event=_print_event,
+    )
+    result = await run.run(args.task)
+    report = run.report(result)
+    await pool.aclose()
+
+    if args.json:
+        print(_json.dumps(report, indent=2))
+        return 0 if result.status == "completed" else 1
+
+    print(
+        f"\nrun={result.run_id}  status={result.status}  "
+        f"{result.duration_s:.1f}s"
+    )
+    if result.criterion:
+        print(f"criterion={result.criterion.hash} "
+              f"({len(result.criterion.criterion.checks)} checks, "
+              f"attempts={result.criterion.attempts})")
+    if result.plan:
+        print(f"plan={result.plan.content_hash()} "
+              f"({len(result.plan.nodes)} nodes, width={result.plan.width})")
+    print(f"nodes_passed={len(result.passed)}/{len(result.results)}  "
+          f"contained={len(result.contained)}")
+    print(f"integrity_hash={result.integrity_hash()}")
+
+    cost = report["cost"]
+    marker = "  [SIMULATED]" if cost.get("simulated") else ""
+    print(f"cost=${cost['total_usd']:.6f} of ${cost['ceiling_usd']} ceiling  "
+          f"calls={cost['llm_calls']}  cache_hits={cost['cache_hits']}{marker}")
+    econ = report["economy"]
+    print(f"agents={econ['population']} alive={econ['alive']} "
+          f"bankrupt={econ['bankruptcies']} contained={econ['contained']}")
+    rt = report["redteam"]
+    print(f"redteam: contained={rt['contained']} flagged={rt['flagged']} "
+          f"llm_calls={rt['llm_calls_used']}")
+    if result.error:
+        print(f"error: {result.error}")
+    return 0 if result.status == "completed" else 1
+
+
+def _print_event(event: dict[str, Any]) -> None:
+    """Terse live log. The dashboard is the rich view; this is the tail."""
+    kind = event.get("kind", "")
+    if kind == "thought":
+        print(f"  . {event.get('agent_id', '')}: {event.get('decision', '')}")
+    elif kind in {"criterion_frozen", "plan_selected", "run_started",
+                  "containment", "agent_killed", "node_finished"}:
+        detail = event.get("hash") or event.get("node") or event.get("reason") or ""
+        print(f"  * {kind} {detail}")
+
+
+def _serve_command(args: argparse.Namespace) -> int:
+    """Start the control plane. Blocks."""
+    try:
+        import uvicorn
+
+        from swarmd.server.app import create_app
+    except ImportError:
+        print("serve needs the 'serve' extra: uv sync --extra serve")
+        return 2
+
+    app = create_app(skills_path=args.skills)
+    print(f"swarmd control plane on http://{args.host}:{args.port}")
+    print(f"  stream:    ws://{args.host}:{args.port}/api/stream")
+    print(f"  health:    http://{args.host}:{args.port}/healthz")
+    print(f"  metrics:   http://{args.host}:{args.port}/metrics")
+    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+    return 0
 
 
 async def _hitl_command(args: argparse.Namespace) -> int:
