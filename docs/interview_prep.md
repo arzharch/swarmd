@@ -326,21 +326,182 @@ The mitigations are that thresholds are not exposed to agents, that library pois
 judged against the control arm rather than self-reported metrics, and that a human approval
 gate stands between a proposed skill and the library.
 
-## Section 8: Phase 5 production floor (populate as you build)
+## Section 8: Cost, quota, and the production floor (answerable NOW)
 
-**Q: Why does the cost ledger record cache hits as zero-cost rows instead of skipping them?**
-A: (to fill - so "what did the cache save" is a query rather than an estimate)
+**Q: Your system spends money on every call. How do you stop it running away?**
+A: A hard $0.05 ceiling per run, checked at the harness boundary so no call path
+can bypass it, and checked twice - before issuing with a conservative estimate,
+and again once real usage is known. Discovering a breach only after the tokens
+are spent means the ceiling was advisory. A breach raises with the itemised
+report attached and the caller turns it into a cleanly aborted run, never a
+truncated one, because a truncated run still emits numbers that look like
+results.
 
-**Q: What did empirical rate-limit discovery find that the published limits got wrong?**
-A: (to fill - keep the raw probe output; sources already disagree on OpenRouter's daily cap)
+**Q: Why does the cost ledger record cache hits as zero-cost rows instead of just
+skipping them?**
+A: So "what did the cache save" is a query rather than an estimate. Each hit row
+carries what the call would have cost at that model's price, so cache savings
+sum out of the same table as spend. Skipping them would mean the only honest
+answer to "was the cache worth it" is an educated guess.
 
-**Q: How does the WebSocket sink avoid a slow browser stalling the run?**
-A: (to fill - drop vs buffer vs block, and why)
+**Q: You say there is no counter. How is that enforced rather than just intended?**
+A: A test appends a row directly to the ledger, bypassing the accountant
+entirely, and asserts the reported total moves. A counter implementation fails
+that test. The reason it matters: agents are selected on reported success and
+paid on verified success, so anything an agent can write, selection pressure
+eventually teaches it to write dishonestly. Removing the capability is cheaper
+than policing it.
 
-## Section 9: Scale and unknown-task runs (populate as Phases 6-7 land)
+**Q: What happens if a model is not in your price table?**
+A: It raises `UnpricedModel` and the call does not happen. Defaulting to zero
+would silently disable the ceiling, which is the single control between a run
+and an unbounded bill. The failure mode of being loud here is a startup error;
+the failure mode of being quiet is a surprise invoice.
+
+**Q: What did empirical rate-limit discovery find that the published limits got
+wrong?**
+A: OpenRouter's daily cap is documented as 50, 200, and 1000 by different
+sources on the same day. That disagreement is the entire argument for treating
+published limits as an ordering hint and letting an actual 429 be the
+authoritative statement. `Retry-After` wins over our own backoff because it is
+the provider telling us its limit; exponential backoff is only the fallback for
+providers that say nothing.
+
+**Q: Three pods, one Groq key. What happens?**
+A: With naive in-process limiting, each pod politely holds itself to the account
+rate and collectively they present three times it, get everything throttled, and
+then each interprets a self-inflicted 429 as evidence about the provider and
+tightens against a problem it caused. That is ADR-011. Quota moves to Redis,
+evaluated as one Lua script because check-then-decrement across two round trips
+is a race that is not rare under hundreds of agents, and refilled against the
+Redis clock because pod clocks drift.
+
+**Q: What happens when Redis is down - do you fail open or closed?**
+A: Neither, deliberately. Pods degrade to local buckets at 25% of the real rate.
+Fail-open would produce exactly the stampede the quota exists to prevent.
+Fail-fully-closed would turn a Redis blip into a total outage of a system whose
+whole premise is graceful degradation. 25% is sized so a plausible number of
+blind pods still sums to under the account limit.
+
+**Q: Why a token bucket and not a fixed window?**
+A: A fixed window permits spending the entire minute's allowance in its first
+second. That reads to the provider as a burst and earns a 429 despite a
+perfectly legal average. Continuous refill is what "30 requests per minute"
+actually means to the thing enforcing it.
+
+**Q: Two API keys for the same provider - does that double your throughput?**
+A: Yes, and the pool models it: one slot and one quota bucket per credential,
+because quota is per account. Keying on provider name alone would throttle two
+accounts as one and discard half the capacity. Worth adding: creating multiple
+accounts specifically to evade a rate limit violates most providers' terms, so
+the capacity answer I would actually give is cross-provider pooling plus a 60%
+cache hit rate, which gets the same multiple legitimately.
+
+**Q: Prometheus or the ledger - which one is the truth?**
+A: Neither, and the split is deliberate. Prometheus is for OPERATING the system:
+it may lose a scrape, and its counters reset when a pod restarts, which is fine
+for "is cost climbing right now". The ledger is for CLAIMS and does neither. If
+a dashboard and BENCHMARKS.md disagree, the ledger is right and the dashboard is
+stale. That sentence is at the top of the metrics module.
+
+**Q: Why is your metrics module on its own registry instead of the default?**
+A: swarmd is a library as well as a service, and a host application that also
+uses prometheus_client would collide with us on the global registry - a
+duplicate-timeseries error at import time, which is the worst possible place to
+find out. It also made the module reloadable, which is what let me actually test
+the no-prometheus fallback rather than assume it.
+
+**Q: How do you stop metric cardinality from exploding?**
+A: A test asserts that no metric declares run_id, task_id, or agent_id as a
+label. One unbounded label on a busy counter kills a Prometheus instance and is
+not recoverable without dropping the series, so it is enforced rather than
+documented. High-cardinality identity goes in traces and the ledger, which are
+built to hold it.
+
+## Section 9: Kubernetes and production operations (answerable NOW)
+
+**Q: Why is a run a Job rather than a Deployment?**
+A: A run has a beginning, an end, and a result - that is a batch workload. As a
+Deployment the controller would restart a finished process forever, and "did
+this run succeed" would be a question you answer by reading logs instead of by
+reading a Job status.
+
+**Q: So does it scale horizontally?**
+A: More concurrent runs, yes. A faster single run, no - a run stays in one pod.
+Distributing one run needs a distributed scheduler I have not built, and PRD
+section 6 lists it as a v1 non-goal. The thing that genuinely does not survive
+naive horizontal scaling is provider quota, which is why Redis is in the
+architecture at all.
+
+**Q: backoffLimit is 0. Why not retry failed runs?**
+A: Re-running burns provider quota, which is the scarcest resource in the
+system, and the ledger already holds everything needed to diagnose the failure.
+Recovery WITHIN a run is what the checkpoint system is for; retrying an entire
+run is a human decision, not a controller's.
+
+**Q: You put runs on Spot instances. Isn't that asking for trouble?**
+A: The product claim is that agents can be killed and work is not lost. Refusing
+to run on Spot would be an odd lack of confidence in my own guarantee. A Spot
+interruption is just another chaos event, and Karpenter gives a two-minute
+drain. Control plane and Redis stay on-demand - an interrupted control plane is
+a blip, an interrupted Redis is a quota-coordination gap.
+
+**Q: Every container has resource limits except the control plane's CPU. Why?**
+A: CFS throttling on a latency-sensitive asyncio event loop produces tail-latency
+spikes that look exactly like provider slowness, which sends you debugging the
+wrong system entirely. The request reserves the floor and the namespace
+ResourceQuota caps the top, so it is bounded - just not per-container.
+
+**Q: Why does Redis use the Recreate strategy instead of RollingUpdate?**
+A: Two Redis pods behind one Service would split the quota buckets in half and
+each half would permit the full rate - precisely the over-permissiveness the
+quota exists to prevent. A few seconds of unavailability during a deploy costs
+one degraded window; two pods costs a throttled account.
+
+**Q: Your readiness and liveness probes hit different endpoints. Deliberate?**
+A: Yes. Readiness goes false when the provider pool has no capacity, so a
+saturated pod stops receiving NEW runs without being killed and losing the ones
+it already holds. If liveness used the same signal, saturation would restart the
+pod and destroy in-flight work - turning a capacity event into a correctness
+event.
+
+**Q: How do you keep credentials out of the cluster?**
+A: External Secrets Operator syncing from AWS Secrets Manager, with IRSA so no
+static AWS credentials exist in the cluster either. The prod overlay deletes the
+placeholder Secret rather than leaving it blank, so a misconfigured ExternalSecret
+fails loudly at pod start instead of quietly mounting empty keys and presenting
+as a provider outage. And the egress NetworkPolicy blocks 169.254.169.254
+specifically, because the metadata endpoint is the standard path from "code
+execution in a pod" to "cloud credentials".
+
+**Q: You run chaos in production. Justify that.**
+A: Turning it off would make production the one environment where the recovery
+guarantee is never actually tested. That is exactly backwards - the guarantee
+matters most where the work is real.
+
+**Q: What is your most uncomfortable production number?**
+A: Infrastructure costs roughly 5,600 times more than inference - about $280 a
+month against effectively $0 of LLM spend. If the goal were minimising cost,
+this belongs on Fargate or a single VM. It is on EKS because the goal is
+demonstrating that I can operate the thing, and I would rather say that plainly
+than pretend the architecture is cost-optimal.
+
+**Q: Why is "agent success rate" not an SLO?**
+A: Because making it one would create pressure to weaken the frozen criterion.
+The system would then hit its SLO by grading itself more generously, which is
+precisely the failure ADR-009 exists to prevent. Capability belongs in
+`swarmd eval` with a control arm; SLOs are for reliability. Correctness under
+chaos IS an SLO, at 100% with no error budget, because a budget there would
+imply an acceptable rate of silently losing work.
+
+## Section 10: Unknown-task runs (populate as Phases 6-7 land)
 
 **Q: What broke first at 500 agents?**
 A: (to fill - keep a raw failure log; this question decides the interview)
 
 **Q: Show me a synthesized DAG that was wrong, and what caught it.**
 A: (to fill - structural validation rejections, with examples)
+
+**Q: What did the cache hit rate actually turn out to be on unknown tasks?**
+A: (to fill - the capacity plan assumes 60%; this is the assumption most likely
+to be wrong, and the wall-clock budget depends on it)

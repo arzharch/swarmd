@@ -451,22 +451,237 @@ ANATOMY: --allow-data-training
 
 ---
 
+## 2026-08-28 - Phase 5 production floor + platform track
+
+Ledger, provider pool, cluster-wide quota, Prometheus metrics, Grafana, Kubernetes,
+SLOs, runbook, deployment plan. 207 tests green, ruff and mypy clean.
+
+DECISION: total_cost() sums ledger rows; no counter exists anywhere (ADR-007)
+ALTERNATIVES: in-process counter with careful review - counter plus periodic audit
+WHY THIS: agents are selected on reported success and paid on verified success.
+  Anything an agent can write, selection pressure eventually teaches it to write
+  dishonestly. Removing the capability is cheaper than policing it.
+TRADE-OFF ACCEPTED: a write per event, and eval runs cost double because the
+  control arm is not optional.
+FOLLOW-UPS:
+  Q: How do you actually enforce "no counter"? That is a comment, not a control.
+  A: A test appends a row directly to the ledger behind the accountant's back
+     and asserts the reported total moves. A counter implementation fails it.
+  Q: Why is an unknown model fatal rather than defaulting to zero?
+  A: A model priced at an assumed zero silently disables the ceiling, which is
+     the single control between a run and an unbounded bill. UnpricedModel
+     raises. The failure mode of being too loud here is a startup error; the
+     failure mode of being quiet is a bill.
+
+DECISION: JSONL for the ledger, fsync per row
+ALTERNATIVES: buffered writes - Postgres table - SQLite
+WHY THIS: append-only is the file format's native mode, so immutability is a
+  property of the medium rather than a rule someone has to remember. fsync per
+  row is slow on purpose: a ledger that loses its last rows when an agent is
+  killed is exactly the ledger that cannot be trusted about a chaos run.
+TRADE-OFF ACCEPTED: cross-run queries need Postgres later; a single run's ledger
+  is small enough that a file is the honest choice now.
+FOLLOW-UPS:
+  Q: What happens to the row being written when the process is killed?
+  A: A torn final line. read_durable() skips it and verify() reports the
+     memory/disk discrepancy rather than raising - after a hard kill the honest
+     outcome is "the last row was torn", stated, not an exception that makes it
+     look like a code failure. Tested directly.
+
+DECISION: one OpenAI-compatible adapter for all five providers
+ALTERNATIVES: five vendor SDKs - one adapter plus per-provider subclasses now
+WHY THIS: Groq, Cerebras, Google AI Studio, Mistral and OpenRouter all expose
+  OpenAI-compatible chat-completions. They differ in base URL, key, and model
+  ids. Five SDKs would be five dependency trees to express the same POST.
+TRADE-OFF ACCEPTED: when a provider breaks the contract it gets a subclass. That
+  cost lands on the one provider that deviates, not on the four that do not.
+
+DECISION: rate limits discovered from observed 429s, not configured (ADR-008)
+ALTERNATIVES: hardcode published limits - config file per provider
+WHY THIS: published free-tier limits disagree across sources - OpenRouter's
+  daily cap is documented as 50, 200, and 1000 by different sources on the same
+  day - and change without notice. A constant is wrong on arrival.
+TRADE-OFF ACCEPTED: the first 429 of a run is a real cost we pay to learn.
+FOLLOW-UPS:
+  Q: Why does Retry-After win over your own backoff?
+  A: It is the provider stating its own limit. Our exponential backoff is a
+     guess for providers that say nothing.
+  Q: Why does a 429 back off the whole provider rather than just that model?
+  A: Quota is per account. Trying the next model only deepens the hole.
+
+DECISION: quota is a cluster resource coordinated in Redis (ADR-011)
+ALTERNATIVES: in-process buckets only - a dedicated quota service - one replica
+WHY THIS: provider limits are per account, not per process. Three pods each
+  correctly limiting to 45 RPM present 135 RPM to the account. Horizontal
+  scaling silently breaks a limiter that was correct on one node, and the bug
+  first appears during a rolling update - i.e. in production, under load.
+TRADE-OFF ACCEPTED: Redis becomes a production dependency, but only in the
+  multi-replica deployment. Single-node and CI keep zero new infrastructure.
+FOLLOW-UPS:
+  Q: What happens when Redis is down?
+  A: Degrade to local buckets at 25% of the real rate. Fail-open produces
+     exactly the stampede this prevents; fail-fully-closed turns a Redis blip
+     into total outage of a system whose premise is graceful degradation.
+  Q: Why a token bucket rather than a fixed window?
+  A: A fixed window lets a caller spend the whole minute's allowance in its
+     first second, which reads to the provider as a burst and earns a 429
+     despite a legal average.
+  Q: Why is the Redis logic one Lua script?
+  A: Check-then-decrement across two round trips is a race, and with hundreds
+     of agents contending it is not a rare one.
+  Q: Whose clock refills the bucket?
+  A: Redis's. Pod clocks drift, and a bucket refilled against a fast clock
+     hands out permits that do not exist.
+
+DECISION: metrics live on a private CollectorRegistry, not the client default
+ALTERNATIVES: default global registry - no metrics module
+WHY THIS: swarmd is a library as well as a service. A host application that
+  also uses prometheus_client would collide on the global registry - a
+  duplicate-timeseries error at import time, the worst place to discover an
+  observability conflict. It also makes the module reloadable, which is what
+  lets the no-prometheus fallback be tested rather than assumed.
+TRADE-OFF ACCEPTED: process/platform/GC collectors must be registered
+  explicitly, since dropping the default registry drops its freebies.
+FOLLOW-UPS:
+  Q: Prometheus or the ledger - which is the source of truth?
+  A: Neither, for different things. Prometheus is for OPERATING the system and
+     is allowed to lose a scrape or reset on restart. The ledger is for CLAIMS
+     and does neither. If a dashboard and BENCHMARKS.md disagree, the ledger is
+     right and the dashboard is stale. This is written at the top of the module.
+  Q: How is the cardinality policy enforced?
+  A: A test asserts no metric declares run_id, task_id, or agent_id as a label.
+     One unbounded label on a busy counter kills a Prometheus instance and is
+     not recoverable without dropping the series.
+  Q: Why count 429s separately from errors?
+  A: They mean different things - an error suggests the provider is broken, a
+     429 suggests it works and we asked too fast. Conflating them makes the
+     error alert fire during normal throttling, which trains people to ignore it.
+
+DECISION: a run is a Kubernetes Job; one run stays in one pod
+ALTERNATIVES: Deployment - distributed run across pods
+WHY THIS: a run has a beginning, an end, and a result: that is a batch
+  workload. A Deployment would restart a "finished" process forever and make
+  "did this run succeed" a question answered by reading logs. Distributing a
+  single run needs a distributed scheduler nobody has built, and PRD section 6
+  lists it as a v1 non-goal.
+TRADE-OFF ACCEPTED: horizontal scale means MORE CONCURRENT RUNS, not a faster
+  single run. That is the honest claim and it is the one that gets made.
+FOLLOW-UPS:
+  Q: backoffLimit 0 - why no retries?
+  A: Re-running burns provider quota, the scarcest resource in the system, and
+     the ledger already holds everything needed to diagnose the failure.
+     Recovery WITHIN a run is the checkpoint system's job; retrying a whole run
+     is a human decision.
+  Q: Spot instances for runs - isn't that reckless?
+  A: Runs are checkpointed and interruption-tolerant by construction; that is
+     the product claim. Refusing Spot would be an odd lack of confidence in it.
+     A Spot interruption is just another chaos event.
+
+DECISION: no CPU limit on the control plane
+ALTERNATIVES: set a CPU limit like everything else
+WHY THIS: CFS throttling on a latency-sensitive asyncio loop produces
+  tail-latency spikes that look exactly like provider slowness - which sends
+  you debugging the wrong system entirely. The request reserves a floor and the
+  namespace ResourceQuota caps the top.
+TRADE-OFF ACCEPTED: a runaway loop could consume node CPU. Bounded by the
+  namespace quota rather than per-container.
+
+DECISION: chaos stays ON in production
+ALTERNATIVES: chaos in dev only
+WHY THIS: turning it off would make production the one environment where the
+  recovery guarantee is never tested. That is precisely backwards.
+TRADE-OFF ACCEPTED: production runs are slower than they would be without kills.
+
+RESEARCH: infrastructure vs inference cost
+  Prod infrastructure lands at roughly $280/month (EKS control plane $73, nodes
+  ~$60, Multi-AZ RDS ~$120, ALB ~$20, S3 ~$5). LLM spend is ~$0 - the workload
+  rides free tiers and the per-run ceiling is $0.05. Infrastructure therefore
+  costs about 5,600x more than inference. Recorded because it is the number
+  that would justify revisiting Fargate if the goal ever shifts from
+  demonstrating Kubernetes competence to minimising cost.
+
+BUGS FOUND BY TESTS:
+  (1) Windows monotonic clock ticks at ~15ms, so a 429 and the success right
+      after it can report a zero delta. A strict `>` in the backoff-decay check
+      silently disabled decay entirely. Fixed to `>=`.
+  (2) Reloading the metrics module re-registered collectors on the global
+      registry and raised duplicate-timeseries, which is also a real embedding
+      bug for any host app using prometheus_client. Fixed by owning a registry.
+  (3) cli.py had a pre-existing mypy failure on the trace-sink assignment,
+      meaning `mypy src` in CI was already red before this batch.
+
+ANATOMY: --ceiling 0.05 (swarmd, per run)
+  Hard USD limit, checked at the harness boundary so no call path bypasses it.
+  Checked BEFORE issuing using a conservative estimate and again after real
+  usage is known - discovering a breach only after the tokens are spent means
+  the ceiling was advisory. Breach raises CeilingExceeded carrying the itemised
+  report; callers turn it into a cleanly aborted run, never a truncated one,
+  because a truncated run still emits numbers that look like results. 2% is
+  held in reserve so the abort path can afford to run.
+
+ANATOMY: quota burst (default = rate/4)
+  How many permits may be spent instantaneously. Why rate/4: enough that a
+  handful of agents starting together do not serialise behind the refill, small
+  enough that a burst cannot consume the window and trip a provider measuring
+  more finely than per-minute. Setting burst == rate reproduces the fixed-window
+  behaviour the bucket exists to avoid.
+
+ANATOMY: quota safety_margin 0.9
+  Fraction of the published rate we decline to use. Published limits are
+  enforced with the provider's clock, not ours, so our 30th request in a minute
+  can arrive inside their previous window. Spending 90% keeps margin for that
+  skew. At 1.0 the 429 rate rises measurably for no extra throughput, since
+  rejected calls have to be retried anyway.
+
+ANATOMY: GROQ_API_KEYS (plural) vs GROQ_API_KEY
+  Plural is comma-separated and yields one pool slot per credential, each with
+  its own quota bucket - two accounts genuinely are two quotas. Credential ids
+  are indices (groq#0, groq#1), never key prefixes, because the id reaches
+  logs, metrics, and the dashboard and must never carry key material.
+
+### Gate evidence
+
+```
+pytest: 207 passed (kernel 26, router 63, pipeline 32, harnesses 12,
+                    leadops 17, observability 22, ledger 23, misc 12)
+ruff check .        All checks passed
+mypy src            Success: no issues found in 26 source files
+kubectl kustomize deploy/k8s/overlays/dev   -> 23 resources
+kubectl kustomize deploy/k8s/overlays/prod  -> 24 resources
+  prod: 0 plain Secrets (placeholder replaced by ExternalSecret)
+  prod: images pinned by digest, replicas 3
+swarmd providers probe (no keys configured):
+  pool unavailable: no usable providers. Skipped: groq (no GROQ_API_KEY), ...
+```
+
+Not yet done in Phase 5: Postgres-durable approvals across processes, ceiling
+wired through the LLM harness call path, WebSocket sink, and the frontend.
+
+---
+
 ## Next up
 
-- [x] Kernel (Phases 1.1-1.8): events, task models, lifecycle, scheduler, runtime
-      recovery, chaos, demo CLI - gate PASSED (hash equality at kill-rate 0.9)
-- [x] Pipeline phase: DAG executor, harnesses, quality gates, HITL state machine,
-      store harness, semantic cache + token budgets
+- [x] Kernel (Phases 1.1-1.8) - gate PASSED (hash equality at kill-rate 0.9)
+- [x] Pipeline phase: DAG executor, harnesses, quality gates, HITL state machine
 - [x] LeadOps: retained as second-domain proof, frozen, tests green
-- [x] v3 docs: PRD/SPEC/PLAN rewritten, ADR-006..010 added, ADR-001 superseded
-- [ ] Phase 5 - production floor: Postgres-durable approvals across processes, cost
-      ledger, hard ceiling at the harness boundary, multi-provider pool router with
-      empirical limit discovery, WebSocket event sink, Prometheus metrics
+- [x] v3 docs: PRD/SPEC/PLAN rewritten, ADR-006..011, ADR-001 superseded
+- [x] Phase 5.2/5.3 - cost ledger, prices as data, hard ceiling
+- [x] Phase 5.4 - provider pool, empirical limit discovery, multi-credential
+- [x] Phase 5.6 - Prometheus metrics on a private registry
+- [x] Platform - Grafana dashboards, alert rules, K8s manifests, dev/prod overlays
+- [x] Docs - capacity plan, SLOs, runbook, deployment plan, ADR-011
+- [ ] Phase 5.1 - Postgres-durable approvals across processes (Phase 3's gate
+      still does not actually pass)
+- [ ] Phase 5.3b - ceiling wired through the LLM harness call path
+- [ ] Phase 5.5 - WebSocket event sink
 - [ ] Track F0/F1 - Next.js shell, agent grid, live event log, cost panel
+- [ ] Platform - Terraform for EKS/RDS/Secrets Manager, CI/CD with progressive
+      rollout, production readiness review checklist
+- [ ] Debt - FallbackRouter still lists MockProvider as last-resort, violating
+      ADR-006; goes when the pool becomes the default path
 - [ ] Phase 6 - criterion synthesis, adversarial pass, content-addressed freeze
-- [ ] Phase 7 - plan synthesis, generic worker pool, sandbox harness, 500-agent chaos run
-- [ ] Phase 8 - red-team organ: five detectors, containment via the chaos kill path
-- [ ] Phase 9 - skill library with human approval gate, economy, consolidation, curriculum
+- [ ] Phase 7 - plan synthesis, generic worker pool, sandbox harness
+- [ ] Phase 8 - red-team organ: five detectors, containment via the kill path
+- [ ] Phase 9 - skill library with human approval gate, economy, consolidation
 - [ ] Phase 10 - eval harness: public + custom arms, control vs treatment, CIs
 - [ ] Phase 11 - hardening, README rewrite, full interview_prep, CI green
-- [ ] Deferred - cloud deployment (out of scope until Phase 11 is green)
