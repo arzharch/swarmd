@@ -103,22 +103,25 @@ groups:
             The repair loop is not converging. Most likely causes: the frozen
             criterion is too strict, or a model swap degraded output quality.
 
-      - alert: SwarmdWorkLostUnderChaos
+      - alert: SwarmdRecoveryPathDead
         expr: |
-          sum(increase(swarmd_agent_kills_total[10m]))
-            - sum(increase(swarmd_requeues_total[10m])) > 5
+          sum(rate(swarmd_agent_kills_total[10m])) > 0
+            and sum(rate(swarmd_requeues_total[10m])) == 0
         for: 10m
         labels:
           severity: page
-          runbook: RUNBOOK.md#worklostunderchaos
+          runbook: RUNBOOK.md#recoverypathdead
         annotations:
-          summary: "Kills are outpacing requeues"
+          summary: "Agents are being killed and nothing is being requeued"
           description: >-
-            Every killed agent's task should be requeued with its checkpoint
-            intact. A sustained gap means the recovery path is dropping work,
-            which invalidates the integrity guarantee the whole system rests on.
-            This is the one alert that indicates a correctness bug rather than
-            a capacity problem.
+            The only alert here that indicates a correctness bug rather than a
+            capacity problem. NOTE: kills legitimately exceed requeues -- an
+            agent killed while idle has no claimed work to requeue, and a
+            kill-rate 0.9 kernel demo shows 595 kills against 404 requeues with
+            a matching integrity hash. So this fires only on requeues at
+            exactly ZERO while kills continue, which is unambiguous: the
+            recovery path is not running at all. A ratio threshold would page
+            during healthy chaos.
 
       - alert: SwarmdUnexpectedContainments
         expr: sum(increase(swarmd_containments_total[15m])) > 0

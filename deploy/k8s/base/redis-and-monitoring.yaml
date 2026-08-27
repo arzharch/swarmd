@@ -149,14 +149,14 @@ spec:
             summary: "Over 10% of calls are being rate limited"
     - name: swarmd-correctness
       rules:
-        - alert: SwarmdWorkLostUnderChaos
+        - alert: SwarmdRecoveryPathDead
           expr: |
-            sum(increase(swarmd_agent_kills_total[10m]))
-              - sum(increase(swarmd_requeues_total[10m])) > 5
+            sum(rate(swarmd_agent_kills_total[10m])) > 0
+              and sum(rate(swarmd_requeues_total[10m])) == 0
           for: 10m
-          labels: { severity: page, runbook: "RUNBOOK.md#worklostunderchaos" }
+          labels: { severity: page, runbook: "RUNBOOK.md#recoverypathdead" }
           annotations:
-            summary: "Kills are outpacing requeues -- recovery may be dropping work"
+            summary: "Agents killed and nothing requeued -- recovery not running"
     - name: swarmd-cost
       rules:
         - alert: SwarmdCostCeilingApproaching

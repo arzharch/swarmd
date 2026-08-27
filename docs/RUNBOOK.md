@@ -161,14 +161,21 @@ swarmd run inspect <run_id> --criterion
 
 ---
 
-## WorkLostUnderChaos
+## RecoveryPathDead
 
-**Severity:** page · kills exceed requeues by >5 over 10m
+**Severity:** page · kills continuing with requeues at exactly zero
 
 **The only alert here that indicates a correctness bug rather than a capacity
-problem.** Every killed agent's task should be requeued with its checkpoint
-intact. A sustained gap means the recovery path is dropping work, which
-invalidates SLO-2 and the guarantee the whole system rests on.
+problem.** Killed agents holding claimed work should have it requeued with the
+checkpoint intact. Requeues sitting at exactly zero while kills continue means
+the recovery path is not running at all, which invalidates SLO-2 and the
+guarantee the whole system rests on.
+
+**Why the condition is "zero" and not "kills exceed requeues".** Kills
+legitimately exceed requeues: an agent killed while idle has no claimed work to
+requeue. A kill-rate 0.9 kernel demo produces 595 kills against 404 requeues
+with a matching integrity hash. An earlier version of this alert used a gap
+threshold and would have paged during entirely healthy chaos.
 
 **Confirm:**
 ```bash

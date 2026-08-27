@@ -1,17 +1,214 @@
+# CI: everything that must be true before a change can ship.
+#
+# Jobs are split by what their failure MEANS, not by convenience. A hermetic
+# unit-test failure is a code regression and blocks. A networked smoke-run
+# failure may be a provider outage and is reported separately, because a red
+# build that everyone learns to ignore is worse than no build.
+
 name: CI
 
 on:
   push:
-    branches: [main]
+    # `master` is this repository's default branch. The original workflow
+    # watched `main` and therefore never ran on a push -- a CI pipeline that
+    # silently never fires is worse than none, because it looks green.
+    branches: [master]
   pull_request:
+  workflow_dispatch:
+
+concurrency:
+  # Cancel superseded runs on the same ref. Without this a busy branch queues
+  # builds for commits nobody is waiting on any more.
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
 
 jobs:
-  test:
+  lint-and-types:
+    name: lint + types
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
-      - run: uv sync --extra dev
-      - run: uv run ruff check .
-      - run: uv run mypy src
-      - run: uv run pytest -q
+        with:
+          enable-cache: true
+      - run: uv sync --all-extras
+      - name: ruff
+        run: uv run ruff check .
+      - name: mypy
+        # Checked against linux, the deployment platform. Checking as win32
+        # hides POSIX-only paths behind sys.platform narrowing.
+        run: uv run mypy src
+
+  tests:
+    name: tests (hermetic)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --all-extras
+      - name: pytest
+        # No network. Every test here uses a double or a fake, so a failure is
+        # unambiguously a code regression.
+        run: uv run pytest -q --timeout=120
+
+  chaos-gate:
+    name: chaos integrity (SLO-2, no error budget)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --all-extras
+      - name: kernel determinism under chaos
+        # The guarantee everything else rests on: killing agents must not
+        # change the result. SLO-2 has no error budget, so this blocks release
+        # rather than opening a ticket.
+        run: uv run swarmd demo kernel --kill-rate 0.9 --tasks 40
+      - name: swarm run completes under chaos
+        env:
+          SWARMD_SIMULATED_PROVIDER: "true"
+        run: |
+          uv run swarmd swarm run \
+            "extract and verify the numeric claims in a short report" \
+            --profile smoke --chaos --kill-rate 0.3
+
+  guards:
+    name: deploy + frontend guards
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --all-extras
+      - name: manifest and frontend guards
+        # No simulated provider in a manifest, no keys committed, non-root
+        # everywhere, metadata endpoint blocked, every alert has a runbook
+        # entry, no sample data in the dashboard.
+        run: uv run pytest tests/test_deploy_guards.py -q
+      - name: kustomize builds
+        run: |
+          for overlay in dev prod; do
+            kubectl kustomize "deploy/k8s/overlays/$overlay" > /dev/null
+            echo "$overlay overlay builds"
+          done
+      - name: alert rules parse
+        run: |
+          docker run --rm -v "$PWD/observability:/o" \
+            prom/prometheus:v3.0.1 promtool check rules /o/alerts.yml
+
+  frontend:
+    name: frontend
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - name: typecheck
+        run: npx tsc --noEmit
+      - name: build
+        run: npm run build
+
+  images:
+    name: build + scan images
+    runs-on: ubuntu-latest
+    needs: [lint-and-types, tests]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+
+      - name: build backend
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile
+          push: false
+          load: true
+          tags: swarmd:ci
+          build-args: |
+            GIT_SHA=${{ github.sha }}
+            BUILD_TIME=${{ github.event.repository.updated_at }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: build frontend
+        uses: docker/build-push-action@v6
+        with:
+          context: frontend
+          push: false
+          load: true
+          tags: swarmd-frontend:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: scan backend
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: swarmd:ci
+          # Fail on HIGH and above. MEDIUM findings in a base image are
+          # constant background noise; failing on them trains people to add
+          # ignore entries, which is how a CRITICAL gets ignored too.
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          ignore-unfixed: true
+
+      - name: scan frontend
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: swarmd-frontend:ci
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          ignore-unfixed: true
+
+      - name: sbom
+        uses: anchore/sbom-action@v0
+        with:
+          image: swarmd:ci
+          format: spdx-json
+          artifact-name: swarmd-sbom.spdx.json
+
+  smoke-live:
+    name: live smoke (informational)
+    runs-on: ubuntu-latest
+    # Only on a push to master, and only when a key exists. A pull request from
+    # a fork cannot read secrets, and failing PRs for that would be noise.
+    if: github.event_name == 'push'
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --all-extras
+      - name: probe providers
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+        run: |
+          if [ -z "$GROQ_API_KEY" ] && [ -z "$GOOGLE_API_KEY" ]; then
+            echo "No provider keys configured; skipping the live smoke run."
+            echo "This job is informational: its failure means a provider"
+            echo "outage, not a code regression."
+            exit 0
+          fi
+          uv run swarmd providers probe
+      - name: live smoke run
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+        run: |
+          if [ -z "$GROQ_API_KEY" ] && [ -z "$GOOGLE_API_KEY" ]; then exit 0; fi
+          uv run swarmd swarm run \
+            "summarise the key claim and limitation of a short abstract" \
+            --profile smoke --ceiling 0.02
