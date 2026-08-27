@@ -111,7 +111,7 @@ redteam: contained=0 flagged=0 llm_calls=0
 
 ```bash
 SWARMD_SIMULATED_PROVIDER=true uv run swarmd serve --port 8000 &
-cd frontend && npm install && npm run dev     # http://localhost:3000
+cd frontend && npm install && npm run dev     # http://localhost:3001
 ```
 
 The dashboard renders the websocket stream or an empty state. There is no
@@ -197,6 +197,7 @@ saying so is better than pretending the architecture is cost-optimal.
 | [RUNBOOK](docs/RUNBOOK.md) | one entry per alert |
 | [DEPLOYMENT](docs/DEPLOYMENT.md) | AWS architecture, rejected alternatives, Azure mapping |
 | [SECURITY](SECURITY.md) | threat model, sandbox limits, data retention, known gaps |
+| [STATUS](docs/STATUS.md) | **what is done and what is not, per requirement** |
 | [PRR](docs/PRR.md) | production readiness review, honestly filled in |
 | [ADRs](docs/adr/) | the one-way doors, including two reversals |
 | [flow.md](docs/flow.md) | decision log with alternatives and follow-up questions |
@@ -204,8 +205,14 @@ saying so is better than pretending the architecture is cost-optimal.
 
 ## Status
 
-The loop runs end to end with no API key. 599 tests, ruff and mypy clean,
+The loop runs end to end with no API key. 708 tests, ruff and mypy clean,
 kernel chaos gate passing at kill-rate 0.9 with matching integrity hashes.
+
+One claim to qualify: the kernel's checkpoint recovery is real and proven at
+kill-rate 0.9, but the swarm flagship does not yet route its nodes through it
+— a killed node is redone by a fresh agent rather than resumed. Results are
+unchanged either way (the integrity hash matches), but the work is repeated.
+Tracked as G-3 in [docs/STATUS.md](docs/STATUS.md).
 
 Not yet done: a real learning curve. That needs volume — 50–200 tasks against
 live providers — and until those numbers exist with their control arm, this

@@ -21,11 +21,16 @@ or a policy check. No model calls. An organ that consumed the rationed resource
 it exists to protect would be self-defeating, and it would also mean the safety
 system degrades exactly when the system is busiest.
 
-**Containment reuses the chaos kill path.** It does not implement quarantine.
-That means containment inherits checkpoint recovery, requeue, and lifecycle
-events for free, and it is already exercised by every chaos test in the suite.
-A wrongly-contained agent's completed work survives, which is what makes a
-false positive survivable.
+**Containment reuses the chaos kill path.** It does not implement quarantine,
+so containment and chaos are one mechanism with one set of tests.
+
+  HONEST LIMIT, because an earlier version of this docstring overstated it:
+  in the KERNEL that kill path carries checkpoint recovery and requeue, proven
+  at kill-rate 0.9 with byte-identical output. The swarm flagship does not yet
+  run its nodes through the kernel Runtime, so a contained agent's node is
+  REDONE by a fresh agent rather than resumed from a checkpoint. The result is
+  still correct -- the integrity hash matches a clean run -- but the work is
+  repeated, not recovered. Tracked as G-3 in docs/STATUS.md.
 """
 
 from __future__ import annotations
@@ -338,10 +343,11 @@ class Containment:
 class RedTeam:
     """Watches the action log and contains agents that go rogue.
 
-    `kill` is injected rather than implemented. It is the chaos harness's kill
-    function, so containment inherits checkpoint recovery and requeue that are
-    already proven by every chaos test -- and a wrongly-contained agent keeps
-    its completed work, which is what makes a false positive survivable.
+    `kill` is injected rather than implemented: it is the chaos harness's kill
+    function, so containment and chaos share one mechanism and one set of tests.
+    In the kernel that path also carries checkpoint recovery; in the swarm
+    flagship it does not yet, so a contained agent's node is redone rather than
+    resumed (docs/STATUS.md G-3).
     """
 
     def __init__(
