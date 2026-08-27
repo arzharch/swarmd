@@ -9,12 +9,15 @@ import {
   PlanPanel,
   ReasoningPanel,
   RedTeamPanel,
+  SummaryPanel,
 } from "@/components/panels";
+import { Rail, TopBar, type ViewId } from "@/components/shell";
 import { useRunStream } from "@/lib/useRunStream";
 import type { CostView, RunSummary } from "@/lib/types";
 
 export default function Dashboard() {
   const stream = useRunStream();
+  const [view, setView] = useState<ViewId>("run");
   const [task, setTask] = useState(
     "extract every numeric claim from the supplied report and verify each one",
   );
@@ -26,10 +29,9 @@ export default function Dashboard() {
   const [error, setError] = useState<string | null>(null);
   const [summary, setSummary] = useState<RunSummary | null>(null);
 
-  // The final report (cost, economy, red-team totals) is written when the run
-  // finishes, so it is fetched then rather than streamed -- streaming a
-  // whole-run aggregate on every event would be a lot of traffic to show a
-  // number that only changes at the end.
+  // The whole-run report is written when the run finishes, so it is fetched
+  // then rather than streamed — pushing an aggregate on every event would be a
+  // lot of traffic to update a number that only changes at the end.
   useEffect(() => {
     if (!stream.activeRun) return;
     if (stream.runStatus === "running" || stream.runStatus === null) return;
@@ -52,8 +54,9 @@ export default function Dashboard() {
     [stream.agents, selected],
   );
 
-  // Taint comes from the ledger, not from a UI setting. If any row in the run
-  // was synthetic the banner shows, and there is no way to configure it away.
+  // Taint is read from the ledger, not from a UI setting. If any row in the
+  // run was synthetic the banner shows, and there is no way to configure it
+  // away (ADR-012).
   const simulated = cost?.simulated === true;
 
   const start = async () => {
@@ -62,6 +65,7 @@ export default function Dashboard() {
     setSummary(null);
     try {
       await stream.submit(task, profile, chaos, useSkills);
+      setView("run");
     } catch (exc) {
       setError(exc instanceof Error ? exc.message : String(exc));
     } finally {
@@ -69,101 +73,89 @@ export default function Dashboard() {
     }
   };
 
+  const counts: Record<string, number> = {
+    run: stream.agents.length,
+    decisions: (stream.criterion ? 1 : 0) + (stream.plan ? 1 : 0),
+    cost: stream.containments.length,
+  };
+
   return (
     <div className="shell">
-      {simulated && (
-        <div className="simulated-banner">
-          SIMULATED RUN — every response came from the synthetic provider.
-          These numbers are not evidence of anything and `swarmd eval` will
-          refuse to report from them.
-        </div>
-      )}
+      <Rail
+        view={view}
+        onView={setView}
+        counts={counts}
+        runId={stream.activeRun}
+        runStatus={stream.runStatus}
+      />
 
-      <header className="bar">
-        <span className="brand">swarmd</span>
-
-        <span className={`status-dot ${stream.connection}`}>
-          <i />
-          {stream.connection === "open"
-            ? "live"
-            : stream.connection === "connecting"
-              ? "connecting"
-              : "disconnected"}
-        </span>
-
-        <input
-          type="text"
-          value={task}
-          onChange={(e) => setTask(e.target.value)}
-          placeholder="describe a task nobody scoped for this system"
-          aria-label="task"
+      <div className="workspace">
+        <TopBar
+          task={task}
+          onTask={setTask}
+          profile={profile}
+          onProfile={setProfile}
+          chaos={chaos}
+          onChaos={setChaos}
+          useSkills={useSkills}
+          onUseSkills={setUseSkills}
+          onRun={start}
+          submitting={submitting}
+          connection={stream.connection}
+          error={error}
         />
 
-        <select
-          value={profile}
-          onChange={(e) => setProfile(e.target.value)}
-          aria-label="profile"
-        >
-          <option value="smoke">smoke · ~2 min</option>
-          <option value="standard">standard · 12–18 min</option>
-          <option value="deep">deep · ~40 min</option>
-        </select>
+        <div>
+          {simulated && (
+            <div className="banner warn" role="status">
+              <strong>Simulated run.</strong> Every response came from the
+              synthetic provider. These numbers are not evidence of anything,
+              and <code>swarmd eval</code> will refuse to report from them.
+            </div>
+          )}
+          {!useSkills && (
+            <div className="banner info" role="status">
+              <strong>Control arm.</strong> Skill retrieval is disabled and
+              everything else is identical. This is the ablation an improvement
+              claim is measured against.
+            </div>
+          )}
+        </div>
 
-        <label className="toggle">
-          <input
-            type="checkbox"
-            checked={chaos}
-            onChange={(e) => setChaos(e.target.checked)}
-          />
-          chaos
-        </label>
-
-        <label className="toggle" title="Unchecking runs the control arm: skills disabled, everything else identical.">
-          <input
-            type="checkbox"
-            checked={useSkills}
-            onChange={(e) => setUseSkills(e.target.checked)}
-          />
-          skills
-        </label>
-
-        <button onClick={start} disabled={submitting || !task.trim()}>
-          {submitting ? "starting…" : "run"}
-        </button>
-
-        {stream.activeRun && (
-          <span style={{ color: "var(--muted)" }}>
-            {stream.activeRun} · {stream.runStatus}
-          </span>
+        {view === "run" && (
+          <div className="board cols-3">
+            <AgentGrid
+              agents={stream.agents}
+              selected={selected}
+              onSelect={setSelected}
+            />
+            <ReasoningPanel agent={selectedAgent} />
+            <EventLog events={stream.events} />
+          </div>
         )}
-        {error && <span style={{ color: "var(--bad)" }}>{error}</span>}
-      </header>
 
-      {!useSkills && (
-        <div className="simulated-banner" style={{ background: "#1b2635", borderColor: "var(--accent)", color: "var(--accent)" }}>
-          CONTROL ARM — skill retrieval disabled. This is the ablation an
-          improvement claim is measured against.
-        </div>
-      )}
+        {view === "decisions" && (
+          <div className="board cols-2">
+            <CriterionPanel criterion={stream.criterion} />
+            <PlanPanel plan={stream.plan} agents={stream.agents} />
+          </div>
+        )}
 
-      <div className="grid">
-        <CriterionPanel criterion={stream.criterion} />
-        <PlanPanel plan={stream.plan} agents={stream.agents} />
-        <EventLog events={stream.events} />
-
-        <AgentGrid
-          agents={stream.agents}
-          selected={selected}
-          onSelect={setSelected}
-        />
-        <ReasoningPanel agent={selectedAgent} />
-        <div style={{ display: "grid", gridTemplateRows: "1fr 1fr", gap: 10, minHeight: 0 }}>
-          <CostPanel cost={cost} />
-          <RedTeamPanel
-            containments={stream.containments}
-            chaos={stream.chaosEvents}
-          />
-        </div>
+        {view === "cost" && (
+          <div className="board cols-3">
+            <CostPanel cost={cost} />
+            <SummaryPanel
+              economy={summary?.report?.economy}
+              redteam={summary?.report?.redteam}
+              skills={summary?.report?.skills}
+              ablation={summary?.report?.ablation}
+            />
+            <RedTeamPanel
+              containments={stream.containments}
+              chaos={stream.chaosEvents}
+            />
+          </div>
+        )}
       </div>
     </div>
   );
