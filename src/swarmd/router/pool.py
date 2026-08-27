@@ -122,7 +122,7 @@ REGISTRY: dict[str, ProviderSpec] = {
     ),
 }
 
-TIER_RANK = {"free": 0, "free_data_training": 1, "paid": 2}
+TIER_RANK = {"simulated": 0, "free": 1, "free_data_training": 2, "paid": 3}
 
 
 def credentials_for(spec: ProviderSpec) -> list[tuple[str, str]]:
@@ -373,6 +373,10 @@ class _Slot:
     state: LimitState = field(default_factory=LimitState)
 
     @property
+    def simulated(self) -> bool:
+        return self.spec.tier == "simulated"
+
+    @property
     def quota_key(self) -> str:
         """Quota is per CREDENTIAL, not per provider.
 
@@ -466,6 +470,32 @@ class ProviderPool(Provider):
         capacity is assembled from whatever is available. Zero usable providers
         IS an error, raised here rather than discovered on the first call.
         """
+        from swarmd.router.simulated import SimulatedProvider, simulation_enabled
+
+        if simulation_enabled():
+            # Exclusive, not additive. A pool mixing real and simulated
+            # providers produces a run whose numbers mean nothing in
+            # particular -- part measured, part invented, with no way to say
+            # which half a given figure came from. Better to be entirely one
+            # thing and have the ledger say which.
+            spec = ProviderSpec(
+                name="simulated",
+                base_url="",
+                api_key_env="",
+                models=("simulated-v1",),
+                tier="simulated",
+                hint_rpm=100_000,
+                hint_tpm=100_000_000,
+            )
+            sim = SimulatedProvider()
+            return cls(
+                [_Slot(sim, spec, credential_id="simulated#0")],  # type: ignore[arg-type]
+                account=account,
+                allow_paid=allow_paid,
+                max_wait_s=max_wait_s,
+                quota=quota,
+            )
+
         slots: list[_Slot] = []
         skipped: list[str] = []
         for name, spec in REGISTRY.items():
@@ -575,6 +605,7 @@ class ProviderPool(Provider):
                             tokens_out=resp.tokens_out,
                             agent_id=agent_id,
                             stage=stage,
+                            simulated=slot.simulated,
                             detail={
                                 "latency_s": round(resp.latency_s, 4),
                                 "credential": slot.credential_id,
@@ -614,6 +645,7 @@ class ProviderPool(Provider):
                 "provider": s.spec.name,
                 "credential": s.credential_id,
                 "tier": s.spec.tier,
+                "simulated": s.simulated,
                 "models": list(s.spec.models),
                 "available": s.state.available(),
                 "wait_s": round(s.state.wait_s(), 2),

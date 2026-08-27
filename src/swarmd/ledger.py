@@ -52,7 +52,11 @@ class ModelPrice:
 FREE = ModelPrice(0.0, 0.0)
 
 # Providers whose entire offering used here is free-tier.
-FREE_PROVIDERS = frozenset({"groq", "cerebras", "google-aistudio", "mistral-free"})
+# "simulated" is priced free because it never touches a network. Its rows
+# carry simulated=True, which is what stops them being read as a real $0 run.
+FREE_PROVIDERS = frozenset(
+    {"groq", "cerebras", "google-aistudio", "mistral-free", "simulated"}
+)
 
 PRICES: dict[str, ModelPrice] = {
     # Paid overflow tier (PRD section 11). Cheapest capable model with a large
@@ -108,6 +112,11 @@ class LedgerRow:
     tokens_out: int = 0
     cost_usd: float = 0.0
     would_have_cost: float = 0.0  # cache hits: what this call would have cost
+    # Taint flag. True when the response came from the simulated provider
+    # rather than a real one. Carried on the ROW rather than inferred from
+    # configuration, so a report built from these rows cannot present
+    # synthetic results as real ones no matter who builds it (ADR-012).
+    simulated: bool = False
     detail: dict[str, Any] = field(default_factory=dict)
 
 
@@ -205,6 +214,32 @@ class JsonlLedger:
 # --- accounting ------------------------------------------------------------
 
 
+class SimulatedDataRefused(RuntimeError):
+    """Raised when simulated rows reach something that must not accept them.
+
+    Guards the boundary between "developing without keys" and "reporting a
+    result". Eval reports, benchmarks, and improvement claims call
+    `refuse_simulated` before doing anything with a ledger.
+    """
+
+
+def refuse_simulated(report: dict[str, Any], *, context: str) -> None:
+    """Abort if a report carries simulated rows.
+
+    Called by anything that publishes a number. The check is on the DATA rather
+    than on configuration, so it holds even when a run was misconfigured, when
+    an env var was set three shells ago, or when someone reuses a ledger file
+    from a development session by mistake.
+    """
+    if report.get("simulated"):
+        raise SimulatedDataRefused(
+            f"{context} refused: {report.get('simulated_rows', '?')} of "
+            f"{report.get('rows', '?')} ledger rows came from the simulated "
+            f"provider. Simulated runs exist to develop against, not to report "
+            f"from. Configure a real provider key and re-run."
+        )
+
+
 class CeilingExceeded(RuntimeError):
     """Run cost hit its hard ceiling.
 
@@ -300,9 +335,10 @@ class CostAccount:
         tokens_out: int,
         agent_id: str = "",
         stage: str = "",
+        simulated: bool = False,
         detail: dict[str, Any] | None = None,
     ) -> float:
-        """Record a real model call and enforce the ceiling."""
+        """Record a model call and enforce the ceiling."""
         price = price_for(provider, model)
         cost = price.cost(tokens_in, tokens_out)
         self.ledger.append(
@@ -315,6 +351,7 @@ class CostAccount:
                 tokens_in=tokens_in,
                 tokens_out=tokens_out,
                 cost_usd=cost,
+                simulated=simulated,
                 detail=detail or {},
             )
         )
@@ -381,8 +418,15 @@ class CostAccount:
                 cache_hits += 1
 
         attempts = calls + cache_hits
+        simulated_rows = sum(1 for r in rows if r.simulated)
         return {
             "run_id": self.run_id,
+            # Taint propagates from rows to report. A report is simulated if
+            # ANY row in it is, because a run that mixed real and synthetic
+            # calls is not a real run -- it is a run whose numbers mean nothing
+            # in particular, and saying so is the only honest option.
+            "simulated": simulated_rows > 0,
+            "simulated_rows": simulated_rows,
             "ceiling_usd": self.ceiling_usd,
             "total_usd": round(sum(r.cost_usd for r in rows), 8),
             "remaining_usd": round(self.remaining(), 8),
