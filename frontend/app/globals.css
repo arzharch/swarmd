@@ -1,0 +1,177 @@
+/* Dark by default: this is an operations console that people watch for
+   fifteen minutes at a stretch, and a bright panel of live-updating text is
+   tiring in a way a settings page is not. */
+
+:root {
+  --bg: #0b0e14;
+  --panel: #12161f;
+  --panel-2: #171c27;
+  --border: #232a38;
+  --text: #d7dce5;
+  --muted: #7d8799;
+  --accent: #5aa9ff;
+  --ok: #4ec9a0;
+  --warn: #e2b341;
+  --bad: #e2686a;
+  --contained: #c678dd;
+  --mono: ui-monospace, "SF Mono", "Cascadia Code", Menlo, Consolas, monospace;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+a { color: var(--accent); }
+
+.shell {
+  display: grid;
+  grid-template-rows: auto auto 1fr;
+  height: 100vh;
+  gap: 10px;
+  padding: 10px;
+}
+
+/* Persistent, unmissable, and sourced from ledger data rather than a UI flag.
+   If any row in the run came from the simulated provider, this shows. */
+.simulated-banner {
+  background: repeating-linear-gradient(
+    45deg, #4a3a10, #4a3a10 10px, #3e3110 10px, #3e3110 20px
+  );
+  border: 1px solid var(--warn);
+  color: #ffdf95;
+  padding: 6px 12px;
+  border-radius: 4px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+}
+
+header.bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px 12px;
+}
+
+.brand { font-weight: 700; letter-spacing: 0.12em; color: var(--accent); }
+
+.status-dot {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+}
+.status-dot i {
+  width: 8px; height: 8px; border-radius: 50%; display: inline-block;
+  background: var(--muted);
+}
+.status-dot.open i { background: var(--ok); }
+.status-dot.connecting i { background: var(--warn); }
+.status-dot.closed i { background: var(--bad); }
+
+input, select, button {
+  font-family: inherit;
+  font-size: inherit;
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 6px 10px;
+}
+input[type="text"] { min-width: 340px; flex: 1; }
+button { cursor: pointer; }
+button:hover:not(:disabled) { border-color: var(--accent); }
+button:disabled { opacity: 0.45; cursor: not-allowed; }
+label.toggle { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); }
+
+.grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1.2fr;
+  grid-auto-rows: minmax(0, 1fr);
+  gap: 10px;
+  min-height: 0;
+}
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+}
+.panel > h2 {
+  margin: 0;
+  padding: 8px 12px;
+  font-size: 11px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--muted);
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  justify-content: space-between;
+}
+.panel > .body { overflow: auto; padding: 10px 12px; min-height: 0; }
+
+.empty { color: var(--muted); font-style: italic; padding: 12px 0; }
+
+table { width: 100%; border-collapse: collapse; }
+th, td { text-align: left; padding: 3px 6px; white-space: nowrap; }
+th { color: var(--muted); font-weight: 500; font-size: 11px; }
+tbody tr:hover { background: var(--panel-2); cursor: pointer; }
+tbody tr.selected { background: #1d2432; }
+
+.tag { padding: 1px 6px; border-radius: 3px; font-size: 11px; }
+.tag.passed { background: #14352b; color: var(--ok); }
+.tag.failed { background: #3a1f20; color: var(--bad); }
+.tag.killed { background: #3a3320; color: var(--warn); }
+.tag.contained { background: #2f2038; color: var(--contained); }
+.tag.running, .tag.spawned { background: #1b2635; color: var(--accent); }
+
+.log { font-size: 12px; }
+.log div { padding: 1px 0; border-bottom: 1px solid rgba(255,255,255,0.03); }
+.log .seq { color: #46506380; margin-right: 8px; }
+.log .kind { color: var(--accent); margin-right: 8px; }
+.log .thought .kind { color: var(--muted); }
+
+.meter { height: 8px; background: var(--panel-2); border-radius: 4px; overflow: hidden; }
+.meter > span { display: block; height: 100%; background: var(--ok); }
+.meter.warn > span { background: var(--warn); }
+.meter.bad > span { background: var(--bad); }
+
+dl.kv { display: grid; grid-template-columns: auto 1fr; gap: 2px 12px; margin: 0; }
+dl.kv dt { color: var(--muted); }
+dl.kv dd { margin: 0; text-align: right; }
+
+.dag { display: flex; flex-direction: column; gap: 8px; }
+.dag .level { display: flex; gap: 8px; flex-wrap: wrap; }
+.dag .node {
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 4px 8px;
+  background: var(--panel-2);
+  font-size: 12px;
+}
+.dag .node.passed { border-color: var(--ok); }
+.dag .node.failed { border-color: var(--bad); }
+.dag .node.running { border-color: var(--accent); }
+.dag .arrow { color: var(--muted); text-align: center; }
+
+.check { font-size: 12px; padding: 2px 0; }
+.check code { color: var(--accent); }
+
+.thought-line { display: grid; grid-template-columns: 130px 1fr; gap: 8px; padding: 2px 0; }
+.thought-line .decision { color: var(--accent); }
+.thought-line .reasoning { color: var(--muted); }

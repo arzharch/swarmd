@@ -24,3 +24,9 @@ venv/
 .DS_Store
 Thumbs.db
 traces*.jsonl
+
+# Frontend build artifacts and dependencies
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/next-env.d.ts
