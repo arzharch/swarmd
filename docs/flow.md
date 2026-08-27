@@ -659,6 +659,92 @@ wired through the LLM harness call path, WebSocket sink, and the frontend.
 
 ---
 
+## 2026-08-28 - Simulated provider, fenced by data taint
+
+Development needs a provider before any credential exists. Rather than relaxing
+ADR-006, the fence moved from configuration to data. 250 tests green.
+
+DECISION: simulated responses allowed outside tests/, fenced by ledger taint (ADR-012)
+ALTERNATIVES: block development until keys exist - allow the mock behind a config
+  flag - keep the mock in tests/ and stub each caller by hand
+WHY THIS: ADR-006's real concern was never "synthetic data exists", it was
+  "synthetic data is indistinguishable downstream". It enforced that by keeping
+  the mock out of certain code paths, which is a property of code organisation
+  and therefore one refactor away from being false. Marking the DATA survives
+  refactors, stale environment variables, copied .env files, and a ledger file
+  reused from a development session by mistake.
+TRADE-OFF ACCEPTED: every report now carries a `simulated` field that consumers
+  must handle. That is the mechanism, not an inconvenience.
+FOLLOW-UPS:
+  Q: Isn't this just re-permitting what ADR-006 banned?
+  A: The ban on REPORTING from synthetic data is not relaxed at all - it moved
+     from convention to a raise. refuse_simulated() aborts eval, benchmarks, and
+     any improvement claim. What is newly permitted is developing against it.
+  Q: Why is a config flag not enough?
+  A: Flags get set three shells ago and forgotten, and .env files get copied
+     between machines. A flag fences the run; taint fences the artefact, which
+     is what someone eventually reads.
+  Q: What stops someone deleting the taint flag to make a report look real?
+  A: Nothing structural - anyone with commit access can remove a control. The
+     distinction that matters is accident versus decision: presenting synthetic
+     data as real now requires a deliberate, visible code change rather than a
+     forgotten environment variable.
+  Q: Does the taint survive a restart?
+  A: Yes, it is a column in the append-only JSONL ledger. That is precisely why
+     it lives on the row rather than in a run-level config object.
+
+DECISION: simulated mode is exclusive - it replaces the pool, never joins it
+ALTERNATIVES: simulated as a last-resort fallback after real providers
+WHY THIS: a pool mixing real and synthetic providers produces a run that is part
+  measured and part invented, with no way to say which half a given figure came
+  from. Being entirely one thing, with the ledger stating which, is the only
+  readable outcome.
+TRADE-OFF ACCEPTED: cannot develop against a partially-keyed pool. Given the
+  alternative is ambiguous numbers, that is a feature.
+
+DECISION: simulated provider has non-zero latency and an available failure rate
+ALTERNATIVES: instant, always-successful responses
+WHY THIS: a fake that answers instantly hides every concurrency and backpressure
+  bug the scheduler exists to handle, and one that never fails leaves fallback
+  chains, repair loops, and dead-lettering completely unexercised. That is how a
+  system passes every local test and falls over on first contact with a real API.
+TRADE-OFF ACCEPTED: 50ms per call. A 600-call demo profile still finishes in
+  under a minute.
+
+BUG FOUND: .gitignore's `.env.*` rule was swallowing .env.example - the single
+env file intended to be committed was the one silently never committed. Fixed
+with a negation, and it had been true since the repo was created.
+
+ANATOMY: SWARMD_SIMULATED_PROVIDER
+  Read from the environment rather than taken as a constructor argument, so
+  enabling it is visible in `env`, in a pod spec, and in a diff, instead of
+  buried in a call site. Never a fallback for a missing key: a run with no
+  providers fails loudly. A CI test fails the build if it appears truthy in any
+  deploy manifest.
+
+### Gate evidence
+
+```
+pytest: 250 passed  (+43: simulated 28, deploy guards 15)
+ruff check .   All checks passed
+mypy src       Success: no issues found in 27 source files
+SWARMD_SIMULATED_PROVIDER=true swarmd providers probe
+  SIMULATED PROVIDER ACTIVE -- all responses are synthetic. Ledger rows will be
+  marked simulated=true and eval will refuse to run against them.
+  simulated  simulated  OK  0.062s  simulated-v1
+  1/1 providers live
+swarmd providers probe (flag off, no keys)
+  pool unavailable: no usable providers. Skipped: groq (no GROQ_API_KEY), ...
+```
+
+Deploy guards now assert, as tests rather than comments: no manifest enables
+simulation, no manifest carries a provider key, prod pins digests and replaces
+the placeholder Secret, dev never enables paid providers, every workload runs
+non-root with dropped capabilities and a read-only rootfs and resource requests,
+egress blocks the cloud metadata endpoint, and every alert has a runbook section.
+
+---
+
 ## Next up
 
 - [x] Kernel (Phases 1.1-1.8) - gate PASSED (hash equality at kill-rate 0.9)
@@ -670,6 +756,7 @@ wired through the LLM harness call path, WebSocket sink, and the frontend.
 - [x] Phase 5.6 - Prometheus metrics on a private registry
 - [x] Platform - Grafana dashboards, alert rules, K8s manifests, dev/prod overlays
 - [x] Docs - capacity plan, SLOs, runbook, deployment plan, ADR-011
+- [x] Simulated provider (ADR-012) + .env.example + deploy guard tests
 - [ ] Phase 5.1 - Postgres-durable approvals across processes (Phase 3's gate
       still does not actually pass)
 - [ ] Phase 5.3b - ceiling wired through the LLM harness call path

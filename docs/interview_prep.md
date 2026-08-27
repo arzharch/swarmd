@@ -494,6 +494,38 @@ precisely the failure ADR-009 exists to prevent. Capability belongs in
 chaos IS an SLO, at 100% with no error budget, because a budget there would
 imply an acceptable rate of silently losing work.
 
+**Q: You banned mock data, then shipped a fake provider. Explain.**
+A: ADR-006's concern was never that synthetic data exists - it was that
+synthetic data is indistinguishable downstream. It enforced that by keeping the
+mock out of certain code paths, which is a property of code organisation and one
+refactor away from being false. ADR-012 moves the fence onto the data: every
+ledger row the simulated provider writes carries simulated=true, any report
+aggregating one is itself tainted, and refuse_simulated() raises before anything
+publishes a number. The ban on reporting from synthetic data did not weaken - it
+went from convention to a raise. What changed is that I can build Phases 6 to 10
+before a credential exists.
+
+**Q: Why is taint on the row rather than a run-level config flag?**
+A: Because it has to survive a process restart and a copied file. A run-level
+flag lives in memory; a ledger read back next week by a different tool would
+have no idea. As a column in append-only JSONL, the artefact carries its own
+provenance wherever it goes.
+
+**Q: What if someone just removes the flag?**
+A: Then they have made a deliberate, visible code change that fails the tests
+asserting the taint propagates. I would not claim it is tamper-proof - anyone
+with commit access can delete any control. The property I am claiming is that
+presenting synthetic data as real requires a decision rather than an accident,
+and forgotten environment variables are the accident I was actually worried
+about.
+
+**Q: Your fake provider is slow and sometimes fails on purpose. Why?**
+A: A fake that answers instantly hides every concurrency and backpressure bug
+the scheduler exists to handle, and one that never fails leaves the fallback
+chain, the repair loop, and dead-lettering completely unexercised. That is
+exactly how a system passes all its local tests and falls over the first time it
+meets a real API. 50ms and a seeded, deterministic failure rate.
+
 ## Section 10: Unknown-task runs (populate as Phases 6-7 land)
 
 **Q: What broke first at 500 agents?**
