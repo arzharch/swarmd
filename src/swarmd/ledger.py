@@ -383,8 +383,21 @@ class CostAccount:
         the original call did; a hit that recorded simulated=False would
         launder synthetic output into a report that claims to be real, which is
         precisely what ADR-012 exists to prevent.
+
+        UNPRICED MODELS ARE TOLERATED HERE, and only here. `charge_call` raises
+        on an unknown model because the money is real and a silent zero is how
+        a paid model gets billed as free. A cache hit costs nothing by
+        construction and cannot move the ceiling, so refusing one protects
+        nothing while breaking a run over a bookkeeping gap -- which is exactly
+        what happened: an unpriced model turned a cache hit into an exception,
+        the batch caught it as a provider failure, and batching silently
+        disabled itself. The saving is reported as zero, which is the honest
+        answer when the price is unknown.
         """
-        price = price_for(provider, model)
+        try:
+            price = price_for(provider, model)
+        except UnpricedModel:
+            price = ModelPrice(0.0, 0.0)
         self.ledger.append(
             self._row(
                 "cache_hit",

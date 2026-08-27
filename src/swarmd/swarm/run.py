@@ -263,7 +263,9 @@ class SwarmRun:
 
     # -- proposal callbacks -------------------------------------------------
 
-    async def _ask(self, prompt: str, system: str, stage: str) -> str:
+    async def _ask(
+        self, prompt: str, system: str, stage: str, *, cacheable: bool = True
+    ) -> str:
         from swarmd.router.providers import LLMRequest
 
         try:
@@ -273,7 +275,11 @@ class SwarmRun:
                     system=system,
                     temperature=0.4,
                     max_tokens=700,
-                    metadata={"stage": stage, "agent_id": f"{stage}-agent"},
+                    metadata={
+                        "stage": stage,
+                        "agent_id": f"{stage}-agent",
+                        **({} if cacheable else {"cache": "bypass"}),
+                    },
                 )
             )
             return str(response.text)
@@ -297,17 +303,31 @@ class SwarmRun:
             f"{PROPOSAL_SCHEMA_HINT}"
         )
         self._emit("criterion_proposal", attempt=attempt, proposer=index)
-        return await self._ask(prompt, PROPOSER_SYSTEM, "criterion")
+        # Not cacheable: see CachedProvider. Prompts already differ by angle,
+        # so this is belt and braces -- but a future edit that unified the
+        # angles would otherwise silently turn three opinions into one.
+        return await self._ask(prompt, PROPOSER_SYSTEM, "criterion", cacheable=False)
 
     async def _propose_plan(self, task: str, attempt: int, index: int) -> str:
+        # Each proposer decomposes under a different pressure. The earlier
+        # version sent one identical prompt to all three and relied on sampling
+        # for variety, which made the "competing plans" a single plan drawn
+        # three times -- and once a cache sat in front of the provider, drawn
+        # once and copied twice.
+        angles = [
+            "Prefer the fewest steps that still make each one checkable.",
+            "Prefer steps that can run in parallel over a long chain.",
+            "Prefer isolating the most failure-prone step so it retries alone.",
+        ]
         prompt = (
             f"TASK: {task}\n\n"
             f"Decompose into a small dependency graph of steps.\n"
+            f"PRIORITY: {angles[index % len(angles)]}\n"
             f"Respond with ONLY a JSON object matching this schema:\n"
             f"{PLAN_SCHEMA_HINT}"
         )
         self._emit("plan_proposal", attempt=attempt, proposer=index)
-        return await self._ask(prompt, PLANNER_SYSTEM, "plan")
+        return await self._ask(prompt, PLANNER_SYSTEM, "plan", cacheable=False)
 
     # -- the run ------------------------------------------------------------
 

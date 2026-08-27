@@ -141,7 +141,7 @@ def create_app(
     # differs and each repair prompt carries its own candidate's failures. The
     # repetition worth paying for is ACROSS runs -- a session working through a
     # curriculum, or two operators asking similar things.
-    app.state.cache = SemanticCache(ttl_s=3600.0, capacity=2048)
+    app.state.cache = SemanticCache(ttl_s=3600.0, capacity=2048, exact_only=True)
     app.state.jobs = JobRegistry(hub=app.state.hub)
     app.state.config = control.HarnessConfig()
     control.register(app, registry=app.state.jobs, config=app.state.config)

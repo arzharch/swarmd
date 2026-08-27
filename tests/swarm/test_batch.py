@@ -24,7 +24,6 @@ from swarmd.swarm.batch import (
 from swarmd.swarm.run import SwarmRun
 from tests.swarm.test_run import ScriptedProvider
 
-
 # --- parsing ----------------------------------------------------------------
 
 
@@ -137,6 +136,48 @@ async def test_a_batch_of_one_skips_the_batch_instruction():
 
     await _batch(Recorder(), 1)
     assert SEPARATOR not in Recorder.prompt
+
+
+async def test_a_ceiling_breach_is_not_swallowed_as_a_provider_failure():
+    """The ceiling firing must stop the run, not downgrade the optimisation.
+
+    Catching it here would let the pool fall back to individual generation and
+    spend MORE, one call at a time, past the limit that just fired.
+    """
+    from swarmd.ledger import CeilingExceeded
+
+    class OverBudget:
+        async def complete(self, request):
+            raise CeilingExceeded("over", {})
+
+    with pytest.raises(CeilingExceeded):
+        await _batch(OverBudget(), 4)
+
+
+async def test_an_unpriced_cache_hit_does_not_disable_batching():
+    """The chain this covers, found in a live run.
+
+    An unpriced model turned a cache hit into an exception; the batch caught it
+    as a provider failure and silently fell back to individual generation. A
+    $0 row cannot move the ceiling, so refusing it protected nothing.
+    """
+    from swarmd.ledger import CostAccount, InMemoryLedger
+    from swarmd.router.cache import SemanticCache
+    from swarmd.router.cached import CachedProvider
+
+    provider = CountingProvider()          # provider "scripted": unpriced
+    account = CostAccount(InMemoryLedger("r"), "r", ceiling_usd=1.0)
+    cached = CachedProvider(
+        provider, SemanticCache(exact_only=True), account=account
+    )
+
+    first = await _batch(cached, 4)
+    second = await _batch(cached, 4)
+
+    assert first.variants == second.variants
+    assert provider.calls == 1, "the second batch did not use the cache"
+    rows = [r for r in account.ledger.rows() if r.kind == "cache_hit"]
+    assert rows and rows[0].would_have_cost == 0.0
 
 
 async def test_a_provider_failure_returns_an_empty_batch_rather_than_raising():

@@ -146,8 +146,16 @@ async def generate_batch(
         max_tokens=min(max_tokens * k, 8192),
         metadata={"stage": stage, "batch": str(k)},
     )
+    from swarmd.ledger import CeilingExceeded
+
     try:
         response = await provider.complete(request)
+    except CeilingExceeded:
+        # NOT survivable, and not this function's decision to survive. The
+        # ceiling exists to stop a run that is spending too much; catching it
+        # here would let the pool fall back to individual generation and spend
+        # MORE, one call at a time, past the limit that just fired.
+        raise
     except Exception as exc:  # noqa: BLE001 - a provider failure is data
         # The pool falls back to generating individually. Losing the saving is
         # survivable; losing the node is not.

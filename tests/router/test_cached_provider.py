@@ -47,6 +47,16 @@ def _request(prompt="hello", *, temperature=0.7, max_tokens=256, system="s"):
     )
 
 
+def _cache(**kw):
+    """Exact matching, which `CachedProvider` requires.
+
+    Similarity matching on templated prompts served one plan node's answer to
+    another at a measured cosine of 0.97; the module docstring on
+    `router/cache.py` has the numbers.
+    """
+    return SemanticCache(exact_only=True, **kw)
+
+
 def _account():
     return CostAccount(InMemoryLedger("run-1"), "run-1", ceiling_usd=1.0)
 
@@ -56,7 +66,7 @@ def _account():
 
 async def test_a_repeated_request_does_not_reach_the_provider():
     provider = Counter()
-    cached = CachedProvider(provider, SemanticCache())
+    cached = CachedProvider(provider, _cache())
 
     first = await cached.complete(_request())
     second = await cached.complete(_request())
@@ -67,7 +77,7 @@ async def test_a_repeated_request_does_not_reach_the_provider():
 
 async def test_a_different_prompt_is_a_miss():
     provider = Counter()
-    cached = CachedProvider(provider, SemanticCache())
+    cached = CachedProvider(provider, _cache())
 
     await cached.complete(_request("summarise the quarterly revenue figures"))
     await cached.complete(_request("write a haiku about the sea in winter"))
@@ -86,7 +96,7 @@ async def test_temperature_is_part_of_the_key():
     unanimous agreement.
     """
     provider = Counter()
-    cached = CachedProvider(provider, SemanticCache())
+    cached = CachedProvider(provider, _cache())
 
     await cached.complete(_request(temperature=0.2))
     await cached.complete(_request(temperature=0.9))
@@ -96,7 +106,7 @@ async def test_temperature_is_part_of_the_key():
 
 async def test_the_system_prompt_is_part_of_the_key():
     provider = Counter()
-    cached = CachedProvider(provider, SemanticCache())
+    cached = CachedProvider(provider, _cache())
 
     await cached.complete(_request(system="you are a planner"))
     await cached.complete(_request(system="you are a critic"))
@@ -106,7 +116,7 @@ async def test_the_system_prompt_is_part_of_the_key():
 
 async def test_max_tokens_is_part_of_the_key():
     provider = Counter()
-    cached = CachedProvider(provider, SemanticCache())
+    cached = CachedProvider(provider, _cache())
 
     await cached.complete(_request(max_tokens=256))
     await cached.complete(_request(max_tokens=2048))
@@ -127,7 +137,7 @@ async def test_a_hit_writes_a_ledger_row_rather_than_incrementing_a_counter():
     """Priced provider, so the avoided dollars are visible in the row."""
     provider = Counter(provider="openrouter", model="z-ai/glm-5.3-flash")
     account = _account()
-    cached = CachedProvider(provider, SemanticCache(), account=account)
+    cached = CachedProvider(provider, _cache(), account=account)
 
     await cached.complete(_request())
     await cached.complete(_request())
@@ -149,7 +159,7 @@ async def test_a_free_tier_hit_saves_no_dollars_and_is_still_recorded():
     """
     provider = Counter()   # groq: free, priced at zero
     account = _account()
-    cached = CachedProvider(provider, SemanticCache(), account=account)
+    cached = CachedProvider(provider, _cache(), account=account)
 
     await cached.complete(_request())
     await cached.complete(_request())
@@ -163,7 +173,7 @@ async def test_a_free_tier_hit_saves_no_dollars_and_is_still_recorded():
 async def test_a_hit_costs_nothing_against_the_ceiling():
     provider = Counter()
     account = _account()
-    cached = CachedProvider(provider, SemanticCache(), account=account)
+    cached = CachedProvider(provider, _cache(), account=account)
 
     await cached.complete(_request())
     before = account.total_cost()
@@ -176,7 +186,7 @@ async def test_a_hit_on_a_simulated_entry_stays_marked_simulated():
     """Otherwise a cached synthetic answer launders itself into a real report."""
     provider = Counter(provider="simulated", model="sim-1")
     account = _account()
-    cached = CachedProvider(provider, SemanticCache(), account=account)
+    cached = CachedProvider(provider, _cache(), account=account)
 
     await cached.complete(_request())
     await cached.complete(_request())
@@ -193,7 +203,7 @@ async def test_the_account_reaches_the_wrapped_provider():
         account = None
 
     provider = HasAccount()
-    cached = CachedProvider(provider, SemanticCache())
+    cached = CachedProvider(provider, _cache())
     account = _account()
     cached.account = account
 
@@ -202,37 +212,145 @@ async def test_the_account_reaches_the_wrapped_provider():
 
 
 async def test_undefined_attributes_delegate_to_the_provider():
-    cached = CachedProvider(Counter(), SemanticCache())
+    cached = CachedProvider(Counter(), _cache())
     assert cached.name == "counting"
+
+
+# --- independence must survive the cache ------------------------------------
+
+
+async def test_a_bypass_request_is_never_served_from_the_cache():
+    """Calls whose whole point is independence opt out."""
+    provider = Counter()
+    cached = CachedProvider(provider, _cache())
+
+    request = _request()
+    request.metadata["cache"] = "bypass"
+    await cached.complete(request)
+    await cached.complete(request)
+
+    assert provider.calls == 2
+    assert cached.bypassed == 2
+
+
+async def test_plan_proposers_stay_independent_with_a_cache_attached():
+    """The live bug this covers.
+
+    The plan proposers sent an identical prompt and differed only by sampling.
+    Putting a cache in front of the provider served proposer 1's answer to
+    proposers 2 and 3, so three competing DAGs became one DAG judged against
+    itself -- and the selection reported a clean winner.
+    """
+    from swarmd.swarm.run import SwarmRun as _Run
+
+    run = _Run(ScriptedProvider(), profile="smoke", cache=_cache())
+    seen = []
+
+    async def record(prompt, system, stage, *, cacheable=True):
+        seen.append((stage, cacheable, prompt))
+        return ""
+
+    run._ask = record
+    await run._propose_plan("t", 1, 0)
+    await run._propose_plan("t", 1, 1)
+
+    assert all(not cacheable for _, cacheable, _ in seen)
+    assert seen[0][2] != seen[1][2], "two proposers sent an identical prompt"
+
+
+async def test_criterion_proposers_stay_independent_too():
+    run = SwarmRun(ScriptedProvider(), profile="smoke", cache=_cache())
+    seen = []
+
+    async def record(prompt, system, stage, *, cacheable=True):
+        seen.append((cacheable, prompt))
+        return ""
+
+    run._ask = record
+    await run._propose_criterion("t", 1, 0)
+    await run._propose_criterion("t", 1, 1)
+
+    assert all(not cacheable for cacheable, _ in seen)
+    assert seen[0][1] != seen[1][1]
 
 
 # --- inside a run -----------------------------------------------------------
 
 
-async def test_a_second_identical_run_makes_fewer_calls():
-    """The saving is across runs, which is where the repetition lives."""
-    cache = SemanticCache()
+async def test_a_second_identical_run_reuses_the_first_runs_generations():
+    """The saving is across runs, which is where the repetition lives.
+
+    Asserted on cache hits rather than on total calls: proposals deliberately
+    BYPASS the cache to stay independent, so the totals include calls that can
+    never be saved and comparing them measures the wrong thing.
+    """
+    cache = _cache()
     provider = ScriptedProvider()
 
     first = SwarmRun(provider, profile="smoke", agents=4, cache=cache)
     await first.run("summarise the source records")
-    after_first = provider.calls
+    hits_after_first = first.provider.hits
 
     second = SwarmRun(provider, profile="smoke", agents=4, cache=cache)
     await second.run("summarise the source records")
-    second_run_calls = provider.calls - after_first
 
-    assert second_run_calls < after_first, (
-        f"second run made {second_run_calls} calls against {after_first}: "
-        "the cache saved nothing"
+    assert second.provider.hits > hits_after_first, (
+        "the second run generated everything again"
     )
+    assert second.provider.misses < second.provider.hits
+
+
+async def test_different_plan_nodes_never_share_a_cached_answer():
+    """The live bug that made exact matching non-negotiable.
+
+    Worker prompts share a long template and differ in one step name, which put
+    genuinely different nodes at cosine 0.97 -- above the 0.95 similarity
+    threshold. Every node received the same answer, and the run reported a high
+    hit rate and a low cost while being wrong.
+    """
+    from swarmd.router.cache import cosine, hash_embedder
+    from swarmd.swarm.batch import batch_prompt
+
+    # The REAL prompt shape, batching instruction included. Using a shortened
+    # stand-in would understate the effect and prove nothing: similarity here
+    # rises with template length, so a shorter envelope sits safely below the
+    # threshold while the prompt production actually sends sits above it.
+    template = (
+        "TASK: extract and verify the numeric claims in a short report\n"
+        "STEP: {step}\n"
+        "REQUIRED: {req}"
+    )
+    a = batch_prompt(
+        template.format(step="extract", req="pull every claim into out.json"), 8
+    )
+    b = batch_prompt(
+        template.format(step="verify", req="recompute each claim and record it"), 8
+    )
+
+    # The hazard, measured: two genuinely different nodes match anyway.
+    assert cosine(hash_embedder(a), hash_embedder(b)) > 0.95
+
+    cache = _cache()
+    provider = Counter()
+    cached = CachedProvider(provider, cache)
+    await cached.complete(_request(a))
+    await cached.complete(_request(b))
+
+    assert provider.calls == 2, "one node was served another node's answer"
+
+
+async def test_a_similarity_cache_is_refused_outright():
+    """Refused rather than warned about: the symptom is a fast, cheap run whose
+    nodes all produced the same artifact, which looks like success."""
+    with pytest.raises(ValueError, match="exact_only=True"):
+        CachedProvider(Counter(), SemanticCache())
 
 
 async def test_an_eval_run_refuses_a_cache():
     """Identical cached repeats do not bias a bootstrap interval, they collapse
     it -- and a zero-width interval reads as a strong result."""
     with pytest.raises(ValueError, match="eval run cannot use the semantic cache"):
-        SwarmRun(ScriptedProvider(), profile="eval", cache=SemanticCache())
+        SwarmRun(ScriptedProvider(), profile="eval", cache=_cache())
 
 
 async def test_a_run_without_a_cache_reports_none_rather_than_zeroes():
@@ -243,7 +361,7 @@ async def test_a_run_without_a_cache_reports_none_rather_than_zeroes():
 
 
 async def test_a_cached_run_reports_its_hit_rate():
-    cache = SemanticCache()
+    cache = _cache()
     run = SwarmRun(ScriptedProvider(), profile="smoke", agents=2, cache=cache)
     result = await run.run("summarise the source records")
 

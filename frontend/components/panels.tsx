@@ -2,9 +2,11 @@
 
 import type {
   AgentState,
+  CacheView,
   CostView,
   CriterionView,
   PlanView,
+  RogueReport,
   SwarmEvent,
 } from "@/lib/types";
 
@@ -348,6 +350,126 @@ export function CostPanel({ cost }: { cost: CostView | null }) {
             ))}
           </dl>
         </>
+      )}
+    </Card>
+  );
+}
+
+/* ------------------------------------------------------------- rogue gate */
+
+export function RogueGatePanel({ rogues }: { rogues: RogueReport | null }) {
+  if (!rogues) {
+    return (
+      <Card title="Red-team gate">
+        <Empty hint="Seed rogues from the top bar to run SPEC Phase 8: five deliberate misbehaviours injected into a real run, with the red-team not told which agents they are.">
+          No rogues seeded.
+        </Empty>
+      </Card>
+    );
+  }
+
+  const rows: Array<[string, string[], string]> = [
+    ["caught by its own detector", rogues.caught, "passed"],
+    ["blocked before the red-team", rogues.blocked_upstream, "neutral"],
+    ["escaped", rogues.escaped, "failed"],
+    ["never seeded", rogues.unexercised, "failed"],
+  ];
+
+  return (
+    <Card
+      title="Red-team gate"
+      meta={rogues.passed ? "PASSED" : "FAILED"}
+    >
+      <div style={{ marginBottom: 12 }}>
+        <span className={`pill ${rogues.passed ? "passed" : "failed"}`}>
+          {rogues.passed ? "every pattern handled" : "gate failed"}
+        </span>
+      </div>
+
+      {rows.map(([label, patterns, tone]) =>
+        patterns.length ? (
+          <div key={label} style={{ marginBottom: 10 }}>
+            <div className="rail-section" style={{ padding: "0 0 4px" }}>
+              {label}
+            </div>
+            {patterns.map((p) => (
+              <span key={p} className={`pill ${tone}`} style={{ marginRight: 6 }}>
+                {p}
+              </span>
+            ))}
+          </div>
+        ) : null,
+      )}
+
+      {Object.keys(rogues.misattributed).length > 0 && (
+        <div>
+          <div className="rail-section" style={{ padding: "0 0 4px" }}>
+            stopped by the wrong detector
+          </div>
+          <dl className="kv">
+            {Object.entries(rogues.misattributed).map(([pattern, fired]) => (
+              <div key={pattern} style={{ display: "contents" }}>
+                <dt>{pattern}</dt>
+                <dd>caught by {fired || "nothing"}</dd>
+              </div>
+            ))}
+          </dl>
+          <p className="hint">
+            The agent was stopped, so a check that only asked &ldquo;was it
+            stopped?&rdquo; would report a pass. The detector under test was
+            never exercised.
+          </p>
+        </div>
+      )}
+    </Card>
+  );
+}
+
+/* --------------------------------------------------------------- efficiency */
+
+export function EfficiencyPanel({
+  cache,
+  batches,
+  agents,
+}: {
+  cache: CacheView | null;
+  batches: SwarmEvent[];
+  agents: number;
+}) {
+  const saved = batches.reduce(
+    (sum, e) => sum + (Number(e.saved_calls) || 0),
+    0,
+  );
+  const calls = batches.reduce((sum, e) => sum + (Number(e.calls) || 0), 0);
+
+  return (
+    <Card title="Capacity levers" meta={agents ? `${agents} agents` : undefined}>
+      <p className="hint" style={{ marginTop: 0 }}>
+        What is scarce on a pooled free tier is requests per minute, not
+        dollars. Both figures below are counted, not estimated.
+      </p>
+
+      <dl className="kv">
+        <dt>batched generations</dt>
+        <dd>{calls}</dd>
+        <dt>requests avoided</dt>
+        <dd>{saved}</dd>
+        <dt>cache hits</dt>
+        <dd>
+          {cache ? `${cache.hits} of ${cache.hits + cache.misses}` : "no cache"}
+        </dd>
+        <dt>cache hit rate</dt>
+        <dd>{cache ? `${(cache.hit_rate * 100).toFixed(0)}%` : "—"}</dd>
+        <dt>cached entries</dt>
+        <dd>{cache ? cache.entries : "—"}</dd>
+      </dl>
+
+      {!cache && (
+        <p className="hint">
+          This run had no cache attached, which is not the same as a zero hit
+          rate. Eval runs refuse one outright: identical cached responses across
+          repeats collapse the bootstrap interval rather than merely biasing it.
+        </p>
       )}
     </Card>
   );

@@ -15,6 +15,7 @@ The properties worth defending, in order of how quietly they break:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import ClassVar
 
 from swarmd.swarm.supervisor import WORKER_STAGE, Supervisor
 
@@ -198,8 +199,8 @@ async def _session(library, supervisor, results, tasks=10):
         class Result:
             status = "completed"
             duration_s = 0.1
-            proposed_skills: list = []
-            contained: list = []
+            proposed_skills: ClassVar[list] = []
+            contained: ClassVar[list] = []
 
             def __init__(self):
                 self.results = results(index)
@@ -217,7 +218,7 @@ async def test_the_patched_prompt_reaches_the_next_run(tmp_path):
     from swarmd.swarm.skills import SkillLibrary
 
     sup = Supervisor()
-    report, prompts = await _session(
+    _report, prompts = await _session(
         SkillLibrary(tmp_path / "s.json"),
         sup,
         lambda index: _failures("json_parses", 3),
@@ -274,7 +275,7 @@ async def test_a_healthy_session_produces_no_patches(tmp_path):
     from swarmd.swarm.skills import SkillLibrary
 
     sup = Supervisor()
-    report, prompts = await _session(
+    report, _prompts = await _session(
         SkillLibrary(tmp_path / "s.json"),
         sup,
         lambda index: [FakeResult(True) for _ in range(3)],
@@ -296,8 +297,8 @@ async def test_the_prompt_version_history_records_the_patch(tmp_path):
         class Result:
             status = "completed"
             duration_s = 0.1
-            proposed_skills: list = []
-            contained: list = []
+            proposed_skills: ClassVar[list] = []
+            contained: ClassVar[list] = []
             results = _failures("json_parses", 3)
 
         return Result(), {"cost": {"total_usd": 0.0}}

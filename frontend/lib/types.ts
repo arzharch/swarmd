@@ -115,7 +115,39 @@ export interface RunSummary {
     leaderboard: Array<Record<string, unknown>>;
     skills: Record<string, number> | null;
     ablation: { skills_enabled: boolean };
+    /** Null when the run had no cache, which is not the same as a zero hit
+     *  rate: one means the mechanism was absent, the other that it missed. */
+    cache: CacheView | null;
+    /** Null unless rogues were seeded for this run. */
+    rogues: RogueReport | null;
+    profile?: {
+      name: string;
+      agents: number;
+      profile_agents: number;
+      agents_explicit: boolean;
+    };
   };
+}
+
+export interface CacheView {
+  hits: number;
+  misses: number;
+  hit_rate: number;
+  entries: number;
+  evictions: number;
+}
+
+export interface RogueReport {
+  requested: string[];
+  seeded: string[];
+  caught: string[];
+  blocked_upstream: string[];
+  /** pattern -> the detector that fired instead. A non-empty map fails the
+   *  gate: the agent was stopped, but the detector under test was not. */
+  misattributed: Record<string, string>;
+  escaped: string[];
+  unexercised: string[];
+  passed: boolean;
 }
 
 export interface LedgerRow {

@@ -91,12 +91,25 @@ class CachedProvider:
         account: Any = None,
         stage: str = "",
     ) -> None:
+        if not cache.exact_only:
+            # Refused rather than warned about. Similarity matching on
+            # templated prompts served one plan node's answer to another at a
+            # measured cosine of 0.97, and the symptom is a fast, cheap run
+            # whose nodes all produced the same artifact -- which looks like
+            # success from every angle except correctness.
+            raise ValueError(
+                "CachedProvider requires a cache built with exact_only=True: "
+                "this system's prompts are assembled from templates, so "
+                "cosine similarity is dominated by shared boilerplate and "
+                "matches prompts that mean different things"
+            )
         self._provider = provider
         self._cache = cache
         self._account = account
         self._stage = stage
         self.hits = 0
         self.misses = 0
+        self.bypassed = 0
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._provider, name)
@@ -116,6 +129,19 @@ class CachedProvider:
 
     async def complete(self, request: Any) -> Any:
         from swarmd.router.simulated import simulation_enabled
+
+        # Calls whose whole point is INDEPENDENCE opt out. Criterion and plan
+        # synthesis run N proposers and merge what they agree on; serving
+        # proposer 1's answer to proposers 2 and 3 does not merely reduce
+        # diversity, it manufactures unanimity -- the merge would report full
+        # agreement across three opinions that were one opinion.
+        #
+        # Found in a live run: the plan proposers sent an identical prompt and
+        # differed only by sampling, so enabling the cache silently collapsed
+        # three competing DAGs into one DAG judged against itself.
+        if request.metadata.get("cache") == "bypass":
+            self.bypassed += 1
+            return await self._provider.complete(request)
 
         simulated = simulation_enabled()
         key = cache_key(request, simulated=simulated)
@@ -157,6 +183,7 @@ class CachedProvider:
         return {
             "hits": self.hits,
             "misses": self.misses,
+            "bypassed": self.bypassed,
             "hit_rate": round(self.hit_rate, 4),
             "entries": len(self._cache),
             "evictions": self._cache.evictions,

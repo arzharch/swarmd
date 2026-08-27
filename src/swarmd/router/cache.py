@@ -12,6 +12,27 @@ Design notes:
 - Eviction: LRU by capacity, TTL by age — both cheap, both bounded.
 - Embeddings come from a pluggable embedder; the default hashes character
   n-grams deterministically so tests/CI need no model download.
+
+WHEN SIMILARITY IS THE WRONG TOOL, learned by shipping it and watching a live
+run. Semantic matching assumes the varying part of a prompt is most of the
+prompt, which holds for human paraphrases ("enrich acme" / "enrich ACME corp")
+and fails completely for MACHINE-ASSEMBLED prompts.
+
+The swarm's worker prompts share a long template — the task, the schema, the
+batching instructions — and differ in one step name and one instruction line.
+Measured cosine between three genuinely different plan nodes: **0.97**, above
+the 0.95 threshold. So the cache served the `extract` node's answer to the
+`verify` node, every node produced the same artifact, and the run reported a
+high hit rate and a low cost while being wrong.
+
+That is not a threshold that needs tuning. Raising it to 0.98 buys nothing,
+because similarity here is dominated by shared boilerplate and rises with
+template length: a longer envelope pushes ANY two prompts above ANY threshold.
+The discriminating tokens are a rounding error in the vector.
+
+Hence `exact_only`. For templated prompts the honest answer is exact matching,
+and `CachedProvider` requires it. The similarity path remains for genuinely
+free-text prompts, which is what it was built for.
 """
 
 from __future__ import annotations
@@ -65,10 +86,15 @@ class SemanticCache:
         ttl_s: float = 3600.0,
         capacity: int = 1024,
         embedder: EmbedFn | None = None,
+        exact_only: bool = False,
     ) -> None:
         if not 0.0 < threshold <= 1.0:
             raise ValueError("threshold must be in (0, 1]")
         self.threshold = threshold
+        # Match on the key itself rather than on similarity. Required for
+        # machine-assembled prompts; see the module docstring for the measured
+        # reason. Everything else -- TTL, LRU, capacity, counters -- is shared.
+        self.exact_only = exact_only
         self.ttl_s = ttl_s
         self.capacity = capacity
         self.embed = embedder or hash_embedder
@@ -82,8 +108,24 @@ class SemanticCache:
         return hashlib.sha256(prompt.encode()).hexdigest()[:16]
 
     async def get(self, prompt: str) -> Any | None:
-        """Return cached response for a semantically-equal prompt, else None."""
+        """Return cached response for an equal prompt, else None.
+
+        "Equal" means byte-identical under `exact_only`, and
+        cosine-above-threshold otherwise.
+        """
         now = time.monotonic()
+
+        if self.exact_only:
+            key = self._key(prompt)
+            entry = self._entries.get(key)
+            if entry is not None and now - entry.created_ts <= self.ttl_s:
+                entry.last_used_ts = now
+                self._entries.move_to_end(key)
+                self.hits += 1
+                return entry.response
+            self.misses += 1
+            return None
+
         emb = self.embed(prompt)
 
         best_key: str | None = None
@@ -124,7 +166,9 @@ class SemanticCache:
         self._entries[key] = _Entry(
             prompt=prompt,
             response=response,
-            embedding=self.embed(prompt),
+            # Skipped entirely in exact mode: embedding a prompt nothing will
+            # ever compare against is pure cost, and these prompts are long.
+            embedding=[] if self.exact_only else self.embed(prompt),
             created_ts=now,
             last_used_ts=now,
         )

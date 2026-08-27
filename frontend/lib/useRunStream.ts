@@ -46,6 +46,8 @@ interface StreamState {
   skillsProposed: string[];
   containments: SwarmEvent[];
   chaosEvents: SwarmEvent[];
+  /** One entry per batched generation: the requests a pool did not make. */
+  batches: SwarmEvent[];
 }
 
 const EMPTY: StreamState = {
@@ -58,6 +60,7 @@ const EMPTY: StreamState = {
   skillsProposed: [],
   containments: [],
   chaosEvents: [],
+  batches: [],
 };
 
 function reduce(state: StreamState, event: SwarmEvent): StreamState {
@@ -114,6 +117,10 @@ function reduce(state: StreamState, event: SwarmEvent): StreamState {
 
     case "agent_requeued":
       next.chaosEvents = [...state.chaosEvents, event].slice(-200);
+      break;
+
+    case "batch_generated":
+      next.batches = [...state.batches, event].slice(-200);
       break;
 
     case "containment":

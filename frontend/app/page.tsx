@@ -4,11 +4,13 @@ import { useEffect, useMemo, useState } from "react";
 import {
   AgentGrid,
   CostPanel,
+  EfficiencyPanel,
   CriterionPanel,
   EventLog,
   PlanPanel,
   ReasoningPanel,
   RedTeamPanel,
+  RogueGatePanel,
   SummaryPanel,
 } from "@/components/panels";
 import {
@@ -273,6 +275,12 @@ export default function Dashboard() {
         {view === "cost" && (
           <div className="board cols-3">
             <CostPanel cost={cost} />
+            <EfficiencyPanel
+              cache={summary?.report?.cache ?? null}
+              batches={stream.batches}
+              agents={summary?.report?.profile?.agents ?? 0}
+            />
+            <RogueGatePanel rogues={summary?.report?.rogues ?? null} />
             <SummaryPanel
               economy={summary?.report?.economy}
               redteam={summary?.report?.redteam}

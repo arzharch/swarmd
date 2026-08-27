@@ -24,7 +24,6 @@ from swarmd.swarm.rogues import (
 from swarmd.swarm.run import SwarmRun
 from tests.swarm.test_run import ScriptedProvider
 
-
 # --- pattern selection ------------------------------------------------------
 
 
