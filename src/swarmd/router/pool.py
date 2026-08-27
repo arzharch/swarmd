@@ -31,12 +31,14 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from swarmd.ledger import CostAccount
+from swarmd.observability import metrics
 from swarmd.router.providers import (
     LLMRequest,
     LLMResponse,
     Provider,
     ProviderError,
 )
+from swarmd.router.quota import QuotaBackend, build_quota
 
 # --- provider catalogue ----------------------------------------------------
 #
@@ -123,6 +125,36 @@ REGISTRY: dict[str, ProviderSpec] = {
 TIER_RANK = {"free": 0, "free_data_training": 1, "paid": 2}
 
 
+def credentials_for(spec: ProviderSpec) -> list[tuple[str, str]]:
+    """Discover every credential configured for a provider.
+
+    Two forms are read, singular and plural:
+
+        GROQ_API_KEY   = "abc"            -> one credential
+        GROQ_API_KEYS  = "abc,def,ghi"    -> three
+
+    Multiple credentials exist because a real deployment separates keys per
+    environment, and because quota is per account: two accounts genuinely are
+    twice the throughput, and the pool has to model that rather than assume one
+    bucket per provider.
+
+    Returns (credential_id, key) pairs. The id is a stable, non-secret handle
+    used as the quota key and as a metric label -- deliberately an index rather
+    than a key prefix, so a credential identifier can never leak key material
+    into logs, metrics, or the dashboard.
+    """
+    found: list[tuple[str, str]] = []
+    plural = os.environ.get(f"{spec.api_key_env}S", "")
+    for i, raw in enumerate(plural.split(",")):
+        key = raw.strip()
+        if key:
+            found.append((f"{spec.name}#{i}", key))
+    single = os.environ.get(spec.api_key_env, "").strip()
+    if single and single not in {k for _, k in found}:
+        found.append((f"{spec.name}#{len(found)}", single))
+    return found
+
+
 class RateLimited(RuntimeError):
     """A provider said 429. Carries what it told us about when to come back."""
 
@@ -142,21 +174,28 @@ class NoCapacity(RuntimeError):
 class OpenAICompatProvider(Provider):
     """One adapter for every OpenAI-compatible chat-completions endpoint."""
 
-    def __init__(self, spec: ProviderSpec, timeout_s: float = 60.0) -> None:
+    def __init__(
+        self,
+        spec: ProviderSpec,
+        api_key: str,
+        *,
+        credential_id: str = "default",
+        timeout_s: float = 60.0,
+    ) -> None:
         import httpx
 
-        key = os.environ.get(spec.api_key_env)
-        if not key:
+        if not api_key:
             raise RuntimeError(
                 f"{spec.name} requires {spec.api_key_env}; unset. Either export it "
                 f"or drop {spec.name} from the pool."
             )
         self.spec = spec
         self.name = spec.name
+        self.credential_id = credential_id
         self.models = list(spec.models)
         self._client = httpx.AsyncClient(
             base_url=spec.base_url,
-            headers={"Authorization": f"Bearer {key}"},
+            headers={"Authorization": f"Bearer {api_key}"},
             timeout=timeout_s,
         )
 
@@ -330,7 +369,17 @@ class LimitState:
 class _Slot:
     provider: OpenAICompatProvider
     spec: ProviderSpec
+    credential_id: str = "default"
     state: LimitState = field(default_factory=LimitState)
+
+    @property
+    def quota_key(self) -> str:
+        """Quota is per CREDENTIAL, not per provider.
+
+        Two Groq keys are two accounts and genuinely two quotas; keying on the
+        provider name alone would throttle them as if they shared one.
+        """
+        return self.credential_id
 
 
 class ProviderPool(Provider):
@@ -370,6 +419,7 @@ class ProviderPool(Provider):
         account: CostAccount | None = None,
         allow_paid: bool = False,
         max_wait_s: float = 30.0,
+        quota: QuotaBackend | None = None,
     ) -> None:
         if not slots:
             raise ValueError("ProviderPool needs at least one provider")
@@ -377,6 +427,25 @@ class ProviderPool(Provider):
         self.account = account
         self.allow_paid = allow_paid
         self.max_wait_s = max_wait_s
+        self.quota = quota if quota is not None else build_quota(None)
+        self._quota_ready = False
+
+    async def _ensure_quota_configured(self) -> None:
+        """Seed each credential's bucket from its published limit, once.
+
+        Published limits are only the starting estimate; observed 429s tighten
+        the bucket from there (ADR-008). Done lazily rather than in __init__
+        because configuring a backend is async and constructors should not be.
+        """
+        if self._quota_ready:
+            return
+        for slot in self._slots:
+            await self.quota.configure(
+                slot.quota_key,
+                rate_per_min=float(slot.spec.hint_rpm),
+                burst=max(1, slot.spec.hint_rpm // 4),
+            )
+        self._quota_ready = True
 
     # -- construction -------------------------------------------------------
 
@@ -389,6 +458,7 @@ class ProviderPool(Provider):
         allow_paid: bool = False,
         include: list[str] | None = None,
         max_wait_s: float = 30.0,
+        quota: QuotaBackend | None = None,
     ) -> ProviderPool:
         """Build a pool from whichever provider keys are actually present.
 
@@ -407,15 +477,29 @@ class ProviderPool(Provider):
             if spec.tier == "paid" and not allow_paid:
                 skipped.append(f"{name} (needs --allow-paid)")
                 continue
-            try:
-                slots.append(_Slot(OpenAICompatProvider(spec), spec))
-            except RuntimeError:
+            creds = credentials_for(spec)
+            if not creds:
                 skipped.append(f"{name} (no {spec.api_key_env})")
+                continue
+            for credential_id, key in creds:
+                slots.append(
+                    _Slot(
+                        OpenAICompatProvider(spec, key, credential_id=credential_id),
+                        spec,
+                        credential_id=credential_id,
+                    )
+                )
         if not slots:
             raise RuntimeError(
                 "no usable providers. Skipped: " + ", ".join(skipped or ["none"])
             )
-        return cls(slots, account=account, allow_paid=allow_paid, max_wait_s=max_wait_s)
+        return cls(
+            slots,
+            account=account,
+            allow_paid=allow_paid,
+            max_wait_s=max_wait_s,
+            quota=quota,
+        )
 
     # -- routing ------------------------------------------------------------
 
@@ -426,6 +510,7 @@ class ProviderPool(Provider):
         )
 
     async def complete(self, request: LLMRequest) -> LLMResponse:
+        await self._ensure_quota_configured()
         agent_id = str(request.metadata.get("agent_id", ""))
         stage = str(request.metadata.get("stage", ""))
         errors: list[str] = []
@@ -433,9 +518,20 @@ class ProviderPool(Provider):
 
         while True:
             ordered = self._ordered()
+            quota_waits: list[float] = []
+
             for slot in ordered:
                 if not slot.state.available():
                     continue
+
+                # Quota gate. Asking permission before sending is what keeps N
+                # pods sharing a credential from collectively exceeding the
+                # account limit -- each pod's own backoff cannot see the others.
+                wait = await self.quota.acquire(slot.quota_key)
+                if wait > 0:
+                    quota_waits.append(wait)
+                    continue
+
                 for model in slot.provider.models:
                     if self.account is not None:
                         # Refuse before spending, not after.
@@ -446,28 +542,58 @@ class ProviderPool(Provider):
                         resp = await slot.provider.complete_with(model, request)
                     except RateLimited as exc:
                         slot.state.record_429(exc.retry_after_s)
+                        metrics.record_rate_limited(
+                            provider=slot.spec.name, model=model
+                        )
+                        # The provider just told us our estimate was too high.
+                        # Tighten the bucket so the correction outlives this
+                        # backoff window instead of being relearned every time.
+                        await self.quota.configure(
+                            slot.quota_key,
+                            rate_per_min=max(1.0, slot.spec.hint_rpm * 0.5),
+                            burst=1,
+                        )
                         errors.append(f"{slot.spec.name}: 429")
                         break  # whole provider is throttled, not just this model
                     except ProviderError as exc:
                         slot.state.record_error()
+                        metrics.record_llm_error(
+                            provider=slot.spec.name,
+                            model=model,
+                            reason=type(exc).__name__,
+                        )
                         errors.append(str(exc))
                         continue  # try the next model on the same provider
+
                     slot.state.record_success()
+                    cost = 0.0
                     if self.account is not None:
-                        self.account.charge_call(
+                        cost = self.account.charge_call(
                             provider=resp.provider,
                             model=resp.model,
                             tokens_in=resp.tokens_in,
                             tokens_out=resp.tokens_out,
                             agent_id=agent_id,
                             stage=stage,
-                            detail={"latency_s": round(resp.latency_s, 4)},
+                            detail={
+                                "latency_s": round(resp.latency_s, 4),
+                                "credential": slot.credential_id,
+                            },
                         )
+                    metrics.record_llm_call(
+                        provider=resp.provider,
+                        model=resp.model,
+                        latency_s=resp.latency_s,
+                        cost_usd=cost,
+                    )
                     return resp
 
-            # Nothing usable right now. Wait for the soonest to come back, if
-            # that fits inside the deadline.
+            # Nothing usable right now. Wait for the soonest opening -- from
+            # either a backoff expiring or a quota bucket refilling -- if that
+            # fits inside the deadline.
             waits = [s.state.wait_s() for s in ordered if not s.state.available()]
+            waits.extend(quota_waits)
+            waits = [w for w in waits if w != float("inf")]
             now = time.monotonic()
             if not waits or now >= deadline:
                 raise NoCapacity(
@@ -486,6 +612,7 @@ class ProviderPool(Provider):
         return [
             {
                 "provider": s.spec.name,
+                "credential": s.credential_id,
                 "tier": s.spec.tier,
                 "models": list(s.spec.models),
                 "available": s.state.available(),

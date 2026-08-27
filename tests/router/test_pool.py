@@ -324,3 +324,99 @@ def test_registry_models_are_priced_or_explicitly_free():
     for spec in REGISTRY.values():
         for model in spec.models:
             price_for(spec.name, model)  # raises UnpricedModel if unknown
+
+
+# --- credentials and quota -------------------------------------------------
+
+
+def test_multiple_credentials_become_multiple_slots(monkeypatch):
+    """Two keys are two accounts, so genuinely two quotas."""
+    for spec in REGISTRY.values():
+        monkeypatch.delenv(spec.api_key_env, raising=False)
+        monkeypatch.delenv(spec.api_key_env + "S", raising=False)
+    monkeypatch.setenv("GROQ_API_KEYS", "key-a, key-b ,key-c")
+
+    pool = ProviderPool.from_env()
+    rows = pool.status()
+    assert len(rows) == 3
+    assert {r["credential"] for r in rows} == {"groq#0", "groq#1", "groq#2"}
+
+
+def test_singular_and_plural_key_vars_combine_without_duplicating(monkeypatch):
+    for spec in REGISTRY.values():
+        monkeypatch.delenv(spec.api_key_env, raising=False)
+        monkeypatch.delenv(spec.api_key_env + "S", raising=False)
+    monkeypatch.setenv("GROQ_API_KEYS", "key-a,key-b")
+    monkeypatch.setenv("GROQ_API_KEY", "key-a")  # already in the plural list
+
+    pool = ProviderPool.from_env()
+    assert len(pool.status()) == 2
+
+
+def test_credential_ids_never_contain_key_material(monkeypatch):
+    """Ids reach logs, metrics and the dashboard; keys must not."""
+    for spec in REGISTRY.values():
+        monkeypatch.delenv(spec.api_key_env, raising=False)
+        monkeypatch.delenv(spec.api_key_env + "S", raising=False)
+    monkeypatch.setenv("GROQ_API_KEY", "sk-super-secret-value")
+
+    pool = ProviderPool.from_env()
+    assert "sk-super-secret-value" not in str(pool.status())
+
+
+async def test_quota_exhaustion_routes_to_another_provider():
+    """A pod that has spent its share must not send anyway."""
+    from swarmd.router.quota import InProcessQuota
+
+    quota = InProcessQuota()
+    a = _slot("groq", ["m"])
+    a.credential_id = "groq#0"
+    b = _slot("cerebras", ["m"])
+    b.credential_id = "cerebras#0"
+    pool = ProviderPool([a, b], quota=quota)
+    await pool._ensure_quota_configured()
+    # Drain groq's bucket entirely.
+    await quota.configure("groq#0", rate_per_min=1, burst=1)
+    await quota.acquire("groq#0")
+
+    resp = await pool.complete(_req())
+    assert resp.provider == "cerebras"
+    assert a.provider.calls == []
+
+
+async def test_a_429_tightens_the_quota_bucket_not_only_the_backoff():
+    """Backoff expires; the corrected rate must outlive it."""
+    from swarmd.router.quota import InProcessQuota
+
+    quota = InProcessQuota()
+    throttled = _slot("groq", ["m"], script=[RateLimited("groq", 0.01)])
+    throttled.credential_id = "groq#0"
+    healthy = _slot("cerebras", ["m"])
+    healthy.credential_id = "cerebras#0"
+    pool = ProviderPool([throttled, healthy], quota=quota)
+
+    await pool.complete(_req())
+
+    snap = await quota.snapshot()
+    assert snap["groq#0"]["rate_per_min"] <= REGISTRY["groq"].hint_rpm * 0.5
+    assert snap["groq#0"]["burst"] == 1
+
+
+async def test_quota_is_keyed_per_credential_not_per_provider():
+    """Otherwise three Groq keys would be throttled as if they were one."""
+    from swarmd.router.quota import InProcessQuota
+
+    quota = InProcessQuota()
+    a = _slot("groq", ["m"])
+    a.credential_id = "groq#0"
+    b = _slot("groq", ["m"])
+    b.credential_id = "groq#1"
+    pool = ProviderPool([a, b], quota=quota)
+    await pool._ensure_quota_configured()
+
+    await quota.configure("groq#0", rate_per_min=1, burst=1)
+    await quota.acquire("groq#0")  # drain only the first credential
+
+    resp = await pool.complete(_req())
+    assert resp.provider == "groq"
+    assert b.provider.calls  # the second credential served it

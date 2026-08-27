@@ -20,6 +20,9 @@ swarmd = "swarmd.cli:main"
 [project.optional-dependencies]
 otel = ["opentelemetry-sdk>=1.25", "opentelemetry-exporter-otlp>=1.25"]
 metrics = ["prometheus-client>=0.20"]
+# Cluster-wide rate-limit quota. Only needed when more than one process shares
+# a provider credential -- i.e. the Kubernetes deployment (ADR-011).
+redis = ["redis>=5.0"]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
@@ -52,7 +55,7 @@ target-version = "py312"
 strict = true
 
 [[tool.mypy.overrides]]
-module = "asyncpg"
+module = ["asyncpg", "redis.*"]
 ignore_missing_imports = true
 
 [dependency-groups]
