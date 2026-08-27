@@ -1065,6 +1065,269 @@ kustomize prod: whitelist-source-range present, no LoadBalancer or NodePort on
 
 ---
 
+## 2026-08-28 - Closing the gaps the audit found
+
+The previous entry ended with an audit that produced a gap list. This one closes
+all of it except the part that needs credentials, and the interesting content is
+not the features -- it is that four of the six defects fixed here were invisible
+to the tests that were supposed to catch them.
+
+### The shape of the problem
+
+Every one of these looked correct from the outside:
+
+| What it looked like | What was happening |
+|---|---|
+| Chaos gate green, integrity hash matches | Killed work was REDONE, not resumed. Deterministic work redone hashes identically to work recovered |
+| Red-team unit tests green, 37 of them | One detector could never fire in production. Its test constructed it with a threshold the real config never uses |
+| Rogue gate would have reported five detectors working | Four were. One rogue was caught by a different detector, which reads as a pass to anything that asks only "was it stopped?" |
+| Cache hit rate 62%, cost near zero, run completed | Every plan node received the same answer |
+
+The pattern: **a check that measures the outcome rather than the mechanism
+cannot tell success from a convincing imitation of it.** Each fix below
+therefore changes what is asserted, not just what is implemented.
+
+### Decision: batching and chaos recovery are the same operation
+
+**Problem.** Two separate gaps. `SwarmRun` wrote no checkpoints, so a chaos kill
+restarted the node. And CAPACITY.md counted an 8x saving from batched
+generation that did not exist -- every agent made its own call, which is why the
+pool was capped at 16.
+
+**Decision.** One mechanism. `GenericWorker.execute` takes a `Checkpoint` -- the
+kernel's type, with the kernel's skip-completed-steps semantics -- and
+checkpoints at attempt-scoped steps (`generate:1`, `materialise:1`, `grade:1`).
+Then batching is implemented by *pre-seeding* each agent's checkpoint with its
+variant, marked `generate:1`. The resume path skips the step and charges
+nothing.
+
+Batching and recovery turn out to be the same question from two sides: work
+someone else already did.
+
+**Alternatives considered.**
+
+*Run swarm nodes through the kernel `Runtime`.* The obvious unification, and it
+imposes the kernel's task/step model on a DAG whose nodes are generated at
+runtime and whose agents are a population rather than a sequence. Sharing the
+contract without sharing the loop is a real duplication, and STATUS.md names it
+as the next structural refactor rather than pretending it is free.
+
+*A coalescing broker for batching* -- collect concurrent identical requests,
+fire one call. Needs a batching window, a timeout, and a policy for when fewer
+callers arrive than expected: three sources of flakiness, replaced by generating
+before the pool spawns.
+
+*Attempt-scoped steps vs node-scoped.* Node-scoped is simpler and wrong: a kill
+during repair round two would resume at round one, discarding a completed
+repair.
+
+**Why the test counts calls.** `test_a_killed_node_resumes_rather_than_repeating_the_model_call`
+asserts `worker_calls == 1` after a resume. Comparing output could never have
+detected the original defect, because the output was identical either way.
+
+**Follow-up questions this invites.**
+- *What happens if the checkpoint outlives the criterion it was graded against?*
+  Today nothing does: checkpoints live for one run. Durable checkpoints across
+  runs would need the criterion hash in the checkpoint and a refusal on
+  mismatch.
+- *Does pre-seeding make the population homogeneous?* It bounds diversity at K.
+  Below the pool size, agents share variants -- visible in the report rather
+  than hidden by re-calling to fill the gap, which would spend the requests
+  batching exists to save.
+- *Why cap the pool at 32 when generation is now O(1) per node?* Repairs are
+  still one call each, so the worst case is linear at `max_repairs` per agent.
+
+### Decision: a seeded rogue must be caught by ITS OWN detector
+
+**Problem.** SPEC Phase 8 named `--seed-rogues all` and it did not exist. The
+detectors were tested against hand-built `Action` fixtures, which proves a
+detector parses its input and says nothing about whether a real rogue ever
+produces that input.
+
+**Decision.** `swarm/rogues.py` injects real misbehaviour into a real run: real
+credits through the economy, real code through the sandbox, reported through the
+same `_observe` path an honest worker uses. Nothing tells the red-team which
+agents are seeded.
+
+The gate tracks four outcomes rather than a boolean:
+
+- **caught** -- the detector for this pattern fired
+- **misattributed** -- a different detector fired first. The agent was stopped,
+  so a boolean would call this a pass, while the detector under test was never
+  exercised
+- **blocked_upstream** -- an earlier layer refused the misbehaviour first
+- **escaped** -- nothing stopped it
+
+**What implementing it found.** Two things, and this is the argument for
+seeding over fixtures:
+
+*`BudgetSiphon` was unreachable.* Threshold 7,500 credits; allowance 2,000 with
+bankruptcy at zero. No agent without a verified success could reach it. The
+detector's docstring said it compared against the population MEDIAN; the code
+compared against a fixed constant. The seeded siphon went bankrupt uncaught.
+
+*The gate would have passed with four detectors.* The siphon's first
+implementation repeated one payload with an index, and digits are masked before
+hashing, so the LOOP detector caught it. Both fixed: the siphon now varies its
+pretexts, and the seeder asks the red-team which detector actually fired.
+
+**Alternatives considered.**
+
+*Random assignment of patterns to agents.* Makes "all five detected" a coin flip
+that passes most of the time. A gate that usually passes teaches people to
+re-run rather than read. Round-robin from the front of the run instead.
+
+*Counting `blocked_upstream` as a detection.* Convenient and false. When the
+frozen criterion rejects the degenerate output before `CriterionGaming` sees it,
+that is ADR-009 working -- and the detector was not tested. Reported in its own
+column.
+
+*Failing the gate on `blocked_upstream`.* The opposite error: it would fail when
+the criterion does its job, which trains people to weaken the criterion to make
+the red-team gate go green.
+
+**Follow-up questions this invites.**
+- *Is the seeded siphon still realistic now that its payloads vary?* More so: an
+  agent burning budget on genuinely varied work is the harder case.
+- *Would a real rogue evade these five patterns?* Certainly. Five named
+  behaviours are the ones observed, not a taxonomy of the possible. The organ's
+  value is that it runs continuously and costs no quota, not that it is
+  complete.
+
+### Decision: the cache matches exactly, and two callers opt out entirely
+
+**Problem.** `SemanticCache` and `charge_cache_hit` had both existed for phases
+with no caller, so `cache_hits` was a structural zero while CAPACITY.md counted
+a 2.5x saving from caching.
+
+**Decision.** `CachedProvider` wraps the provider, so every call goes through it
+rather than the one path someone remembered to instrument. One cache per
+process, shared across runs.
+
+**What wiring it found, in the order it appeared.**
+
+*Different plan nodes shared answers.* Cosine similarity between three genuinely
+different nodes: **0.97**, above the 0.95 threshold. Worker prompts share a long
+template and differ in a step name, so similarity is dominated by boilerplate.
+The symptom was a fast, cheap run whose nodes all produced the same artifact.
+Raising the threshold does not fix it -- similarity rises with template length,
+so a longer envelope pushes any two prompts above any threshold.
+`CachedProvider` now refuses a cache that is not `exact_only`.
+
+*The plan proposers would have collapsed.* They sent an identical prompt and
+relied on sampling for variety. With a cache in front, three competing DAGs
+became one drawn once and copied twice -- and the selection reported a clean
+winner. Fixed twice over: the proposers now decompose under different
+priorities, and both proposer paths set `cache: bypass`.
+
+*An unpriced model silently disabled batching.* A $0 cache-hit row re-priced the
+model, raised `UnpricedModel`, and the batch caught it as a provider failure. A
+cache hit cannot move the ceiling, so refusing it protected nothing. `charge_call`
+still raises, because there the money is real.
+
+*Batching swallowed a ceiling breach.* `CeilingExceeded` fell into the generic
+handler and the pool fell back to individual generation, spending MORE past the
+limit that had just fired.
+
+**Alternatives considered.**
+
+*Keeping similarity with a higher threshold.* Trades a known failure for an
+unknown one, at a threshold that has to be re-tuned every time a prompt template
+changes length.
+
+*Per-run caches.* Safe and pointless: within a run each node's prompt differs
+and each repair prompt carries its own failures. The repetition is across runs.
+
+*Caching in eval runs.* Refused in code, not documented as a caution. An eval
+measures variance across repeats; serving repeat 2 from repeat 1 does not bias
+the bootstrap interval, it collapses it toward zero width -- and a zero-width
+interval reads as a strong result.
+
+**Follow-up questions this invites.**
+- *What is the hit rate on genuinely novel tasks?* Near zero, by construction.
+  Exact keying means identical prompts hit, and unknown tasks do not repeat. The
+  100% measured on a repeated run is the ceiling. This is now the weakest number
+  in CAPACITY.md and it says so.
+- *Then what carries the capacity plan?* Batching, which does not depend on
+  repetition.
+- *Why keep the similarity path at all?* It is correct for free-text prompts,
+  which is what it was built for. The mistake was assuming this system sends
+  those.
+
+### Decision: the supervisor proposes, the consolidator decides
+
+**Problem.** PRD section 7 lists a supervisor under the flagship. One existed
+only in `examples/leadops`, where stages were known at startup -- the generalist
+swarm's stage names come from a plan generated minutes earlier.
+
+**Decision.** `swarm/supervisor.py` reads the criterion's own failure taxonomy
+and, when failures cluster on one check kind, writes a constraint addressing
+that kind into the worker system prompt. The consolidator gates it and holds the
+version history; the supervisor never judges its own patch.
+
+Every patch is a hypothesis: measured against the pass rate before it, reverted
+when it did not help. Off by default, because a patched prompt is a confound and
+an eval arm must know which prompt it ran.
+
+**Alternatives considered.**
+
+*Let the supervisor decide whether its patch worked.* The self-assessment
+failure the whole criterion-first architecture exists to avoid.
+
+*Patch per plan node.* Node names change every run, so per-node prompts have
+nowhere to persist. The worker system prompt is what carries across runs.
+
+*Patch on the first failure.* Encodes one task's idiosyncrasy into every future
+run -- the same reasoning that makes distillation require two verified
+successes.
+
+*Have an LLM write the patch.* Better generalisation, and it spends the rationed
+resource on a process that runs between runs where a lookup table of constraints
+per check kind is adequate. Worth revisiting when the taxonomy outgrows the
+table -- and the code says so by reporting `unaddressable` rather than emitting
+an empty patch.
+
+**Follow-up questions this invites.**
+- *What if a patch helps one task type and hurts another?* The pass rate is
+  aggregate, so it would be kept while hurting a subset. Per-kind measurement is
+  the obvious next step and is not built.
+- *Do prompts grow without bound?* No: an ineffective patch is reverted, so only
+  patches that measurably helped persist.
+
+### Decision: the agent count belongs to the operator
+
+**Problem.** `--agents` existed and was unused; the profile decided, and the
+profile encodes a wall-clock target rather than the right population for a task.
+
+**Decision.** `agents` is a per-run parameter on the API, the dashboard and the
+CLI. It overrides `ADVISORY_POOL`, because a cap the operator cannot override is
+a lie about who is in control, and the cost ceiling is the real protection
+either way. Exceeding the advisory emits a `pool_above_advisory` event naming
+the reason, so an expensive run is a decision rather than a surprise.
+
+**Follow-up questions this invites.**
+- *Why is `HARD_POOL` 64 if the ceiling protects cost?* It does not bound cost.
+  It bounds concurrent in-flight work per node, so one level cannot turn a
+  rate-limit into a thundering herd.
+
+### Gate evidence
+
+```
+ruff check .                      All checks passed
+mypy src                          Success: no issues in 54 source files
+pytest -q                         807 passed, 1 skipped
+npx tsc --noEmit                  clean
+swarmd swarm run --seed-rogues all --profile smoke
+                                  rogue gate PASSED: 4 caught,
+                                  1 blocked before the red-team
+swarmd swarm run --agents 32 --profile smoke
+                                  32 agents, 8 provider calls
+POST /api/runs x2 (identical)     run 1: 8 calls, 4 cache entries
+                                  run 2: 4 calls, 4 hits, 0 misses
+```
+
+---
+
 ## Next up
 
 - [x] Kernel, pipeline, harnesses, gates, HITL state machine, router
@@ -1080,8 +1343,13 @@ kustomize prod: whitelist-source-range present, no LoadBalancer or NodePort on
 - [x] Track F: Next.js dashboard on the live stream, no fixture path
 - [x] Platform: Grafana, alerts, K8s manifests, Terraform, CI that fires
 - [x] Docs: capacity plan, SLOs, runbook, deployment plan, PRR, README rewrite
-- [ ] Live validation: 500-agent run against real providers; measure the actual
-      cache hit rate against the capacity plan's 60% assumption
+- [x] Batched generation: one call per node, verified by counted calls
+- [x] Semantic cache wired to the provider, exact-keyed, eval runs refuse it
+- [x] Checkpoint recovery in the swarm, tested by counting calls not comparing output
+- [x] Rogue seeding with per-detector attribution; SPEC Phase 8 gate runs in CI
+- [x] Agent count selectable per run from the service, dashboard and CLI
+- [ ] Live validation: run against real providers; measure the actual cache hit
+      rate, and whether a real model returns K genuinely distinct variants
 - [ ] The learning curve: 50-200 tasks with the control arm, then and only then
       generate BENCHMARKS.md and make an improvement claim
 - [x] Product posture: operator token, edge allowlist, rate limits, JSON logs
@@ -1093,4 +1361,8 @@ kustomize prod: whitelist-source-range present, no LoadBalancer or NodePort on
       mock tail, and 'mock' now aliases the tainted simulated provider
 - [x] Traceability view + the ledger commands RUNBOOK.md names
 - [ ] Wire skill approval through the HITL queue rather than the library alone
-- [ ] Supervisor consolidation inside the swarm loop (exists for LeadOps only)
+- [x] Supervisor inside the swarm loop: proposes from the failure taxonomy,
+      the consolidator gates, ineffective patches are reverted
+- [x] ADRs 007, 008 and 010 written -- they were cited 32 times and did not exist
+- [ ] Unify the kernel Runtime and the swarm executor: they share the Checkpoint
+      contract but not the loop

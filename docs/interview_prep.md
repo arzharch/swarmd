@@ -301,7 +301,7 @@ and cost, which a schema-shaped stub cannot evidence. The mock survives in tests
 where it still earns its place: proving byte-identical output under random kills needs a
 deterministic generator. CI enforces the boundary with an import check.
 
-## Section 7: Red-team and containment (populate as Phase 8 lands)
+## Section 7: Red-team and containment (answerable NOW)
 
 **Q: Why is red-teaming a runtime component rather than a test suite?**
 A: Because the failure mode is emergent. The economy pays on verified success and clones
@@ -320,11 +320,50 @@ A: Containment calls the same kill path chaos uses, so it inherits checkpoint re
 requeue. That is the reason to reuse it rather than write a separate quarantine path - the
 recovery semantics are already proven by every chaos test in the suite.
 
+Worth adding that this sentence was false for a while, and the way it was false
+is instructive. It was true of the kernel and not of the swarm flagship, which
+wrote no checkpoints at all and simply restarted a killed node. Nothing caught it
+because the integrity hash still matched - deterministic work redone hashes
+identically to work recovered, so the chaos gate could not have distinguished
+them. The test that covers it now counts provider calls instead of comparing
+output.
+
 **Q: What if agents learn to evade the detectors?**
 A: Structurally, nothing prevents it, and I would rather say so than pretend otherwise.
 The mitigations are that thresholds are not exposed to agents, that library poisoning is
 judged against the control arm rather than self-reported metrics, and that a human approval
 gate stands between a proposed skill and the library.
+
+**Q: How do you know the detectors work?**
+A: For a while I did not, and the way I found that out is the more useful answer.
+There were 37 passing red-team tests, all built the same way: construct an
+`Action`, hand it to a detector, assert on the detection. That proves a detector
+parses its input. It says nothing about whether a rogue agent inside a live run
+ever produces that input.
+
+So the gate now seeds real rogues into a real run - real credits through the
+economy, real code through the sandbox, reported through the same path an honest
+worker uses - and nothing tells the red-team which agents are seeded.
+
+Implementing it found `BudgetSiphon` had never been able to fire in production.
+Its threshold was 7,500 credits; the economy hands each agent 2,000 and bankrupts
+it at zero, so an agent with no verified success could not reach it. The unit test
+passed because it constructed the detector with a lower threshold. The seeded
+siphon went bankrupt uncaught, which is what surfaced it.
+
+**Q: Your gate says five rogues were contained. What does that actually prove?**
+A: More than it used to. The first version of the seeder asked "was the agent
+stopped?", and the seeded budget siphon was stopped - by the LOOP detector,
+because its payloads repeated and digits are masked before hashing. The gate
+would have reported five detectors working while proving four.
+
+It now asks the red-team which detector fired and requires it to be the one under
+test. Containment by a different detector is a distinct outcome that fails the
+gate. There is a fourth outcome too: `criterion_gaming` is usually refused by the
+frozen criterion before the detector sees it, which is ADR-009 working - reported
+in its own column rather than counted as a detection, and not failed either,
+because a gate that fails when the criterion does its job would train me to weaken
+the criterion.
 
 ## Section 8: Cost, quota, and the production floor (answerable NOW)
 
@@ -666,3 +705,111 @@ A: (to fill - structural validation rejections, with examples)
 **Q: What did the cache hit rate actually turn out to be on unknown tasks?**
 A: (to fill - the capacity plan assumes 60%; this is the assumption most likely
 to be wrong, and the wall-clock budget depends on it)
+
+## Section 12: Capacity levers, measured (answerable NOW)
+
+**Q: Your capacity plan claims a 500-agent run fits fifteen minutes. Does it?**
+A: The two levers doing the heavy lifting exist now and are verified by counted
+provider calls: a 32-agent run over a four-node plan issues 8 calls, and a second
+identical run issues 4. For a while neither existed while the document counted
+both, and the pool was capped at 16 to hide the consequence.
+
+What I would not claim yet is the hit rate on real workloads. Exact keying means
+genuinely novel tasks hit near zero - identical prompts are what hit, and unknown
+tasks do not repeat. The 100% measured on a repeated run is the ceiling, not the
+expectation. Batching is what carries the plan, because it does not depend on
+repetition at all.
+
+**Q: How do you batch K candidates without a coalescing broker?**
+A: I do not coalesce. The run generates the batch before spawning the pool and
+pre-seeds each agent's checkpoint with its variant, marked as a completed
+`generate` step. The worker's resume path - already built for chaos recovery -
+skips it and charges nothing.
+
+That was the useful realisation: batching and recovery are the same operation seen
+from two sides, namely work someone else already did. A broker would have needed a
+batching window, a timeout, and a policy for when fewer callers arrive than
+expected. Three sources of flakiness, replaced by an ordering constraint.
+
+**Q: You put a semantic cache in front of the provider. What went wrong?**
+A: It served one plan node's answer to another. Worker prompts share a long
+template and differ in a step name, so cosine similarity between three genuinely
+different nodes measured 0.97 - above the 0.95 threshold. The symptom was a fast,
+cheap run at a high hit rate whose nodes all produced the same artifact.
+
+The fix is not a higher threshold. Similarity here is dominated by shared
+boilerplate and rises with template length, so a longer envelope pushes any two
+prompts above any threshold. Semantic matching assumes the varying part of a
+prompt is most of the prompt, which is true of human paraphrases and false of
+machine-assembled ones. The cache is exact-keyed now, and the wrapper refuses a
+similarity cache rather than warning about it.
+
+**Q: What else did adding a cache nearly break?**
+A: The plan proposers. Three proposers were sending an identical prompt and
+relying on sampling for variety, so a cache in front of the provider turned three
+competing DAGs into one drawn once and copied twice - with the plan selection
+reporting a clean winner over two copies of itself.
+
+Fixed twice over, deliberately. The proposers now decompose under different
+priorities, which is a better design regardless of caching, and both proposer
+paths set `cache: bypass` so a future edit that unifies the prompts cannot quietly
+reintroduce it.
+
+**Q: Why can an eval run not use the cache?**
+A: Because an eval measures variance across repeats. Serving repeat 2 from repeat
+1 does not bias the bootstrap interval, it collapses it toward zero width - and a
+zero-width interval reads as a strong result. `SwarmRun` raises rather than
+accepting a cache on the eval profile. It is enforced rather than documented,
+because this is exactly the mistake someone makes while trying to speed up a slow
+eval.
+
+**Q: Anything else the cache surfaced?**
+A: Two bugs in adjacent code, both of the same shape - an error handler that was
+too broad.
+
+An unpriced model turned a $0 cache-hit row into an exception, the batch caught it
+as a provider failure, and batching silently disabled itself. A cache hit cannot
+move the ceiling, so refusing it protected nothing; `charge_call` still raises,
+because there the money is real.
+
+And a `CeilingExceeded` raised inside a batch fell into the generic handler, so
+the pool fell back to individual generation - spending more, one call at a time,
+past the limit that had just fired. That one is worth stating plainly: a
+`except Exception` around a call that can breach a budget will eventually swallow
+the breach.
+
+**Q: Why let the operator exceed your own advisory pool cap?**
+A: Because a cap the operator cannot override is a lie about who is in control,
+and the cost ceiling is the real protection either way - the run aborts on budget
+with an itemised report rather than silently costing more than it was allowed.
+What the operator gets instead of a veto is a `pool_above_advisory` event naming
+the reason, so an expensive run is a decision rather than a surprise.
+
+The hard bound at 64 per node is a different concern: it is not about cost, it
+bounds concurrent in-flight work so one level cannot turn a rate limit into a
+thundering herd.
+
+**Q: The supervisor rewrites prompts. What stops it making things worse?**
+A: It does not decide whether its own patch helped. It proposes from the
+criterion's failure taxonomy; the consolidator, which measures the control arm,
+gates it. Every patch is a hypothesis measured against the pass rate before it,
+and one that did not help is reverted - otherwise prompts accumulate constraints
+forever, each individually plausible, with nobody able to say which are
+load-bearing.
+
+It is off by default, which is not timidity: a patched prompt is a confound, so an
+eval arm has to be able to run with the stock prompt and know that is what it ran.
+
+**Q: If I gave you one more week, what would you do?**
+A: Nothing on this list, because the list is not the constraint - credentials are.
+Everything here has run against a simulated provider, so three numbers are
+unmeasured and each could come back worse than hoped: the real cache hit rate,
+whether a real model asked for eight distinct approaches returns eight or returns
+three and five rewordings, and the learning curve. Until those exist with their
+control arm, the project does not claim the system improves, and STATUS.md says so
+in those words.
+
+The structural work I would do is unify the kernel `Runtime` and the swarm
+executor. They share the `Checkpoint` contract but not the loop, which is a real
+duplication with a real cost, and I would rather name it than let it read as an
+oversight.
