@@ -289,3 +289,80 @@ def test_the_simulated_banner_is_driven_by_ledger_data():
     assert "cost?.simulated" in page, (
         "the SIMULATED banner must be derived from the cost report's taint flag"
     )
+
+
+# --- the no-user-auth posture (ADR-013) ------------------------------------
+
+
+def test_the_control_plane_has_no_publicly_routable_service():
+    """The run API must not be reachable except through the allowlisted path.
+
+    A LoadBalancer or NodePort pointing at the control plane would give it a
+    route of its own, bypassing both the Ingress allowlist and the reasoning
+    in ADR-013.
+    """
+    offenders = []
+    for path, doc in _all_deploy_docs():
+        if doc.get("kind") != "Service":
+            continue
+        if doc["spec"].get("type") in {"LoadBalancer", "NodePort"}:
+            offenders.append(f"{path.relative_to(REPO)}: {doc['metadata']['name']}")
+    assert offenders == [], f"publicly routable services: {offenders}"
+
+
+def test_the_ingress_allowlists_source_addresses():
+    """The dashboard is an operations console, not a public site."""
+    found = False
+    for _, doc in _all_deploy_docs():
+        if doc.get("kind") != "Ingress":
+            continue
+        annotations = doc["metadata"].get("annotations", {})
+        allowlist = annotations.get(
+            "nginx.ingress.kubernetes.io/whitelist-source-range"
+        )
+        assert allowlist, "ingress must allowlist source addresses"
+        found = True
+    assert found, "no Ingress found to check"
+
+
+def test_the_base_allowlist_fails_closed():
+    """A forgotten overlay override must lock everyone out, not let everyone in."""
+    path = DEPLOY / "k8s" / "base" / "frontend.yaml"
+    for doc in yaml.safe_load_all(path.read_text(encoding="utf-8")):
+        if doc and doc.get("kind") == "Ingress":
+            allowlist = doc["metadata"]["annotations"][
+                "nginx.ingress.kubernetes.io/whitelist-source-range"
+            ]
+            assert allowlist.startswith("127.0.0.1"), (
+                "the base allowlist must be loopback so a missing override "
+                f"fails closed, got {allowlist!r}"
+            )
+
+
+def test_the_operator_token_is_declared_but_empty_in_the_base_secret():
+    path = DEPLOY / "k8s" / "base" / "rbac-and-config.yaml"
+    for doc in yaml.safe_load_all(path.read_text(encoding="utf-8")):
+        if doc and doc.get("kind") == "Secret":
+            assert "SWARMD_API_TOKEN" in doc["stringData"]
+            assert doc["stringData"]["SWARMD_API_TOKEN"] == ""
+
+
+def test_prod_sources_the_operator_token_from_external_secrets():
+    path = DEPLOY / "k8s" / "overlays" / "prod" / "external-secrets.yaml"
+    text = path.read_text(encoding="utf-8")
+    assert "SWARMD_API_TOKEN" in text
+
+
+def test_interactive_api_docs_are_disabled_in_cluster():
+    """Docs are a live client for every endpoint, served without the token."""
+    path = DEPLOY / "k8s" / "base" / "rbac-and-config.yaml"
+    for doc in yaml.safe_load_all(path.read_text(encoding="utf-8")):
+        if doc and doc.get("kind") == "ConfigMap":
+            assert doc["data"].get("SWARMD_ENV") == "prod"
+
+
+def test_structured_logging_is_configured_in_cluster():
+    path = DEPLOY / "k8s" / "base" / "rbac-and-config.yaml"
+    for doc in yaml.safe_load_all(path.read_text(encoding="utf-8")):
+        if doc and doc.get("kind") == "ConfigMap":
+            assert doc["data"].get("SWARMD_LOG_FORMAT") == "json"

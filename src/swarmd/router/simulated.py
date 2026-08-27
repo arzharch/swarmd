@@ -69,7 +69,7 @@ class SimulatedProvider(Provider):
       answers instantly hides every concurrency and backpressure bug the
       scheduler exists to handle, so development against it would produce code
       that breaks the first time a real provider takes two seconds. Low enough
-      that a 600-call demo profile still finishes in under a minute.
+      that a 600-call standard profile still finishes in under a minute.
 
     ANATOMY: failure_rate
       Fraction of calls that raise, deterministically chosen by prompt hash.

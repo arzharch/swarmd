@@ -37,7 +37,8 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 
-from swarmd.observability import metrics
+from swarmd.observability import logs, metrics
+from swarmd.server import middleware
 from swarmd.server.hub import EventHub
 from swarmd.swarm.run import PROFILES, RunResult, SwarmRun
 
@@ -57,7 +58,7 @@ class RunRequest(BaseModel):
     """
 
     task: str = Field(min_length=1, max_length=4000)
-    profile: str = "demo"
+    profile: str = "standard"
     chaos: bool = True
     kill_rate: float = Field(default=0.2, ge=0.0, le=1.0)
     use_skills: bool = True
@@ -90,6 +91,7 @@ def create_app(
     hub: EventHub | None = None,
     provider_factory: Any = None,
     skills_path: str | None = None,
+    api_token: str | None = None,
 ) -> Any:
     """Build the FastAPI app.
 
@@ -97,7 +99,20 @@ def create_app(
     and without provider keys, and so the simulated provider can be swapped in
     by configuration rather than by editing a call site.
     """
-    app = FastAPI(title="swarmd", version="0.1.0")
+    logs.configure()
+    app = FastAPI(
+        title="swarmd",
+        version="0.1.0",
+        # No interactive docs in a deployed service. They are a live client for
+        # every endpoint, served without the operator token, to anyone who
+        # reaches the port. Useful locally; not a thing to expose.
+        docs_url="/docs" if os.environ.get("SWARMD_ENV", "dev") == "dev" else None,
+        redoc_url=None,
+        openapi_url="/openapi.json"
+        if os.environ.get("SWARMD_ENV", "dev") == "dev"
+        else None,
+    )
+    middleware.install(app, token=api_token)
     app.state.hub = hub or EventHub()
     app.state.registry = RunRegistry()
     app.state.provider_factory = provider_factory or _default_provider_factory
@@ -329,6 +344,20 @@ def create_app(
         Replays recent history on connect so a viewer arriving at minute ten of
         an eighteen-minute run sees the run so far rather than a blank page.
         """
+        # The stream carries every prompt, thought and artifact a run
+        # produces, so it is gated exactly like the mutating endpoints. A
+        # browser cannot set Authorization on a handshake, hence the query
+        # parameter and the X-Swarmd-Token header both being accepted.
+        expected = app.state.api_token
+        if expected:
+            supplied = (
+                websocket.query_params.get("token")
+                or middleware.extract_token(websocket.headers)
+            )
+            if not middleware.token_matches(supplied, expected):
+                await websocket.close(code=1008, reason="operator token required")
+                return
+
         await websocket.accept()
         subscriber = app.state.hub.subscribe(replay=True)
         try:

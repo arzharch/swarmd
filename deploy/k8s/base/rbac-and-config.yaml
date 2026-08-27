@@ -46,7 +46,6 @@ data:
   # that ADR exists to prevent, so it is set unconditionally in-cluster.
   SWARMD_REDIS_URL: "redis://swarmd-redis:6379/0"
   SWARMD_METRICS_PORT: "9464"
-  SWARMD_LOG_FORMAT: "json"
   SWARMD_COST_CEILING_USD: "0.05"
   SWARMD_OTEL_ENDPOINT: "http://otel-collector:4318"
   # Off by default. The Mistral free tier's quota is paid for in data -- see
@@ -54,6 +53,10 @@ data:
   # it here rather than in code means the decision is visible in a diff.
   SWARMD_ALLOW_DATA_TRAINING: "false"
   SWARMD_ALLOW_PAID: "false"
+  # Disables interactive API docs, which are otherwise a live client for every
+  # endpoint served without the operator token.
+  SWARMD_ENV: "prod"
+  SWARMD_LOG_FORMAT: "json"
 ---
 apiVersion: v1
 kind: Secret
@@ -67,6 +70,10 @@ metadata:
     swarmd.dev/managed-by: "replace-with-external-secrets-operator"
 type: Opaque
 stringData:
+  # Gates every mutating endpoint and the event stream. Not user auth: one
+  # principal, one credential (ADR-013). The app refuses to start bound
+  # off-host without it.
+  SWARMD_API_TOKEN: ""
   GROQ_API_KEY: ""
   GOOGLE_API_KEY: ""
   CEREBRAS_API_KEY: ""

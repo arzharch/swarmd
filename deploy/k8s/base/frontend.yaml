@@ -116,10 +116,34 @@ metadata:
     # repeatedly, and the reconnect storm looks like a backend fault.
     nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
     nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+
+    # NOT OPEN TO THE PUBLIC. The dashboard is an operations console for one
+    # operator, so the edge allowlists source addresses. Overlays replace this
+    # with the real range; the placeholder is deliberately a single loopback
+    # address so a forgotten override fails closed rather than open.
+    nginx.ingress.kubernetes.io/whitelist-source-range: "127.0.0.1/32"
+
+    # Body cap at the edge as well as in the app. Defence in depth costs
+    # nothing here and stops an oversized body before it reaches a pod.
+    nginx.ingress.kubernetes.io/proxy-body-size: "64k"
+
+    # Second rate limit, per source address, in front of the app's own. The
+    # app's limiter protects provider quota; this one protects the pod from
+    # ever having to run the request.
+    nginx.ingress.kubernetes.io/limit-rps: "20"
+    nginx.ingress.kubernetes.io/limit-connections: "20"
+
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
 spec:
   rules:
     - http:
         paths:
+          # /api is served through the SAME host as the dashboard, so the
+          # control plane never gets a route of its own. There is deliberately
+          # no separate ingress, Service of type LoadBalancer, or NodePort
+          # pointing at it -- the only way to reach the run API from outside
+          # the cluster is through this allowlisted path, and the operator
+          # token gates it even then (ADR-013).
           - path: /api
             pathType: Prefix
             backend:

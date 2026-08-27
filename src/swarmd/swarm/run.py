@@ -63,7 +63,7 @@ class Profile:
 
 PROFILES = {
     "smoke": Profile("smoke", 8, 2, 1, 60, "CI: proves the loop runs, ~2 min"),
-    "demo": Profile("demo", 500, 3, 2, 600, "the watchable run, 12-18 min"),
+    "standard": Profile("standard", 500, 3, 2, 600, "the ordinary run, 12-18 min"),
     "deep": Profile("deep", 500, 3, 3, 1800, "enough curve points, ~40 min"),
     "eval": Profile("eval", 500, 3, 2, 600, "one task within a sweep"),
 }
@@ -131,7 +131,7 @@ class SwarmRun:
         self,
         provider: Any,
         *,
-        profile: str = "demo",
+        profile: str = "standard",
         run_id: str | None = None,
         ledger_path: str | None = None,
         ceiling_usd: float = 0.05,

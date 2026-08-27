@@ -65,6 +65,16 @@ patches:
         path: /spec/template/spec/topologySpreadConstraints/0/whenUnsatisfiable
         value: DoNotSchedule
 
+  # Replace the fail-closed placeholder allowlist with the real operator
+  # range. The dashboard is an operations console, not a public site.
+  - target:
+      kind: Ingress
+      name: swarmd
+    patch: |
+      - op: replace
+        path: /metadata/annotations/nginx.ingress.kubernetes.io~1whitelist-source-range
+        value: "REPLACE_WITH_OPERATOR_CIDR"
+
   - target:
       kind: HorizontalPodAutoscaler
       name: swarmd-control-plane

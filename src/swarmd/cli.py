@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import sys
 import time
 from pathlib import Path
@@ -112,11 +113,11 @@ def main(argv: list[str] | None = None) -> int:
     swarm_run.add_argument("task", help="the task, in plain language")
     swarm_run.add_argument(
         "--profile",
-        default="demo",
-        choices=["smoke", "demo", "deep", "eval"],
+        default="standard",
+        choices=["smoke", "standard", "deep", "eval"],
         help="run size, derived from docs/CAPACITY.md rather than chosen: "
-        "smoke ~2min/60 calls (CI), demo 12-18min/600 calls (the watchable "
-        "run), deep ~40min/1800 calls (enough curve points to mean something).",
+        "smoke ~2min/60 calls (CI), standard 12-18min/600 calls, deep "
+        "~40min/1800 calls (enough curve points to mean something).",
     )
     swarm_run.add_argument(
         "--chaos", action="store_true",
@@ -167,7 +168,7 @@ def main(argv: list[str] | None = None) -> int:
         "silently consume the set reserved for acceptance.",
     )
     ev.add_argument("--profile", default="smoke",
-                    choices=["smoke", "demo", "deep", "eval"])
+                    choices=["smoke", "standard", "deep", "eval"])
     ev.add_argument("--benchmarks", default=None, metavar="PATH",
                     help="generate BENCHMARKS.md here (refuses simulated data)")
     ev.add_argument("--json", default=None, metavar="PATH",
@@ -447,13 +448,33 @@ def _serve_command(args: argparse.Namespace) -> int:
     try:
         import uvicorn
 
+        from swarmd.observability import logs
         from swarmd.server.app import create_app
+        from swarmd.server.middleware import (
+            ENV_TOKEN,
+            InsecureConfiguration,
+            require_safe_configuration,
+        )
     except ImportError:
         print("serve needs the 'serve' extra: uv sync --extra serve")
         return 2
 
+    logs.configure()
+    token = os.environ.get(ENV_TOKEN, "")
+    try:
+        require_safe_configuration(args.host, token)
+    except InsecureConfiguration as exc:
+        print(f"refusing to start: {exc}")
+        return 2
+
     app = create_app(skills_path=args.skills)
     print(f"swarmd control plane on http://{args.host}:{args.port}")
+    print(
+        "  auth:      operator token required"
+        if token
+        else "  auth:      OPEN (loopback only; set "
+        f"{ENV_TOKEN} before exposing this)"
+    )
     print(f"  stream:    ws://{args.host}:{args.port}/api/stream")
     print(f"  health:    http://{args.host}:{args.port}/healthz")
     print(f"  metrics:   http://{args.host}:{args.port}/metrics")

@@ -136,12 +136,12 @@ whole of the tiering policy.
 | Profile | Calls | Wall clock @45 RPM | Agents | Purpose |
 |---|---|---|---|---|
 | `smoke` | ~60 | ~2 min | 20 | CI on every PR; proves the loop runs end to end |
-| `demo` | ~600 | **12–18 min** | 500 | The live watchable run — full loop, chaos, red-team |
+| `standard` | ~600 | **12–18 min** | 500 | The live watchable run — full loop, chaos, red-team |
 | `deep` | ~1,800 | ~40 min | 500 | Enough curve points for a learning claim to mean anything |
 | `eval` | ~12,000 | ~4.5 hr | 500 | 100 tasks x 2 arms x 5 repeats; a batch job, not interactive |
 
-**The demo and the eval are different products.** The demo is something you
-watch. The eval is something you run overnight and read in the morning. Trying
+**The standard run and the eval are different products.** One is something
+you watch. The eval is something you run overnight and read in the morning. Trying
 to make one thing serve both is what produces a demo nobody waits through and an
 eval too small to be evidence.
 
@@ -177,14 +177,14 @@ is worse than no result.
 | `swarmd_rate_limited_total` rate | > 10% of calls | Add a provider (Cerebras first — largest free daily quota) |
 | Cache hit rate | < 40% sustained | Investigate prompt normalisation before buying capacity |
 | Daily request usage | > 80% of 15,900 | Add providers, or move `eval` to a multi-day schedule |
-| `demo` profile wall clock | > 20 min | Re-derive this document; a lever has stopped working |
+| `standard` profile wall clock | > 20 min | Re-derive this document; a lever has stopped working |
 
 ---
 
 ## 7. Assumptions, stated so they can be falsified
 
 1. **60% cache hit rate.** Measured in Phase 4 against a repeated workload. If
-   real unknown-task runs come in lower, the `demo` profile's call budget rises
+   real unknown-task runs come in lower, the `standard` profile's call budget rises
    proportionally and wall clock with it. This is the assumption most likely to
    be wrong.
 2. **K=8 batching holds quality.** Untested past Phase 7; if variant quality

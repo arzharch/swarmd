@@ -302,9 +302,9 @@ async def test_a_ledger_written_to_disk_survives_the_run(tmp_path):
 
 
 def test_profiles_are_derived_from_the_capacity_plan():
-    assert set(PROFILES) == {"smoke", "demo", "deep", "eval"}
-    assert PROFILES["smoke"].target_calls < PROFILES["demo"].target_calls
-    assert PROFILES["demo"].target_calls < PROFILES["deep"].target_calls
+    assert set(PROFILES) == {"smoke", "standard", "deep", "eval"}
+    assert PROFILES["smoke"].target_calls < PROFILES["standard"].target_calls
+    assert PROFILES["standard"].target_calls < PROFILES["deep"].target_calls
 
 
 def test_an_unknown_profile_is_refused():

@@ -105,7 +105,7 @@ export default function Dashboard() {
           aria-label="profile"
         >
           <option value="smoke">smoke · ~2 min</option>
-          <option value="demo">demo · 12–18 min</option>
+          <option value="standard">standard · 12–18 min</option>
           <option value="deep">deep · ~40 min</option>
         </select>
 

@@ -125,7 +125,7 @@ OpenRouter roughly double the daily headroom.
 
 ```bash
 uv run swarmd providers probe   # discovers what capacity actually exists
-uv run swarmd swarm run "<task>" --profile demo --chaos
+uv run swarmd swarm run "<task>" --profile standard --chaos
 uv run swarmd eval --arms both --repeats 5 --benchmarks docs/BENCHMARKS.md
 ```
 
@@ -149,7 +149,7 @@ call slots. Four levers get a 500-agent run inside that:
 | Profile | Calls | Wall clock | Use |
 |---|---|---|---|
 | `smoke` | ~60 | ~2 min | CI, every PR |
-| `demo` | ~600 | **12–18 min** | the watchable run |
+| `standard` | ~600 | **12–18 min** | the watchable run |
 | `deep` | ~1,800 | ~40 min | enough curve points to mean something |
 | `eval` | ~12,000 | ~4.5 hr | the sweep — a batch job, not interactive |
 
@@ -172,6 +172,14 @@ kubectl apply -k deploy/k8s/overlays/dev
 Chaos runs in production. Turning it off would make production the one
 environment where the recovery guarantee is never tested.
 
+**Access posture.** Single-tenant and operator-run: no user accounts, no roles,
+because there is one principal. A shared operator token gates every mutating
+endpoint and the event stream, and the service refuses to start bound off-host
+without one. The dashboard sits behind an Ingress source allowlist and the
+control plane is never given a public route. That is a decision with
+compensating controls, not an omission — [ADR-013](docs/adr/ADR-013.md) and
+[SECURITY.md](SECURITY.md).
+
 **The uncomfortable number:** infrastructure costs ~$280/month against ~$0 of
 LLM spend — about 5,600× more than inference. If the goal were minimising cost
 this belongs on Fargate. It is on EKS because the goal is operating it, and
@@ -188,13 +196,15 @@ saying so is better than pretending the architecture is cost-optimal.
 | [SLO](docs/SLO.md) | what we promise, and what we deliberately do not |
 | [RUNBOOK](docs/RUNBOOK.md) | one entry per alert |
 | [DEPLOYMENT](docs/DEPLOYMENT.md) | AWS architecture, rejected alternatives, Azure mapping |
+| [SECURITY](SECURITY.md) | threat model, sandbox limits, data retention, known gaps |
+| [PRR](docs/PRR.md) | production readiness review, honestly filled in |
 | [ADRs](docs/adr/) | the one-way doors, including two reversals |
 | [flow.md](docs/flow.md) | decision log with alternatives and follow-up questions |
 | [interview_prep.md](docs/interview_prep.md) | the questions this invites, answered |
 
 ## Status
 
-The loop runs end to end with no API key. 558 tests, ruff and mypy clean,
+The loop runs end to end with no API key. 599 tests, ruff and mypy clean,
 kernel chaos gate passing at kill-rate 0.9 with matching integrity hashes.
 
 Not yet done: a real learning curve. That needs volume — 50–200 tasks against

@@ -79,7 +79,7 @@ class SandboxLimits:
     ANATOMY: timeout_s
       Wall clock before the process tree is killed. Why 30: long enough for a
       real computation on a small dataset, short enough that a wedged candidate
-      cannot consume a run's wall-clock budget. A `demo` profile is 12-18
+      cannot consume a run's wall-clock budget. A `standard` profile is 12-18
       minutes total (docs/CAPACITY.md), so a handful of 30s timeouts is
       recoverable and a single 5-minute one is not.
 
