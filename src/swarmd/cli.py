@@ -5,11 +5,25 @@ Commands:
     swarmd demo kernel [--kill-rate F] [--tasks N] [--seed I]
         Runs the kill-and-resume determinism demo. Exit code 0 = hashes match.
 
-    swarmd approve|reject|list
-        HITL CLI — Phase 3 wires these.
+    swarmd swarm run|session
+        The flagship: one unknown task end to end, or many with learning
+        between them.
 
-    swarmd bench
-        Benchmark suite — Phase 6 wires this.
+    swarmd eval
+        Both arms over the suite, with confidence intervals. This is the
+        benchmark; an earlier version of this docstring promised a `swarmd
+        bench` that was never written, which is the same class of claim the
+        rest of this project exists to avoid making.
+
+    swarmd ledger report|verify|inspect
+        Query the append-only cost record (ADR-007).
+
+    swarmd providers probe
+        What the pool currently believes about each credential (ADR-008).
+
+    swarmd serve
+        The control plane the dashboard talks to. The service is the primary
+        surface; these commands are the same operations without a browser.
 """
 
 from __future__ import annotations
