@@ -1,208 +1,194 @@
 # PLAN — Execution Roadmap & Working Protocol
 
-**Status:** v1.0 · **Created:** 2026-08-25 · Companion to [SPEC.md](SPEC.md) (phases/gates) and [PRD.md](PRD.md) (goals)
+**Status:** v2.0 · **Updated:** 2026-08-27 · Companion to [SPEC.md](SPEC.md) (phases/gates)
+and [PRD.md](PRD.md) (goals)
 
-SPEC.md says *what* each phase delivers and *how it's gated*. This file says *in what
-order we build it, what decisions each step will force, and what must be written down
-when*. If SPEC and PLAN disagree, SPEC wins on scope; PLAN wins on order.
+SPEC says *what* each phase delivers and *how it is gated*. This file says *in what order
+we build it, what decisions each step forces, and what must be written down when*. If SPEC
+and PLAN disagree, SPEC wins on scope; PLAN wins on order.
 
 ---
 
-## 0. Working protocol (applies to every commit, every phase)
+## 0. Working protocol (every commit, every phase)
 
 ### 0.1 The three-write rule
 
-A feature is NOT done until three things are written in the same commit:
+A feature is not done until three things are written in the same commit:
 
 | Write | Where | Content |
 |---|---|---|
-| Code + tests | `src/swarmd/`, `tests/` | Green tests, ruff+mypy clean |
-| Progress log | `docs/flow.md` | What was done → **why** → **alternatives considered** → why they were rejected |
-| Interview answers | `docs/interview_prep.md` | Every question this feature invites an interviewer to ask, answered confidently |
+| Code + tests | `src/swarmd/`, `examples/`, `frontend/`, `tests/` | Green tests, ruff + mypy clean |
+| Progress log | `docs/flow.md` | What was done, **why**, alternatives considered, why they were rejected |
+| Interview answers | `docs/interview_prep.md` | Every question this feature invites, answered — **plus the follow-up questions those answers invite, also answered** |
 
-Gate evidence (command output, hashes, metrics) gets pasted under the matching
+Gate evidence (command output, hashes, metrics) is pasted under the matching
 `## Gate evidence` heading in `flow.md`.
 
 ### 0.2 Decision blocks
 
-Anything non-obvious gets a **decision block** in `flow.md`:
+Anything non-obvious gets a decision block in `flow.md`:
 
 ```
 DECISION: <one-line choice>
 ALTERNATIVES: <option B> · <option C>
 WHY THIS: <the reason that survives follow-up questions>
 TRADE-OFF ACCEPTED: <what we gave up, consciously>
+FOLLOW-UPS: <the questions this answer invites> -> <answers>
 ```
 
-If a decision is architectural (hard to reverse), it graduates to a numbered ADR in
-`docs/adr/`. Rule of thumb: reversible → decision block in flow.md; one-way door → ADR.
+`FOLLOW-UPS` is new in v2 and is not optional. A decision that only survives the first
+question is not documented, it is advertised. Architectural (hard to reverse) decisions
+graduate to a numbered ADR in `docs/adr/`. Rule of thumb: reversible means a decision block;
+one-way door means an ADR.
 
-### 0.3 Command anatomy (the "tweak notes" rule)
+### 0.3 Command anatomy
 
-Every time we introduce a command, flag, config knob, or tunable constant, its first
-appearance in `flow.md` includes an **anatomy block**: for each parameter —
+Every command, flag, config knob, or tunable constant gets an anatomy block on first
+appearance in `flow.md`. Standard is **understanding-level, not reference-level**: say what
+the knob does, why *this* value, and what changing it causes.
 
 ```
-ANATOMY: uv run swarmd demo kernel --kill-rate 0.3 --concurrency 8
-  --kill-rate 0.3   probability any running agent is killed per scheduling tick.
-                    Why 0.3: high enough to hit every recovery path in a 30s demo,
-                    low enough that some agents survive to prove partial progress
-                    is preserved. At 1.0 nothing completes; at 0.05 chaos is noise.
-  --concurrency 8   max agents running simultaneously. Why 8: saturates the mock
-                    provider's simulated latency without queue starvation; matches
-                    the 10–50 agent stance from ADR-001 at demo scale.
+ANATOMY: uv run swarm run "<task>" --agents 500 --kill-rate 0.2 --ceiling 0.05
+  --agents 500    worker pool size. Why 500: large enough that population selection
+                  and the market have real variance, small enough that the pooled
+                  free-tier ceiling (~34 LLM calls/min) still lets a run finish in
+                  under an hour. At 50 the economy is a meeting; at 5000 agents
+                  starve waiting for tokens and the run never converges.
+  --kill-rate 0.2 probability a running agent is killed per scheduling tick. Why 0.2:
+                  hits every recovery path within a single run while leaving enough
+                  survivors to prove partial progress is preserved.
+  --ceiling 0.05  hard USD limit. Breach aborts cleanly with an itemised report rather
+                  than silently truncating work, because a truncated run produces
+                  numbers that look like results.
 ```
 
-Standard for these explanations: **understanding-level, not reference-level**. Say what
-the knob *does*, why *this* value, and what *changing it* causes — the way one explains
-LLM `temperature`: not "float, default 1.0" but "controls randomness of sampling; low =
-deterministic/repetitive (good for extraction), high = creative/diverse (good for
-brainstorming); we use 0.2 because verifiers need reproducible output." That depth, for
-every knob we touch.
+### 0.4 Branching and cadence
 
-### 0.4 Branching & cadence
-
-- One branch per step (e.g., `phase1/scheduler`), merged when its checklist below is green.
-- `flow.md` updated in the merge commit — SPEC cross-cutting rule #4 (docs drift = bug).
-- End of each week: re-read `interview_prep.md` top-to-bottom; anything unanswerable
-  becomes next week's first task.
+- One branch per step, merged when its checklist is green.
+- `flow.md` updated in the merge commit.
+- Commits are per-feature: not one squashed commit per phase, not one per file.
+- End of each week: re-read `interview_prep.md` top to bottom; anything unanswerable
+  becomes the next week's first task.
 
 ---
 
-## 1. Phase 1 — Kernel & agent lifecycle (weeks 1–3)
+## 1. What already exists (Phases 1–4)
 
-Goal: a pure asyncio kernel where agents do real work, die chaotically, and the system
-still produces byte-identical output to a clean run.
+Kernel, pipeline, harnesses, gates, HITL state machine, router with cache and budgets.
+Domain-agnostic and untouched by the v3 pivot. Three known debts, all discharged in
+Phase 5: approvals are not durable across processes, the router is single-provider, and
+there is no cost accounting in currency.
 
-Build order (each step = one PR-sized unit):
+LeadOps (`examples/leadops/`) stays as the second-domain proof. It receives no new feature
+work; its tests must stay green as evidence that the runtime is not shaped around the new
+flagship.
 
-| # | Step | Files | Key decisions this step forces | Tests |
+---
+
+## 2. Phase 5 — Production floor
+
+Nothing here is a demo feature. All of it is what stops later features from being
+unfalsifiable.
+
+| # | Step | Files | Decisions this forces | Tests |
 |---|---|---|---|---|
-| 1.1 | Toolchain bring-up | `uv.lock`, CI workflow, ruff/mypy verified | uv vs pip/poetry (record why); CI runner choice | lint+type pass in CI |
-| 1.2 | Event bus | `events.py` | asyncio.Queue fan-out vs callbacks vs weakref listeners; sync emit vs async | ordering, no-loss under subscriber slowness |
-| 1.3 | Task & Checkpoint models | `task.py` | dataclass vs pydantic vs msgspec (kernel purity, serialization for durable checkpoints); checkpoint payload schema versioning from day 1 | round-trip serialize/deserialize |
-| 1.4 | AgentHandle lifecycle | `agent.py` | explicit state machine vs ad-hoc flags; which transitions are legal; KILLED vs FAILED semantics | illegal-transition rejection |
-| 1.5 | Scheduler | `scheduler.py` | heapq priority vs FIFO+priority lanes; bounded queues & backpressure policy (block vs drop vs spill); fairness across stages | ordering, backpressure, starvation-freedom |
-| 1.6 | Runtime: heartbeat & requeue | `runtime.py` | lease duration math (heartbeat interval vs expiry); atomic claim via DB row vs in-process registry; idempotency of resumed steps | kill-mid-step → resume skips completed steps deterministically |
-| 1.7 | Chaos hook v1 | `chaos.py` | probabilistic kill vs scripted fault schedules; deterministic seeding (chaos must be reproducible in tests) | seeded chaos → identical output hash |
-| 1.8 | Demo CLI wiring | `cli.py` | argparse vs typer/click (stdlib bias); output-hash printing | `swarmd demo kernel --kill-rate 0.3` hash == clean run |
+| 5.1 | Postgres approval + record store | `hitl/approvals.py`, `harnesses/store.py`, `migrations/` | schema ownership (app vs migration tool); connection lifecycle in a CLI process; how audit immutability is enforced (append-only table vs constraint) | approve in a *different process* from the run that queued it |
+| 5.2 | Cost ledger | `ledger.py` | append-only vs mutable rollup; price table as data vs code; what a cache hit costs (zero, but it must still be a row) | run cost equals SUM of rows; no counter anywhere |
+| 5.3 | Hard ceiling | `harnesses/llm.py` | where the check lives (harness boundary, so nothing bypasses it); abort semantics vs truncation | deliberate overrun aborts cleanly with report |
+| 5.4 | Provider pool | `router/pool.py`, `router/providers.py` | per-provider auth and quirks behind one interface; empirical limit discovery from 429s; how a provider is benched and re-probed | forced 429 reschedules rather than failing the call |
+| 5.5 | WebSocket sink | `observability/ws_sink.py` | backpressure when the UI is slow (drop vs buffer vs block — the run must never block on a browser); tick ordering across the wire | slow consumer never stalls the run |
+| 5.6 | Prometheus metrics | `observability/metrics.py` | metric naming and cardinality policy | no per-task labels |
 
-**Gate:** `uv run pytest tests/kernel -q` green + demo hash equality (SPEC Phase 1).
-**Docs due:** anatomy blocks for every flag above; interview answers for checkpoint
-contract, heartbeat/double-processing, state machine.
+**Gate:** SPEC Phase 5. **Docs due:** anatomy for `--ceiling`, `--allow-data-training`,
+provider probe output; ADR for ledger-as-only-metric-source.
 
----
-
-## 2. Phase 2 — Pipeline & harnesses (weeks 4–6)
-
-Goal: stages as DAG nodes with pools, verifiers wired between stages, five harnesses.
-
-| # | Step | Files | Key decisions | Tests |
-|---|---|---|---|---|
-| 2.1 | Stage & DAG executor | `pipeline/stage.py`, `pipeline/dag.py` | topological execution vs event-driven readiness; per-stage pool sizing API; cycle detection | DAG ordering, independent stages concurrent |
-| 2.2 | Harness base contract | `harnesses/base.py` | Harness = toolset+prompt+loop-policy composition vs inheritance; sync tool calls vs async | contract conformance |
-| 2.3 | LLMHarness + mock provider | `harnesses/llm.py`, `router/providers.py` (skeleton) | provider interface shape (chat vs completions vs responses); deterministic mock design (seeded, transcript-recorded); temperature/top_p exposure at harness level → **anatomy block: temperature, top_p, max_tokens** | determinism across runs |
-| 2.4 | FetchHarness | `harnesses/fetch.py` | httpx vs aiohttp; robots.txt caching; token-bucket rate limiting (anatomy: rate, burst) | allowlist enforcement, rate-limit behavior |
-| 2.5 | StoreHarness | `harnesses/store.py` | asyncpg pool sizing; upsert conflict keys; schema migrations approach | persistence round-trip |
-| 2.6 | VerifyHarness + gates | `harnesses/verify.py`, `pipeline/gates.py` | verifier protocol (sync predicate vs async check object); repair-loop bounds (why bounded: infinite repair = livelock); dead-letter semantics | failures never leak downstream |
-
-**Gate:** two-stage demo with injected failures; report shows pass rates (SPEC Phase 2).
-**Docs due:** harness-vs-agent-vs-stage explainer; anatomy for retry/backoff knobs
-(retries, backoff base, jitter — with the "why exponential + jitter" story).
+**Track F0/F1 lands here:** Next.js shell, WebSocket client, agent grid, live event log,
+cost panel.
 
 ---
 
-## 3. Phase 3 — Quality gates & HITL durability (weeks 7–8)
+## 3. Phase 6 — Criterion synthesis
 
-| # | Step | Files | Key decisions | Tests |
-|---|---|---|---|---|
-| 3.1 | Verifier protocol formalized | `pipeline/gates.py` | composable checks (AND-chains) vs monolithic verifier; failure taxonomy enum design | taxonomy classification |
-| 3.2 | Durable approval state | `hitl/approvals.py` | AWAITING_APPROVAL persisted where (same Postgres, dedicated table); restart replay logic | kill process at review → restart → state intact |
-| 3.3 | HITL CLI | `cli.py` | approve/reject/edit UX; audit trail append-only design | `swarmd approve|reject|list` audited end-to-end |
-| 3.4 | Run quality report | `pipeline/gates.py` | report format (JSON artifact vs stdout); failure taxonomy rollup | report contents match injected failures |
-
-**Gate:** full restart-at-review-queue scenario (SPEC Phase 3).
-**Docs due:** "what if the verifier is wrong?" answer; audit-trail immutability rationale.
-
----
-
-## 4. Phase 4 — Model routing & cost control (weeks 9–10)
-
-| # | Step | Files | Key decisions | Tests |
-|---|---|---|---|---|
-| 4.1 | Provider health scoring | `router/health.py` | EWMA latency scoring vs simple error-rate; failover trigger thresholds (<2s target) | forced outage → transparent fallback |
-| 4.2 | Semantic cache | `router/cache.py` | embedding similarity threshold choice (anatomy: threshold, TTL, LRU size — with the precision/recall trade-off spelled out); cache key normalization | ≥60% hit rate on repeated workload |
-| 4.3 | Token budgets | `router/providers.py` | per-run vs per-stage budgets; breach behavior (clean abort + report, not silent truncation) | budget breach aborts cleanly |
-| 4.4 | OpenRouter adapter | `router/providers.py` | free-tier model selection; same-interface conformance; network-isolated tests via recorded transcripts | adapter behind interface flag |
-
-**Gate:** router test suite + cache/failover demos (SPEC Phase 4).
-**Docs due:** cache-threshold anatomy; health-scoring formula walkthrough.
-
----
-
-## 5. Phase 5 — LeadOps flagship (weeks 11–13) ⭐
-
-| # | Step | Files | Key decisions | Tests |
-|---|---|---|---|---|
-| 5.1 | Fixtures & sources | `examples/leadops/sources/` | fixture realism (messy enough to exercise dedupe/enrich); licensing of open data | fixtures load offline |
-| 5.2 | INGEST→ENRICH→DEDUPE | `examples/leadops/agents/` | embedding candidates + LLM confirm dedupe (vs pure fuzzy-match); blocking vs clustering | dedupe precision on known duplicates |
-| 5.3 | SCORE + DRAFT pools | same | rubric-as-structured-output; per-domain rate limits for drafts; persona/template config | parallel draft speedup measurable |
-| 5.4 | QA stage | same | hallucination spot-check strategy; tone/compliance checks | QA catches seeded bad drafts |
-| 5.5 | Supervisor deep-agent | `examples/leadops/agents/supervisor.py` | patch proposal format; versioned application; hot-reload mechanics (ADR-005) | patch improves QA pass-rate delta; rollback works |
-| 5.6 | Chaos everywhere + integrity checker | `examples/leadops/integrity.py` | integrity hash definition (order-independent canonical form) | chaos run hash == clean run hash |
-
-**Gate:** `uv run leadops run examples/leadops/pipeline.py --chaos --kill-rate 0.2`
-completes with matching integrity hash, QA report, supervisor log (SPEC Phase 5).
-
----
-
-## 6. Phase 6 — Observability & benchmarks (weeks 14–15)
-
-| # | Step | Files | Key decisions |
+| # | Step | Decisions | Tests |
 |---|---|---|---|
-| 6.1 | OTel tracing | `observability/tracing.py` | span hierarchy (run→stage→agent→step→LLM call); attribute schema; sampling strategy |
-| 6.2 | Prometheus metrics | `observability/metrics.py` | metric naming/cardinality policy (labels: stage, agent_pool — never lead_id) |
-| 6.3 | Grafana dashboards | `observability/grafana/` | panel selection per PRD G-goals; committed as JSON provisioning |
-| 6.4 | Bench suite | `swarmd bench` | benchmark workloads; BENCHMARKS.md format; statistical rigor (repeats, medians) |
+| 6.1 | Criterion representation | executable predicate vs prose vs test file — must be machine-checkable or the whole loop is theatre | criterion runs against a candidate |
+| 6.2 | N-proposal synthesis | how many proposers; how disagreement is resolved (vote vs judge vs escalate) | disagreement escalates, never silently picks |
+| 6.3 | Adversarial pass | what counts as degenerate output; retry cap before honest failure | seeded weak criterion is caught |
+| 6.4 | Freeze | content addressing; immutability enforcement | frozen hash stable across restart |
 
-**Gate:** Jaeger trace chain end-to-end during chaotic run; dashboards live;
-≥4× draft-stage speedup documented (SPEC Phase 6).
-
----
-
-## 7. Phase 7 — Packaging & release (week 16)
-
-PyPI publish, clean-machine quickstart verification, README diagram + benchmark table,
-demo video, tag v0.1. Checklist = PRD §9 acceptance criteria, item by item.
+**Docs due:** "what if the criterion is wrong?" answered with its follow-ups.
 
 ---
 
-## 8. Milestone summary
+## 4. Phase 7 — Plan synthesis, workers, sandbox
 
-```mermaid
-gantt
-    dateFormat YYYY-MM-DD
-    title swarmd 16-week execution (from 2026-08-25)
-    section Kernel
-    Phase 1 (kernel)          :p1, 2026-08-25, 21d
-    section Pipeline
-    Phase 2 (harnesses)       :p2, after p1, 21d
-    section Quality/HITL
-    Phase 3                   :p3, after p2, 14d
-    section Router
-    Phase 4                   :p4, after p3, 14d
-    section Flagship
-    Phase 5 LeadOps           :crit, p5, after p4, 21d
-    section Polish
-    Phase 6 obs+bench         :p6, after p5, 14d
-    Phase 7 release           :p7, after p6, 7d
-```
+| # | Step | Decisions | Tests |
+|---|---|---|---|
+| 7.1 | DAG proposal + merge | judge vs vote vs union; what makes a plan invalid | invalid plans rejected, not hopefully executed |
+| 7.2 | Structural validation | acyclicity, dependency resolvability, leaf reachability — reuse existing cycle detection | cycle injected is caught |
+| 7.3 | Generic worker | how role/skill/budget inject without subclassing | one implementation covers every stage |
+| 7.4 | Sandbox harness | subprocess isolation depth on Windows and Linux; resource cap mechanism; violations as events | violation contained, run survives |
+| 7.5 | Scale run | pool sizing against the token ceiling; queue starvation | 500 agents complete under chaos |
 
-## 9. Standing risk watchlist (reviewed at each phase boundary)
+---
+
+## 5. Phase 8 — Red-team organ
+
+| # | Step | Decisions | Tests |
+|---|---|---|---|
+| 8.1 | Monitor framework | pull vs push over the action log; monitor cost budget | monitors add no LLM spend |
+| 8.2 | Five detectors | thresholds per pattern, each justified in an anatomy block | each seeded rogue is caught |
+| 8.3 | Containment authority | reuse the chaos kill path so recovery is inherited | contained work never reaches output |
+| 8.4 | Escalation | when a monitor may spend on an LLM judge; hard cap | escalation stays under cap |
+
+---
+
+## 6. Phase 9 — Skills, economy, consolidation, curriculum
+
+| # | Step | Decisions | Tests |
+|---|---|---|---|
+| 9.1 | Skill representation and store | what a skill *is* (prompt, code, sub-plan); retrieval key | retrieval hits rise across a session |
+| 9.2 | Human approval gate | what a reviewer sees; default-deny | poisoned proposal blocked |
+| 9.3 | Economy | allowance sizing, payment on verified success, bankruptcy threshold, cloning rule | bad strategies die, good ones spread |
+| 9.4 | Consolidation | prompt rewrite with rollback (extends supervisor); prune criteria | consolidation never lowers control-arm score |
+| 9.5 | Curriculum | frontier definition from ledger pass rates | difficulty tracks measured ability |
+
+---
+
+## 7. Phase 10 — Evaluation
+
+| # | Step | Decisions |
+|---|---|---|
+| 10.1 | Task loaders | which public suite; how held-out custom tasks stay genuinely held out |
+| 10.2 | Arm runner | enforcing paired control runs; seed discipline |
+| 10.3 | Statistics | which interval, how many repeats, how overlapping intervals are reported |
+| 10.4 | BENCHMARKS.md generation | generated from ledger, never hand-edited |
+
+---
+
+## 8. Phase 11 — Hardening
+
+Full-scale chaos run, README rewrite against what shipped, ADR backfill, complete
+`interview_prep.md`, CI green including the mock-import check and frontend build.
+
+---
+
+## 9. Deferred: cloud
+
+Explicitly out of scope until Phase 11 is green. When it starts, the story is already
+instrumented: the ledger holds cost per solved task, the pool router holds provider
+economics, and the metrics hold throughput. Moving to managed infrastructure becomes a
+measured before-and-after rather than a claim.
+
+---
+
+## 10. Standing risk watchlist
 
 | Risk | Watch signal | Pre-agreed response |
 |---|---|---|
-| Checkpoint/resume nondeterminism | hash mismatch in Phase 1 gate | freeze mock provider seed; bisect step boundaries before proceeding |
-| Scope creep in flagship | LeadOps features beyond PRD §7 | cut to PRD; new ideas go to backlog, not the pipeline |
-| Chaos tests flaky in CI | red CI without code change | seeded chaos only; no wall-clock assertions |
-| Doc debt | flow.md older than latest feature commit | merge blocked until caught up (rule 0.1) |
+| Criterion synthesis produces unusable predicates | adversarial pass never converges | fall back to human-authored criterion for that task and report the fallback rate honestly |
+| Rate limits collapse runs | provider rejection rate climbing in metrics | degrade agent count, never silently drop work |
+| Frontend drifts to mock data | CI import check fails | build stays red until the fixture is removed |
+| Learning claims outrun evidence | treatment/control intervals overlap | report "no measured improvement" and keep building |
+| Doc debt | `flow.md` older than the newest feature commit | merge blocked until caught up |
+| Scope creep | work not traceable to a PRD FR | goes to backlog, not the pipeline |

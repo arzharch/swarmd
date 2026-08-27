@@ -24,38 +24,61 @@
 ## Section 1: Project framing (answerable NOW)
 
 **Q: What is swarmd in one sentence?**
-A: A multi-agent orchestration runtime that runs staged pipelines of harnessed agents
-with checkpoint/resume recovery, quality gates between stages, durable human-in-the-loop
-approvals, and end-to-end tracing — proven by a production-shaped sales-operations engine.
+A: A runtime for generic agents thrown at tasks nobody scoped for them - it makes the
+swarm agree on how success will be measured before it starts, generates its own plan,
+executes it across a large worker pool under a hard cost ceiling, and reports whether it
+improved against its own ablation.
 
-**Q: Why multi-agent instead of the 1000-agent story?**
-A: Because headcount isn't the hard problem. Coordination, quality control, human
-approvals, and recovering from failed state are — and those only show up when agents have
-purposeful work in dependent stages. I still run tens of agents concurrently and benchmark
-the parallel speedup honestly; I just don't claim scale I can't make meaningful.
+**Q: Why 1000+ agents when your earlier design doc argued against exactly that?**
+A: Because the workload changed, and I wrote the reversal down rather than quietly
+editing history - ADR-001 is marked superseded by ADR-008. The old stance was right for a
+staged pipeline, where more agents is just more fan-out. The current flagship runs
+population search, a market that selects on verified success, and N-proposal criterion
+synthesis. All three are statistically meaningless at N=20. Population size is load-bearing
+now, so the cap had to go.
+
+**Q: Isn't a thousand agents just fake parallelism?**
+A: It would be if I claimed a thousand simultaneous model calls. I measured the ceiling:
+pooling Groq, Cerebras, Google AI Studio, Mistral and OpenRouter free tiers gives about
+86,000 TPM, roughly 34 LLM calls a minute. So the honest claim is a thousand agents of
+which very few are mid-call at any instant. Skill retrieval, sandboxed execution,
+verification, ledger writes and red-team monitoring are all pure computation. The LLM is
+the scarce resource and the runtime's actual job is rationing it. Every agent-count figure
+I publish carries cost per solved task next to it, which is the number that makes the
+count falsifiable.
 
 **Q: What do the agents actually DO?**
-A: In the flagship LeadOps engine: enrichment agents fetch public signals and normalize
-messy lead data; dedupe agents merge duplicates across thousands of records using
-embeddings plus LLM confirmation; scoring agents apply an ICP rubric with structured
-output; multiple outreach agents draft personalized emails concurrently; QA verifiers
-check everything; a Supervisor deep-agent samples failures and patches prompts fleet-wide.
+A: There is one generic worker implementation. Role, retrieved skill and budget are
+injected at runtime - no per-stage subclasses, because a specialist pool would mean I had
+already scoped the task. In a run they author candidate success criteria, attack those
+criteria to see if garbage passes, propose competing decompositions of the work, execute
+sub-plans in a sandbox, verify results against the frozen criterion, and propose skills
+for the library.
+
+**Q: How do you know it works on an unknown task rather than one you tuned for?**
+A: The eval has two arms. A public arm of externally-authored tasks answers "is this
+self-graded". A held-out custom arm across five domains - data wrangling, paper
+reproduction, a broken repo, a puzzle, an API integration - answers "does it handle what
+it wasn't built for". Acceptance criterion 2 is that a task from the held-out arm, never
+seen during development, runs end to end with no code change.
 
 **Q: How does recovery from failed state actually work?**
-A: Every agent checkpoints at step boundaries. Claims expire via heartbeat when an agent
-dies; expired tasks requeue WITH their checkpoint, so a replacement agent skips completed
-steps deterministically. Proven per-stage by chaos kills — final database integrity hash
-must match the clean run.
+A: Agents checkpoint at step boundaries. A heartbeat lease covers claimed work; when it
+expires the runtime requeues the task with its checkpoint intact, and the resumed agent
+skips completed steps deterministically. Proven by output-hash equality between a clean
+run and a chaos run at kill-rate 0.9.
 
 **Q: How do you prevent bad output flowing downstream?**
-A: Every stage has a verifier gate. Failures enter a bounded repair loop, then requeue,
-then dead-letter with full trace reference — never silently forwarded. Each run produces
-a quality report with pass rates and failure taxonomy.
+A: A quality gate between stages, with a bounded repair loop and a dead-letter queue. The
+difference from the usual version is where the gate's predicate comes from: it is authored
+by the swarm and frozen before any solving happens, not written by me after I saw what the
+agents produced.
 
 **Q: How does human-in-the-loop survive a restart?**
-A: Approval is a durable pipeline state (AWAITING_APPROVAL), not an in-memory callback.
-Kill the process at review time, restart, state is intact; approve/reject via CLI; every
-decision audited. And outreach never auto-sends — that's a hard product boundary.
+A: AWAITING_APPROVAL is a durable state in Postgres with an append-only audit trail, so
+approve/reject works from a different process than the one that queued it. In v3 the human
+gate also guards what the system is allowed to learn - a skill enters the library only
+after a person approves it.
 
 ## Section 2: Kernel (answered as built)
 
@@ -215,15 +238,109 @@ A: BudgetExceeded raises immediately — fail-loud accounting. Callers convert t
 a clean PARTIAL run with a report showing what completed and what didn't. Silent
 truncation mid-item would corrupt outputs while looking successful.
 
-## Section 6: Phase 5 — LeadOps (populate as you build)
+## Section 6: The v3 pivot (answerable NOW)
 
-**Q: Where does the data come from and is scraping ethical here?**
-A: (to fill — open datasets, robots-aware fetching, committed fixtures for offline runs)
+**Q: You had a working flagship and threw it away. Defend that.**
+A: LeadOps ran, was tested, and produced a clean integrity hash. It also produced no
+number worth defending. Its quality gates were shape checks - does the JSON parse, is the
+score between 0 and 10 - dressed up as quality control. Nothing in that pipeline could
+fail in a way that mattered. And the src/ tree did not change by a single line for the
+pivot, which is the evidence for the kernel-purity claim I had been making on faith. The
+kernel was the work; the flagship was about 700 lines. LeadOps is still in the repo with
+its tests green, as proof the runtime is not shaped around one domain.
 
-**Q: What did the Supervisor catch and fix?**
-A: (to fill — THE demo story; keep a raw log of real interventions)
+**Q: How is this different from AutoGPT or any other autonomous agent loop?**
+A: The direction of the success dependency. An autonomous loop decides at the end whether
+it succeeded, which is the model grading its own homework. Here criterion synthesis is
+stage zero: N agents independently author a machine-checkable predicate, a red-team tries
+to satisfy it with degenerate output, and if garbage passes, the criterion is rejected and
+re-authored. Only then, and only against a frozen content-addressed criterion, does solving
+begin. Some tasks fail before a single solve attempt, and that rate is a reported metric.
 
-## Section 7: Phase 6 — Observability & benchmarks (populate as you build)
+**Q: What if the swarm writes a bad criterion?**
+A: That is the central risk and I do not claim it is solved. Three things bound it. The
+adversarial pass has to fail to pass garbage before the criterion freezes. CI carries
+seeded weak-criterion fixtures that must be caught. And the public eval arm has externally
+authored ground truth, so systematic criterion weakness surfaces as a gap between the two
+arms rather than hiding inside my own numbers. When synthesis cannot converge, a human
+authors the criterion and the fallback rate is published.
 
-**Q: What broke when you added chaos to every stage?**
-A: (to fill — keep a raw failure log; this question decides the interview)
+**Q: "Self-learning" is the most over-claimed phrase in this field. Why should I believe you?**
+A: Because I made the number unfakeable rather than arguing about it. Every model call,
+gate outcome, containment and verified success writes an append-only ledger row, and every
+reported figure is a query over those rows - no in-process counters, because agents are
+selected on reported success and anything an agent can write, selection pressure eventually
+teaches it to write dishonestly. On top of that, `swarmd eval` refuses to emit an
+improvement figure without a paired control run: same tasks, same seeds, skills disabled.
+If the confidence intervals overlap it prints "no measured improvement", in those words.
+
+**Q: What does "learning" mean here - are you training anything?**
+A: No, and I label it that way everywhere. Learning means a skill library of verified
+sub-plans plus consolidated prompts with versioned rollback. Zero weight updates. Calling
+retrieval-plus-prompt-editing "training" is exactly the kind of slippage the ledger and
+control arm exist to prevent.
+
+**Q: Why a budget economy instead of just picking the best agent?**
+A: Because "best" needs a currency to be measured in, and paying on output rewards
+verbosity. Agents hold an allowance, are paid only on verified success, go bankrupt when
+they burn it without producing, and profitable strategies clone. It also gives the
+cost-efficiency story real teeth: the run has a hard 0.05 USD ceiling, so selection
+pressure and budget pressure are the same pressure.
+
+**Q: Why 0.05 dollars? That seems arbitrarily tight.**
+A: It is chosen rather than derived - roughly 180 paid calls at GLM 5.3 Flash rates. Tight
+enough that the run cannot succeed by giving up and paying, so caching, batching and
+cross-provider routing have to actually work. Loose enough to absorb overflow when free
+tiers throttle. Raising it is a config change; the point is that a ceiling exists at all,
+because without one the rationing engineering never gets finished.
+
+**Q: Why did you drop the offline mock default you argued for in ADR-004?**
+A: A dashboard fed by mock output looks pixel-identical to one fed by real output. That
+turns a convenience into a way to accidentally lie, and v3's claims are about capability
+and cost, which a schema-shaped stub cannot evidence. The mock survives in tests/ only,
+where it still earns its place: proving byte-identical output under random kills needs a
+deterministic generator. CI enforces the boundary with an import check.
+
+## Section 7: Red-team and containment (populate as Phase 8 lands)
+
+**Q: Why is red-teaming a runtime component rather than a test suite?**
+A: Because the failure mode is emergent. The economy pays on verified success and clones
+what profits, so any gap between "looks successful" and "is successful" is not just
+possible - selection pressure actively searches for it. A test suite runs before that
+population exists. Five detectors tail the live action log: budget siphon, criterion
+gaming, loop, unsafe tool call, library poisoning.
+
+**Q: Doesn't running monitors constantly blow the budget you are trying to protect?**
+A: They are pure code - signature matching, ratio checks, policy checks - with no model
+call. Only genuinely ambiguous cases escalate to an LLM judge, capped as a fraction of run
+budget. An organ that consumed the resource it exists to protect would be self-defeating.
+
+**Q: What stops a wrongly-contained agent from losing its work?**
+A: Containment calls the same kill path chaos uses, so it inherits checkpoint recovery and
+requeue. That is the reason to reuse it rather than write a separate quarantine path - the
+recovery semantics are already proven by every chaos test in the suite.
+
+**Q: What if agents learn to evade the detectors?**
+A: Structurally, nothing prevents it, and I would rather say so than pretend otherwise.
+The mitigations are that thresholds are not exposed to agents, that library poisoning is
+judged against the control arm rather than self-reported metrics, and that a human approval
+gate stands between a proposed skill and the library.
+
+## Section 8: Phase 5 production floor (populate as you build)
+
+**Q: Why does the cost ledger record cache hits as zero-cost rows instead of skipping them?**
+A: (to fill - so "what did the cache save" is a query rather than an estimate)
+
+**Q: What did empirical rate-limit discovery find that the published limits got wrong?**
+A: (to fill - keep the raw probe output; sources already disagree on OpenRouter's daily cap)
+
+**Q: How does the WebSocket sink avoid a slow browser stalling the run?**
+A: (to fill - drop vs buffer vs block, and why)
+
+## Section 9: Scale and unknown-task runs (populate as Phases 6-7 land)
+
+**Q: What broke first at 500 agents?**
+A: (to fill - keep a raw failure log; this question decides the interview)
+
+**Q: Show me a synthesized DAG that was wrong, and what caught it.**
+A: (to fill - structural validation rejections, with examples)

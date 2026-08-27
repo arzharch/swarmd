@@ -326,14 +326,147 @@ swarmd leadops --provider mock:
 
 ---
 
+## 2026-08-27 - v3 pivot: generalist swarm, unknown tasks, measured learning
+
+Flagship changed from LeadOps (sales pipeline) to a generalist swarm thrown at unknown
+tasks. PRD and SPEC rewritten to v3.0, PLAN to v2.0, ADR-006 through ADR-010 added,
+ADR-001 superseded, ADR-004 amended. Phases 1-4 code is untouched by the pivot, which is
+the strongest available evidence for the kernel-purity claim in ADR-002.
+
+DECISION: flagship is a generalist swarm on unscoped tasks, not a fixed-domain pipeline
+ALTERNATIVES: keep LeadOps and finish phases 5-6 as specified - paper-reproduction
+  pipeline (paper to code to verified claim numbers) - broader research desk
+WHY THIS: LeadOps gates were shape-checks (does the JSON parse) dressed as quality
+  gates. Nothing in it could fail in a way that mattered, so no number it produced was
+  worth defending. The generalist swarm forces the three things that are actually hard
+  and actually rare: deciding what "done" means when nobody scoped the task, generating
+  the plan instead of drawing it, and proving improvement against an ablation.
+TRADE-OFF ACCEPTED: a working, tested flagship stops being the headline. LeadOps stays
+  in examples/ with its tests green as second-domain proof, and receives no new work.
+FOLLOW-UPS:
+  Q: Isn't this just AutoGPT with more steps?
+  A: AutoGPT decides its own success at the end. Here the success criterion is authored
+     by N independent agents, attacked by a red-team that tries to satisfy it with
+     garbage, and frozen with a content hash before a single solve attempt runs
+     (ADR-009). The direction of that dependency is the whole difference.
+  Q: Why not the paper-reproduction flagship? It has objective ground truth.
+  A: It has better ground truth and a narrower claim. It only ever tests one task shape,
+     so "unknown task" stays untested. Paper reproduction survives as one domain inside
+     the custom eval arm, where it does its job without being the whole story.
+  Q: Doesn't throwing away a working flagship waste the last two weeks?
+  A: The kernel was the work. examples/leadops is roughly 700 lines against a src/ tree
+     that did not change by a line for this pivot.
+
+DECISION: reverse the 10-50 agent stance; target 1000+, ration the LLM (ADR-008)
+ALTERNATIVES: keep the 10-50 cap - scale by paying for throughput
+WHY THIS: population size is load-bearing for population search, market selection, and
+  N-proposal criterion synthesis. A market with twenty participants is a meeting.
+TRADE-OFF ACCEPTED: runs take minutes to an hour rather than seconds, because pooled
+  free-tier throughput caps at roughly 34 LLM calls per minute. This is why the live
+  dashboard exists rather than being a nice-to-have.
+FOLLOW-UPS:
+  Q: Isn't "1000 agents, most idle" fake parallelism, exactly what ADR-001 warned about?
+  A: ADR-001's concern was agent counts inflated by sleep loops doing nothing. The answer
+     here is not to cap the count but to publish cost per solved task beside it, every
+     time. An agent holding budget, lineage, and skill state is a live market
+     participant whether or not it is mid-call; idle-but-alive is its normal condition.
+  Q: What happens at saturation?
+  A: Agents block on the scheduler's bounded queue - the Phase 1 backpressure path. The
+     run degrades to fewer effective agents and reports that, rather than dropping work.
+
+DECISION: hard 0.05 USD ceiling per full run, enforced at the harness boundary
+ALTERNATIVES: no ceiling with cost reporting - per-stage soft budgets
+WHY THIS: a self-imposed ceiling is what forces the rationing engineering to be real.
+  Without it, cache hit rate and cross-provider routing are optimisations nobody has to
+  finish. With it, a run's feasibility depends on them.
+TRADE-OFF ACCEPTED: some runs will abort. The abort is clean and itemised, which is a
+  better outcome than a silently truncated run producing numbers that look like results.
+FOLLOW-UPS:
+  Q: Is 0.05 not arbitrary?
+  A: It is chosen, not derived: roughly 180 paid calls at GLM 5.3 Flash rates, which is
+     enough overflow headroom for a run whose bulk rides free tiers, and small enough
+     that it cannot be met by giving up and paying. Raising it is a config change, not
+     a redesign.
+
+RESEARCH: free-tier capacity, measured 2026-08-27
+  Groq              14,400 req/day   6,000 TPM
+  Cerebras          ~1M tokens/day   ~30,000 TPM
+  Google AI Studio  1,500 req/day    Gemini 2.5 Flash, 1M context
+  Mistral           ~1B tokens/month ~50,000 TPM, REQUIRES opting into data training
+  OpenRouter :free  20 RPM, daily cap reported inconsistently (50 / 200 / 1000)
+  Paid overflow     GLM 5.3 Flash, 0.075 USD/M in, 0.25 USD/M out, 1.31M context
+  Pooled: ~86,000 TPM, ~34 LLM calls per minute. The OpenRouter daily-cap disagreement
+  across sources is exactly why the router discovers limits from observed 429s instead
+  of trusting a constant.
+
+DECISION: mock provider confined to tests/ (ADR-006, amends ADR-004)
+ALTERNATIVES: keep mock as the default offline demo path - drop the mock entirely
+WHY THIS: a dashboard fed by mock output is pixel-identical to one fed by real output.
+  That makes the mock a way to accidentally lie, not a convenience.
+TRADE-OFF ACCEPTED: "offline-first" stops being a headline feature. It was protecting a
+  claim v3 no longer makes.
+FOLLOW-UPS:
+  Q: Doesn't this make CI flaky and networked?
+  A: Unit tests keep the mock and stay hermetic. Only the eval smoke run touches the
+     network, as a separate job, whose failure reads as a provider outage rather than a
+     code regression.
+  Q: Why keep the mock at all?
+  A: The chaos integrity gate needs a deterministic generator to prove output is
+     byte-identical under random kills. That test lives in tests/, where a double is
+     legitimate.
+
+DECISION: append-only ledger is the only source of any reported number (ADR-007)
+ALTERNATIVES: in-process counters with careful review - counters plus periodic audit
+WHY THIS: agents are selected on reported success and paid on verified success. Anything
+  an agent can write, selection pressure eventually teaches it to write dishonestly.
+  Removing the capability is cheaper than policing it.
+TRADE-OFF ACCEPTED: a write per event, and eval runs cost double because the control arm
+  is not optional. Half the compute buys the only thing that makes the other half mean
+  anything.
+FOLLOW-UPS:
+  Q: What stops the ledger itself from being wrong?
+  A: It is append-only and written at the harness boundary, below agent code. Cache hits
+     write zero-cost rows so "what did the cache save" is a query, not an estimate.
+  Q: What if treatment and control intervals overlap?
+  A: The report emits the string "no measured improvement". Deliberately that phrasing,
+     so a non-result stays visible rather than softened.
+
+ANATOMY: uv run swarm run "<task>" --agents 500 --kill-rate 0.2 --ceiling 0.05
+  --agents 500     worker pool size. Why 500: enough that population selection and the
+                   market have real variance, few enough that the ~34 calls/min pooled
+                   ceiling still lets a run finish within the hour. At 50 the economy is
+                   a meeting; at 5000 agents starve on tokens and never converge.
+  --kill-rate 0.2  probability a running agent is killed per scheduling tick. Why 0.2:
+                   hits every recovery path inside one run while leaving enough
+                   survivors to prove partial progress is preserved.
+  --ceiling 0.05   hard USD limit, checked at the harness boundary so no call path can
+                   bypass it. Breach aborts cleanly with an itemised report.
+
+ANATOMY: --allow-data-training
+  Off by default. Enables the Mistral Experiment free tier, whose quota is granted in
+  exchange for consenting to have submitted prompts used for training. Every other
+  provider in the pool is used without it. It is an explicit flag rather than a config
+  default because the cost of that tier is paid in data, not dollars, and that should
+  be a decision someone makes on purpose.
+
+---
+
 ## Next up
 
-- [x] Kernel (Phases 1.1–1.8): events, task models, lifecycle, scheduler, runtime
-      recovery, chaos, demo CLI — gate PASSED (hash equality at kill-rate 0.9)
-- [x] Pipeline phase: DAG executor, harnesses, quality gates, durable HITL,
+- [x] Kernel (Phases 1.1-1.8): events, task models, lifecycle, scheduler, runtime
+      recovery, chaos, demo CLI - gate PASSED (hash equality at kill-rate 0.9)
+- [x] Pipeline phase: DAG executor, harnesses, quality gates, HITL state machine,
       store harness, semantic cache + token budgets
-- [ ] Phase 5: LeadOps flagship — fixtures, INGEST→ENRICH→DEDUPE→SCORE→DRAFT→QA→
-      REVIEW pipeline over the kernel, supervisor agent, chaos integration,
-      integrity checker
-- [ ] Phase 6: OTel tracing + Prometheus metrics + Grafana dashboards + bench suite
-- [ ] Phase 7: packaging & release
+- [x] LeadOps: retained as second-domain proof, frozen, tests green
+- [x] v3 docs: PRD/SPEC/PLAN rewritten, ADR-006..010 added, ADR-001 superseded
+- [ ] Phase 5 - production floor: Postgres-durable approvals across processes, cost
+      ledger, hard ceiling at the harness boundary, multi-provider pool router with
+      empirical limit discovery, WebSocket event sink, Prometheus metrics
+- [ ] Track F0/F1 - Next.js shell, agent grid, live event log, cost panel
+- [ ] Phase 6 - criterion synthesis, adversarial pass, content-addressed freeze
+- [ ] Phase 7 - plan synthesis, generic worker pool, sandbox harness, 500-agent chaos run
+- [ ] Phase 8 - red-team organ: five detectors, containment via the chaos kill path
+- [ ] Phase 9 - skill library with human approval gate, economy, consolidation, curriculum
+- [ ] Phase 10 - eval harness: public + custom arms, control vs treatment, CIs
+- [ ] Phase 11 - hardening, README rewrite, full interview_prep, CI green
+- [ ] Deferred - cloud deployment (out of scope until Phase 11 is green)
