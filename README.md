@@ -1,66 +1,207 @@
 # swarmd
 
-> A multi-agent orchestration runtime: staged pipelines of harnessed agents with
-> checkpoint/resume recovery, quality gates, durable human-in-the-loop approvals,
-> and full tracing — proven by a production-shaped LeadOps engine.
+> A runtime for generic agents thrown at tasks nobody scoped for them. The
+> swarm agrees on how success will be measured *before* it starts, generates
+> its own plan, executes it across a worker pool under a hard cost ceiling, and
+> reports whether it improved against its own ablation.
 
-## Why
+## The problem
 
-Frameworks make it easy to *draw* an agent graph. Operating one reliably is the hard part:
-agents die mid-stage, bad output flows downstream without quality gates, human approvals
-vanish on restart, and "recovery" means re-running everything. `swarmd` owns that layer —
-scheduling, checkpointing, verification, approval states, and tracing — demonstrated by a
-real application, not a toy.
+Agent systems get demonstrated on tasks their authors already knew how to
+solve. The pipeline is hand-drawn, the success criterion is hand-written, and
+"the agents learned" is asserted against no control. Throw the same system at
+something nobody scoped for it and it has no way to decide what *done* means,
+no way to decompose the work, no memory that the last hundred tasks happened,
+and no way to tell a productive agent from one burning budget in a loop.
 
-## The flagship: LeadOps engine
+Meanwhile the scale demos measure headcount. Nobody publishes cost per solved
+task, and nobody runs the ablation that would show whether the swarm improved
+or the tasks got easier.
 
-A sales/leads operations pipeline over open data:
+## The loop
 
 ```
-INGEST → ENRICH → DEDUPE → SCORE → DRAFT → QA → REVIEW QUEUE (human)
+unknown task in
+  │
+CRITERIA     N agents independently author a machine-checkable criterion
+             a red-team tries to satisfy it with garbage
+             garbage passes → rejected, re-authored
+             → FROZEN, content-addressed, immutable for the run
+  │
+PLAN         competing DAG decompositions proposed
+             structurally validated → handed to the existing executor
+  │
+RETRIEVE     skill library queried (cold start: empty, and the run shows it)
+  │
+EXECUTE      one generic worker type, chaos killing them throughout
+             each spending from a budget, paid on VERIFIED success only
+  │
+GATE         the frozen criterion decides · bounded repair · dead-letter
+  │
+DISTILL      verified successes → candidate skills → A HUMAN APPROVES
+  │
+CONSOLIDATE  prompts rewritten with rollback, dead skills pruned
+  │
+CURRICULUM   next task proposed at the measured ability frontier
 ```
 
-- Parallel agent pools per stage (10–50 concurrent agents), multiple outreach agents drafting simultaneously
-- Every stage checkpointed — kill any agent mid-run and the pipeline resumes from last-good state
-- Quality gates between stages; failing items repair/requeue instead of flowing downstream
-- Outreach **never** auto-sends: review queue is a durable pipeline state that survives restarts
-- A Supervisor deep-agent samples QA failures and hot-patches stage prompts fleet-wide
+Running throughout, not as a stage: a **red-team organ** tailing the live action
+log with authority to contain agents.
 
-## The kernel (what you embed)
+## Five things that are actually unusual here
 
-| Layer | Provides |
-|---|---|
-| **Pipeline** | stage DAG, dependency + concurrency control, per-stage pools & retry policies |
-| **Kernel** | async scheduler, agent lifecycle, step-boundary checkpoints, heartbeat requeue |
-| **Harnesses** | Fetch · LLM (router w/ cache+budgets) · Store · Verify · Draft |
-| **Chaos harness** | random kills, latency injection, provider outages — first-class |
-| **Observability** | OTel spans per transition/LLM call, Prometheus metrics, Grafana dashboards |
+**The criterion is frozen before any solving happens.** Not written by a
+developer, not judged by a model at the end. N agents author it, a red-team
+tries to pass it with empty, constant, and prompt-echoing output, and it is
+rejected if garbage gets through. Some tasks fail at stage zero without a single
+solve attempt, and that rate is a reported metric. ([ADR-009](docs/adr/ADR-009.md))
+
+**No improvement claim without a control arm.** `swarmd eval` refuses to emit an
+improvement figure without a paired run — identical tasks, identical seeds,
+skills disabled. When the confidence intervals overlap it prints *"no measured
+improvement"*, in those words. ([ADR-007](docs/adr/ADR-006.md))
+
+**Every reported number is a sum over an append-only ledger.** No component
+keeps a running total. Agents are selected on reported success and paid on
+verified success, so anything an agent can write, selection pressure eventually
+teaches it to write dishonestly — removing the capability is cheaper than
+policing it.
+
+**Provider quota is a cluster resource.** Limits are per *account*, not per
+process, so three pods each politely limiting to 45 RPM present 135 to the
+account. Quota moves to Redis, evaluated as one atomic script against the Redis
+clock. ([ADR-011](docs/adr/ADR-011.md))
+
+**Synthetic data cannot pretend to be real.** The simulated provider marks every
+ledger row it produces; taint propagates row → report → dashboard banner, and
+`refuse_simulated()` raises before anything publishes a number from it.
+([ADR-012](docs/adr/ADR-012.md))
 
 ## Quickstart
 
 ```bash
-uv sync
-uv run leadops run examples/leadops/pipeline.py --chaos --kill-rate 0.2
-# → runs the full pipeline on committed open-data fixtures (offline mock provider)
+uv sync --all-extras
+
+# No API key required. Runs the entire loop on a synthetic provider whose
+# output is marked simulated everywhere it surfaces.
+SWARMD_SIMULATED_PROVIDER=true uv run swarmd swarm run \
+  "extract the numeric claims from a short report and verify each one" \
+  --profile smoke --chaos
 ```
 
-Observability stack:
+```
+* criterion_frozen 0eff8402816d7ce1
+* plan_selected    ab7f6feca1038789
+* node_finished    read
+. a0001: calling_model
+. a0001: criterion_passed
+* agent_killed
+* agent_requeued
+
+run=run-8d321c794d  status=completed  0.5s
+criterion=0eff8402816d7ce1 (2 checks, attempts=1)
+plan=ab7f6feca1038789 (4 nodes, width=2)
+nodes_passed=4/4  contained=0
+integrity_hash=ba687b1e8e66c34a
+cost=$0.000000 of $0.05 ceiling  calls=8  cache_hits=0  [SIMULATED]
+redteam: contained=0 flagged=0 llm_calls=0
+```
+
+### Watch it live
 
 ```bash
-docker compose up -d   # Jaeger · Prometheus · Grafana (dashboards in-repo)
+SWARMD_SIMULATED_PROVIDER=true uv run swarmd serve --port 8000 &
+cd frontend && npm install && npm run dev     # http://localhost:3000
 ```
+
+The dashboard renders the websocket stream or an empty state. There is no
+fixture path anywhere in it, and CI fails the build if one appears.
+
+### With real providers
+
+Copy `.env.example` to `.env` and add at least one key. Groq (14,400 req/day)
+and Google AI Studio (1,500 req/day) are free and need no card; Cerebras and
+OpenRouter roughly double the daily headroom.
+
+```bash
+uv run swarmd providers probe   # discovers what capacity actually exists
+uv run swarmd swarm run "<task>" --profile demo --chaos
+uv run swarmd eval --arms both --repeats 5 --benchmarks docs/BENCHMARKS.md
+```
+
+**A note on free tiers:** they train on submitted prompts. Mistral's tier
+requires explicitly consenting to that, which is why it sits behind
+`--allow-data-training` and is off by default.
+
+## Capacity is the design constraint
+
+The bottleneck is not CPU or money — it is someone else's rate limit. Pooled
+free tiers give roughly **45 requests/minute**, so a 15-minute run has ~675
+call slots. Four levers get a 500-agent run inside that:
+
+| Lever | Effect |
+|---|---|
+| The criterion is executable code, so verification costs nothing | −5,000 calls |
+| Batched generation: one call returns K variants | 8× |
+| Semantic cache (population search generates near-identical prompts) | ~2.5× |
+| Red-team detectors are pure code, zero model calls | the safety tax |
+
+| Profile | Calls | Wall clock | Use |
+|---|---|---|---|
+| `smoke` | ~60 | ~2 min | CI, every PR |
+| `demo` | ~600 | **12–18 min** | the watchable run |
+| `deep` | ~1,800 | ~40 min | enough curve points to mean something |
+| `eval` | ~12,000 | ~4.5 hr | the sweep — a batch job, not interactive |
+
+Full derivation, including the assumptions most likely to be wrong, in
+[docs/CAPACITY.md](docs/CAPACITY.md).
+
+## Operations
+
+Kubernetes manifests with dev/prod overlays, Terraform for EKS/RDS/Secrets
+Manager, Prometheus metrics on a private registry, two provisioned Grafana
+dashboards, alert rules where every alert has a runbook entry, and SLOs that
+promise what the system actually claims — correctness under chaos at 100% with
+no error budget, and cost per run.
+
+```bash
+docker compose up -d          # Jaeger · Prometheus · Grafana · Postgres · Redis
+kubectl apply -k deploy/k8s/overlays/dev
+```
+
+Chaos runs in production. Turning it off would make production the one
+environment where the recovery guarantee is never tested.
+
+**The uncomfortable number:** infrastructure costs ~$280/month against ~$0 of
+LLM spend — about 5,600× more than inference. If the goal were minimising cost
+this belongs on Fargate. It is on EKS because the goal is operating it, and
+saying so is better than pretending the architecture is cost-optimal.
 
 ## Docs
 
-- [`docs/PLAN.md`](docs/PLAN.md) — execution roadmap, build order, documentation protocol
-- [`docs/PRD.md`](docs/PRD.md) — goals, non-goals, acceptance criteria
-- [`docs/SPEC.md`](docs/SPEC.md) — phased spec with hard gates
-- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — design + trade-offs
-- [`docs/adr/`](docs/adr/) — decision records
-- [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) — methodology + results (fills as phases land)
-- [`docs/flow.md`](docs/flow.md) — living progress log (decision + anatomy blocks)
-- [`docs/interview_prep.md`](docs/interview_prep.md) — growing interview Q&A
+| | |
+|---|---|
+| [PRD](docs/PRD.md) | goals, non-goals, acceptance criteria |
+| [SPEC](docs/SPEC.md) | phases with hard gates |
+| [PLAN](docs/PLAN.md) | build order and the documentation protocol |
+| [CAPACITY](docs/CAPACITY.md) | why the run profiles are what they are |
+| [SLO](docs/SLO.md) | what we promise, and what we deliberately do not |
+| [RUNBOOK](docs/RUNBOOK.md) | one entry per alert |
+| [DEPLOYMENT](docs/DEPLOYMENT.md) | AWS architecture, rejected alternatives, Azure mapping |
+| [ADRs](docs/adr/) | the one-way doors, including two reversals |
+| [flow.md](docs/flow.md) | decision log with alternatives and follow-up questions |
+| [interview_prep.md](docs/interview_prep.md) | the questions this invites, answered |
 
 ## Status
 
-Pre-code. Specs complete; implementation starts at Phase 1 of SPEC.md.
+The loop runs end to end with no API key. 558 tests, ruff and mypy clean,
+kernel chaos gate passing at kill-rate 0.9 with matching integrity hashes.
+
+Not yet done: a real learning curve. That needs volume — 50–200 tasks against
+live providers — and until those numbers exist with their control arm, this
+README does not claim the system improves. That is the whole point of building
+the measurement first.
+
+Second domain: [`examples/leadops/`](examples/leadops/) is a sales pipeline on
+the same runtime, retained and green. The `src/` tree did not change by a line
+when the flagship pivoted, which is the evidence for the kernel-purity claim.

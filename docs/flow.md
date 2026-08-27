@@ -745,30 +745,268 @@ egress blocks the cloud metadata endpoint, and every alert has a runbook section
 
 ---
 
+## 2026-08-28 - Full system: Phases 5-11 built without provider keys
+
+Durable approvals, criterion synthesis, sandbox, plan synthesis, skills, economy,
+red-team, generic worker, orchestrator, control plane, Next.js dashboard, eval
+harness, consolidation, curriculum, Terraform, CI. 558 tests, ruff and mypy clean,
+full loop runs end to end on the simulated provider with no key.
+
+DECISION: SQLite as the default durable approval store, Postgres for deployment
+ALTERNATIVES: Postgres only - keep in-memory and document the gap
+WHY THIS: Phase 3's gate says kill the process at review, restart, approve via
+  CLI. It never passed: the CLI built a fresh InMemoryApprovalStore per
+  invocation, so a queued approval was invisible to the next command. A gate that
+  needs docker running to demonstrate is a gate people stop running.
+TRADE-OFF ACCEPTED: two backends to maintain. Both sit behind one protocol and
+  the state machine is untouched.
+FOLLOW-UPS:
+  Q: Why did the original tests not catch this?
+  A: They tested ApprovalManager, which was always correct. The defect was the
+     WIRING. The regression test now spans a real subprocess, because nothing
+     short of that would have caught it.
+  Q: Why WAL mode?
+  A: Without it `swarmd list` during a live run contends with the writer and
+     fails with "database is locked", which reads as a pipeline bug rather than
+     a journaling mode.
+
+DECISION: criteria are a declarative check language, not model-written Python
+ALTERNATIVES: exec model-emitted `def check(candidate)` - prose criteria judged
+  by a model at the end
+WHY THIS: four reasons in descending order of weight. A frozen criterion is a
+  run output a human may audit months later, and a typed check list can be read
+  where a page of generated Python must be comprehended. It is content-
+  addressable, so the same criterion hashes the same regardless of phrasing.
+  It cannot DO anything - executing model-written code to decide correctness, in
+  a system whose agents are selected on passing that check, is an obvious
+  exploit surface. And malformed proposals fail at parse time rather than as a
+  NameError halfway through a run.
+TRADE-OFF ACCEPTED: bounded expressiveness. A task needing a genuinely novel
+  predicate cannot be graded until a check kind is added. Preferred over running
+  arbitrary model output as the arbiter of truth.
+FOLLOW-UPS:
+  Q: What if the swarm authors a criterion nothing can satisfy?
+  A: Dead-letter rate near 100% from run start, which has its own alert and
+     runbook entry. The criterion cannot change mid-run by design; correction
+     happens between runs, visible as a new hash.
+  Q: Isn't a fixed attack list weaker than a model-generated adversary?
+  A: A model asked for garbage produces creative garbage. The boring garbage -
+     empty, constant, prompt-echo, zero-valued artifacts - is what actually
+     slips through weak checks. The structural is_weak() check backstops it.
+
+DECISION: consensus threshold uses ceil, not int
+ALTERNATIVES: truncation (the original)
+WHY THIS: int(3 * 0.5) == 1, so three proposers at 0.5 agreement required ONE
+  vote - every check any single proposer named was "agreed" and the consensus
+  mechanism agreed on nothing. Caught by a test asserting aligned proposers
+  score higher than split ones.
+
+DECISION: the sandbox is defence in depth, not a security boundary
+ALTERNATIVES: claim isolation - use a container per execution
+WHY THIS: separate process, process-tree timeout, stripped env allowlist,
+  confined tempdir, POSIX rlimits, output truncation. Real isolation is the
+  Kubernetes Job with seccomp and no network, and this is the in-process layer
+  beneath it. setrlimit does not exist on Windows, so limits_enforced reports
+  false there rather than implying protection that is absent.
+TRADE-OFF ACCEPTED: a determined attacker with code execution is not stopped by
+  this alone. Saying so is better than implying otherwise.
+FOLLOW-UPS:
+  Q: Why do artifacts travel through a file rather than stdout?
+  A: Regexing numbers out of stdout would let any program that prints a number
+     claim success. artifacts.json is the only channel from sandbox to criterion.
+  Q: Why kill the process GROUP?
+  A: A timeout that kills only the parent leaves grandchildren holding CPU, and
+     the symptom appears later as unexplained slowness in an unrelated stage.
+
+DECISION: skill retrieval is lexical with IDF, not embedding-based
+ALTERNATIVES: embedding similarity - LLM-judged relevance
+WHY THIS: an embedding call per retrieval spends the binding constraint on an
+  operation that happens many times per run. Lexical scoring is free,
+  deterministic (so chaos-integrity hashes stay comparable), and explainable to
+  the human reviewing why a skill was suggested.
+TRADE-OFF ACCEPTED: genuinely synonymous phrasings miss. Embeddings become worth
+  it when a measured miss rate says so, not before.
+
+DECISION: the economy pays only on the frozen criterion's verdict
+ALTERNATIVES: pay on output - pay on self-reported success - no economy
+WHY THIS: paying on output rewards verbosity; paying on self-report rewards
+  lying, and selection pressure finds that faster than it finds competence.
+TRADE-OFF ACCEPTED: agents can die before demonstrating anything if the
+  allowance is mis-sized, which selects for luck. Hence starting_balance at
+  roughly three calls and reward above cost.
+FOLLOW-UPS:
+  Q: Why does a parent pay for its offspring?
+  A: Free reproduction lets one lucky agent flood the population at no cost,
+     which is drift rather than selection.
+  Q: Why rank on efficiency rather than successes?
+  A: On a quota-bound system, credits per success decides what is worth
+     spreading. An agent that succeeds often but expensively is usually worse.
+
+DECISION: red-team detectors are pure code; containment reuses the chaos kill path
+ALTERNATIVES: LLM judge per action - a separate quarantine mechanism
+WHY THIS: an organ that consumed the rationed resource it protects would be
+  self-defeating, and would degrade exactly when the system is busiest. Reusing
+  the chaos kill path means containment inherits checkpoint recovery and requeue
+  already proven by every chaos test, so a wrongly-contained agent keeps its
+  completed work.
+TRADE-OFF ACCEPTED: cheap detectors miss what a judge would catch. Ambiguous
+  cases escalate, capped as a fraction of run budget.
+FOLLOW-UPS:
+  Q: What stops an agent learning to evade the detectors?
+  A: Nothing structural, and I would rather say so. Thresholds are not exposed
+     to agents, library poisoning is judged against the control arm rather than
+     self-report, and a human gate stands between a proposal and the library.
+  Q: Who watches the red-team?
+  A: Its containments are audit records subject to the same human review queue,
+     and its spend is a ledger row. Kill authority, not silent authority.
+
+DECISION: a run is a Kubernetes Job, and the dashboard is an observer
+ALTERNATIVES: Deployment - dashboard with backpressure into the run
+WHY THIS: a run has a beginning, an end and a result. The event hub drops on
+  overflow rather than blocking, because one viewer on bad wifi must not apply
+  backpressure into the agent loop.
+TRADE-OFF ACCEPTED: a saturated dashboard misses events. SLO-4 budgets 5% for
+  exactly this, and drops are counted rather than hidden.
+
+DECISION: eval refuses an improvement figure without a paired control
+ALTERNATIVES: report the treatment curve with a caveat
+WHY THIS: a curve with nothing to compare against is the single most common way
+  self-improvement claims get made. Refusing to produce one is cheaper than
+  arguing about it later.
+TRADE-OFF ACCEPTED: eval costs double. Half the compute buys the only thing
+  that makes the other half mean anything.
+FOLLOW-UPS:
+  Q: Why bootstrap rather than a t-interval?
+  A: Success rate over five runs is a proportion and cost-per-solved is skewed
+     by the occasional expensive failure. Neither is normal at n=5, and a
+     t-interval understates spread in the direction that flatters the result.
+  Q: Why pair on (task, seed)?
+  A: Task difficulty varies far more than the skills effect, so an unpaired
+     comparison buries the signal in task noise.
+  Q: What if the intervals overlap?
+  A: The report prints "no measured improvement", in those words. A non-result
+     that reads as a soft positive is worse than no measurement - it is quotable.
+
+DECISION: consolidation reverts any prompt change that lowers the control score
+ALTERNATIVES: accept changes that improve the treatment arm - allow a small
+  tolerance
+WHY THIS: a change helping only the treatment arm has taught the system to score
+  better on its own benchmark. Any tolerance above zero lets that accumulate one
+  small step at a time.
+
+BUGS FOUND BY TESTS AND BY RUNNING IT:
+  (1) Consensus threshold truncated: int(3*0.5)==1 meant a single proposer's
+      check counted as agreement, so the consensus mechanism agreed on nothing.
+  (2) Loop detector false positive: empty payloads all hashed to one signature,
+      so any agent doing bookkeeping actions was contained as a looper - which
+      also MASKED real detections, because the first detector to fire wins.
+  (3) FastAPI resolves annotations against the module namespace, so models and
+      types defined inside the app factory silently became query parameters.
+      Every POST returned 422 and every websocket handshake closed with 1008.
+  (4) The provider pool held no account, so runs reported calls=0 while
+      spending - a cost ceiling that would never have triggered.
+  (5) The simulated provider returned schema-shaped noise, which criterion
+      synthesis correctly refused. No run got past stage zero, so the "develop
+      without keys" story did not actually work until the provider learned the
+      three prompt shapes the swarm issues.
+  (6) .gitignore's `.env.*` swallowed .env.example - the one env file meant to
+      be committed was the one never committed, since the repo was created.
+  (7) The CI workflow triggered on `main` while the default branch is `master`,
+      so it had never run on a push. A pipeline that silently never fires is
+      worse than none, because it looks green.
+  (8) My own WorkLostUnderChaos alert was a false positive: the kernel demo
+      shows 595 kills against 404 requeues with a MATCHING integrity hash,
+      because an agent killed while idle has no claimed work to requeue. A gap
+      threshold would have paged during entirely healthy chaos. Now fires only
+      on requeues at exactly zero.
+  (9) mypy on Windows reported eleven errors for correct POSIX-only code;
+      pinned to platform = "linux", the deployment target.
+
+ANATOMY: --profile smoke|demo|deep|eval
+  Derived from docs/CAPACITY.md rather than chosen. The pooled free-tier ceiling
+  is ~45 requests/minute, so a profile is a statement about how many model calls
+  fit in a target wall clock: smoke ~60 calls/~2min for CI, demo ~600/12-18min
+  for the watchable run, deep ~1800/~40min for enough curve points to mean
+  anything, eval as one task inside a sweep.
+
+ANATOMY: --no-skills (and use_skills=False)
+  THE CONTROL ARM. Disables skill retrieval with everything else identical -
+  same tasks, same seeds, same chaos schedule. Every improvement figure is
+  measured against this, and swarmd eval refuses to emit one without it.
+
+ANATOMY: min_agreement 0.5 (criterion synthesis)
+  Fraction of valid proposers that must include a check for it to enter the
+  merged criterion. A check only one of three proposers thought of is as likely
+  a misreading as an insight. Requiring all of them collapses to the
+  intersection, which drifts to the weakest common denominator - usually just
+  output_nonempty, exactly what the attack stage exists to reject.
+
+ANATOMY: target band 0.4-0.7 (curriculum)
+  Above 0.7 everything passes and nothing distinguishes a good approach from a
+  lucky one. Below 0.4 almost everything dead-letters, burning quota on failures
+  that teach nothing. The band is where outcomes actually vary.
+
+### Gate evidence
+
+```
+pytest: 558 passed, 1 skipped
+ruff check .   All checks passed
+mypy src       Success: no issues found in 43 source files
+
+swarmd demo kernel --kill-rate 0.9 --tasks 40
+  clean_hash = fc290c0ca81354c4
+  chaos_hash = fc290c0ca81354c4
+  kills=595 requeues=404 ticks=594
+  INTEGRITY: MATCH
+
+SWARMD_SIMULATED_PROVIDER=true swarmd swarm run "<task>" --profile smoke --chaos
+  criterion=0eff8402816d7ce1 (2 checks, attempts=1)
+  plan=ab7f6feca1038789 (4 nodes, width=2)
+  nodes_passed=4/4 contained=0  integrity_hash=ba687b1e8e66c34a
+  cost=$0.000000 of $0.05 ceiling  calls=8  [SIMULATED]
+  redteam: contained=0 flagged=0 llm_calls=0
+
+swarmd serve + POST /api/runs -> 31 events streamed, run completed, metrics
+  exported: swarmd_llm_calls_total{provider="simulated"} 8.0
+
+swarmd eval --arms custom --repeats 2 -> 20 runs, both arms, bootstrap CIs
+  VERDICT: no measured improvement (intervals overlap)
+  BENCHMARKS.md NOT written: 20 of 20 ledger rows came from the simulated
+  provider
+
+kubectl kustomize overlays/dev  -> 23 resources
+kubectl kustomize overlays/prod -> 24 resources, 0 plain Secrets, digests pinned
+frontend: npm run build -> compiled, 4 routes
+```
+
+Not done, and named rather than buried: no live-provider run at 500 agents, so
+the capacity plan's 60% cache-hit assumption is untested; no learning curve,
+which needs 50-200 tasks against real providers; egress policy is wider than it
+should be. See docs/PRR.md for the full review including what blocks a real
+production deploy.
+
+---
+
 ## Next up
 
-- [x] Kernel (Phases 1.1-1.8) - gate PASSED (hash equality at kill-rate 0.9)
-- [x] Pipeline phase: DAG executor, harnesses, quality gates, HITL state machine
-- [x] LeadOps: retained as second-domain proof, frozen, tests green
-- [x] v3 docs: PRD/SPEC/PLAN rewritten, ADR-006..011, ADR-001 superseded
-- [x] Phase 5.2/5.3 - cost ledger, prices as data, hard ceiling
-- [x] Phase 5.4 - provider pool, empirical limit discovery, multi-credential
-- [x] Phase 5.6 - Prometheus metrics on a private registry
-- [x] Platform - Grafana dashboards, alert rules, K8s manifests, dev/prod overlays
-- [x] Docs - capacity plan, SLOs, runbook, deployment plan, ADR-011
-- [x] Simulated provider (ADR-012) + .env.example + deploy guard tests
-- [ ] Phase 5.1 - Postgres-durable approvals across processes (Phase 3's gate
-      still does not actually pass)
-- [ ] Phase 5.3b - ceiling wired through the LLM harness call path
-- [ ] Phase 5.5 - WebSocket event sink
-- [ ] Track F0/F1 - Next.js shell, agent grid, live event log, cost panel
-- [ ] Platform - Terraform for EKS/RDS/Secrets Manager, CI/CD with progressive
-      rollout, production readiness review checklist
-- [ ] Debt - FallbackRouter still lists MockProvider as last-resort, violating
-      ADR-006; goes when the pool becomes the default path
-- [ ] Phase 6 - criterion synthesis, adversarial pass, content-addressed freeze
-- [ ] Phase 7 - plan synthesis, generic worker pool, sandbox harness
-- [ ] Phase 8 - red-team organ: five detectors, containment via the kill path
-- [ ] Phase 9 - skill library with human approval gate, economy, consolidation
-- [ ] Phase 10 - eval harness: public + custom arms, control vs treatment, CIs
-- [ ] Phase 11 - hardening, README rewrite, full interview_prep, CI green
+- [x] Kernel, pipeline, harnesses, gates, HITL state machine, router
+- [x] LeadOps retained as second-domain proof, frozen, tests green
+- [x] v3 docs: PRD/SPEC/PLAN, ADR-006..012
+- [x] Phase 5: ledger, hard ceiling, provider pool, cluster quota, metrics,
+      Postgres/SQLite durable approvals, WebSocket event hub
+- [x] Phase 6: criterion synthesis with adversarial freeze
+- [x] Phase 7: sandbox harness, plan synthesis, generic worker
+- [x] Phase 8: red-team organ, five detectors, containment via the kill path
+- [x] Phase 9: skill library with human gate, economy, consolidation, curriculum
+- [x] Phase 10: eval harness, control arm mandatory, generated BENCHMARKS.md
+- [x] Track F: Next.js dashboard on the live stream, no fixture path
+- [x] Platform: Grafana, alerts, K8s manifests, Terraform, CI that fires
+- [x] Docs: capacity plan, SLOs, runbook, deployment plan, PRR, README rewrite
+- [ ] Live validation: 500-agent run against real providers; measure the actual
+      cache hit rate against the capacity plan's 60% assumption
+- [ ] The learning curve: 50-200 tasks with the control arm, then and only then
+      generate BENCHMARKS.md and make an improvement claim
+- [ ] Narrow the egress NetworkPolicy to provider CIDRs (widest control shipped)
+- [ ] Wire structured JSON logging - the ConfigMap sets it, the handler does not
+- [ ] Exercise rollback against a real cluster
+- [ ] Debt: FallbackRouter still lists MockProvider as last-resort (ADR-006)

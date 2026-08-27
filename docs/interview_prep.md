@@ -526,6 +526,135 @@ chain, the repair loop, and dead-lettering completely unexercised. That is
 exactly how a system passes all its local tests and falls over the first time it
 meets a real API. 50ms and a seeded, deterministic failure rate.
 
+## Section 10: The loop, end to end (answerable NOW)
+
+**Q: Walk me through what happens when I give this an unfamiliar task.**
+A: Nothing solves anything first. Three agents independently author a
+machine-checkable success criterion from different angles - what artifact must
+exist, what would prove it was NOT done, what number settles it objectively.
+Their proposals are merged on majority agreement; if they share no check at all
+that is escalated rather than resolved, because disagreement about what success
+means is information. A red-team then tries to satisfy the merged criterion with
+empty output, constant output, repeated tokens, the prompt echoed back, and
+zero-valued artifacts. If any of those pass, the criterion is rejected and
+re-authored. Only once something survives does it get content-addressed and
+frozen, and only then does planning start.
+
+**Q: What if it never survives?**
+A: The task fails with no solve attempt, and the reason is recorded. That is the
+correct outcome: proceeding would grade results against a criterion known to be
+weak, and every downstream number would inherit the lie. When I first wrote the
+end-to-end test I gave it a criterion of `output_nonempty` plus
+`min_distinct_words` and the run kept failing - because echoing the task passes
+both. The system was right and my test fixture was wrong.
+
+**Q: Why is the plan generated rather than written?**
+A: A hand-drawn pipeline means the task was one I already scoped. Three agents
+propose decompositions, each is structurally validated before anything runs -
+acyclic, dependencies resolvable, every node reachable from a root, bounded size
+- and invalid ones are discarded rather than executed hopefully. The winner is
+picked on computable properties: width, because wall clock is the scarce
+resource; brevity, because each node costs at least one call; and whether
+instructions name an artifact rather than describe an activity. Not judged by a
+model - that would be a second opinion with no ground truth costing a call per
+proposal.
+
+**Q: The generated plan runs on the same executor as everything else?**
+A: Yes, and that was the point of writing the Phase 2 executor to take stages as
+data. There is exactly one execution path. A parallel path for generated plans
+would mean the thing I tested and the thing that runs are different.
+
+**Q: What actually makes a 500-agent run finish in fifteen minutes?**
+A: Four levers, and the first is by far the largest. Because the criterion is
+executable code rather than prose, verification costs zero model calls - a naive
+design would spend one per check and that alone is 5,000 calls. Then batched
+generation returns K variants per call, the semantic cache absorbs the
+near-identical prompts population search produces, and the red-team detectors are
+pure code. Without those, 45 requests a minute means three and a half hours.
+
+**Q: How do you know chaos is not quietly losing work?**
+A: The integrity hash. It is order-independent, because chaos changes the order
+work completes in and must not change the result, and it excludes contained
+work. CI runs the kernel demo at kill-rate 0.9 and requires byte equality with
+the clean run - 595 kills, matching hash. That is SLO-2, and it has no error
+budget: a budget there would imply an acceptable rate of silently losing work.
+
+**Q: Something interesting from that number?**
+A: 595 kills against 404 requeues, with the hashes matching. My own alert
+compared those two counters and would have paged during entirely healthy chaos.
+An agent killed while idle has no claimed work to requeue, so the gap is normal.
+The alert now fires only on requeues at exactly zero while kills continue, which
+is unambiguous.
+
+**Q: Your fake provider drove the whole system. Isn't that testing itself?**
+A: It drove the ORCHESTRATION, and every row it produced is marked simulated -
+the eval harness refuses to generate BENCHMARKS.md from it and the dashboard
+shows a banner. What it proves is that the loop runs, chaos recovers, containment
+works, and cost is bounded. What it explicitly does not prove is capability, and
+the README says so rather than showing a curve.
+
+**Q: What is the weakest part of this?**
+A: The capacity plan assumes a 60% cache hit rate and that assumption is
+untested on real unknown-task workloads. If it comes in at 30% the demo profile
+no longer fits its wall-clock budget and every profile has to be re-derived. It
+is listed in CAPACITY.md section 7 as the assumption most likely to be wrong,
+with the metric that would falsify it.
+
+**Q: Sell me on one design decision you would defend hardest.**
+A: That criteria are a declarative check language rather than model-written
+Python. The obvious implementation is to have the model emit a check function
+and exec it. That would be inspectable only by reading generated code, would
+hash differently for a renamed variable so criteria could not be compared across
+runs, and - the real problem - would execute model-written code to decide
+correctness in a system whose agents are selected on passing that check. The cost
+is that expressiveness is bounded and a genuinely novel predicate needs a new
+check kind. I will take that over running arbitrary model output as the arbiter
+of truth.
+
+## Section 11: Operations (answerable NOW)
+
+**Q: Your CI has seven jobs. Why not one?**
+A: They are split by what a failure MEANS. A hermetic test failure is a code
+regression and blocks. The live smoke run against real providers is
+informational and continues on error, because its failure is a provider outage.
+A red build people learn to ignore is worse than no build.
+
+**Q: What did you find when you first ran CI?**
+A: That it had never run. The workflow triggered on `main`; this repository's
+default branch is `master`. It had been green-by-absence since the repo was
+created, which is the worst state for a pipeline to be in because it looks fine.
+`mypy src` had also been failing on a pre-existing type error nobody saw.
+
+**Q: You run chaos in production. Defend it.**
+A: Turning it off makes production the one environment where the recovery
+guarantee is never tested. The guarantee matters most where the work is real.
+
+**Q: Talk me through a page for ProviderPoolExhausted.**
+A: Every provider backed off for two minutes, so runs are blocked. First
+`swarmd providers probe`, which distinguishes the four causes in the order they
+actually occur: credentials rotated (note that envFrom is fixed at container
+start, so even a successful rotation needs a restart), genuine daily quota
+exhaustion, Redis lost so quota degraded to 25% local buckets, or egress
+blocked. Individual providers backing off is routine; all of them at once
+usually has one common cause.
+
+**Q: What is your most uncomfortable production number?**
+A: Infrastructure costs about 5,600 times more than inference - roughly $280 a
+month against effectively zero LLM spend. If minimising cost were the goal this
+belongs on Fargate or one VM. It is on EKS because the goal is demonstrating I
+can operate it, and I would rather say that than pretend the architecture is
+cost-optimal.
+
+**Q: Is this production ready?**
+A: No, and docs/PRR.md says which items block and why. Three things: no
+live-provider validation at 500 agents, so the capacity assumptions are
+untested; no on-call rotation, and a system with paging alerts and one
+maintainer has alerts rather than on-call; and the egress policy allows 443
+anywhere, which is the loosest control shipped. It is ready for a demo and
+evaluation deployment. The operational work is further along than the empirical
+work, and that ordering was deliberate - building the curve before the apparatus
+that makes it trustworthy is how unfalsifiable claims get made.
+
 ## Section 10: Unknown-task runs (populate as Phases 6-7 land)
 
 **Q: What broke first at 500 agents?**
