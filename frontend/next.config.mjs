@@ -18,7 +18,8 @@ const nextConfig = {
   // /api from the same host, so the browser's same-origin request reaches the
   // control plane without the frontend knowing where it lives. This rewrite
   // only reproduces that arrangement locally, where the two run on separate
-  // ports.
+  // ports. The dashboard runs on 3001 (3000 is commonly taken) and the
+  // control plane on 8000 unless SWARMD_API says otherwise.
   async rewrites() {
     if (process.env.NODE_ENV === "production") return [];
     const backend = process.env.SWARMD_API ?? "http://127.0.0.1:8000";

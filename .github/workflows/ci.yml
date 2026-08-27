@@ -45,6 +45,26 @@ jobs:
   tests:
     name: tests (hermetic)
     runs-on: ubuntu-latest
+
+    # Postgres is a SERVICE rather than a mock. The Postgres store had never
+    # once executed -- asyncpg was referenced everywhere and declared nowhere,
+    # so every import would have failed at runtime while the suite stayed green
+    # on SQLite. A path that type-checks, is documented, and has never run is
+    # exactly what a test suite exists to prevent.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: swarmd
+          POSTGRES_PASSWORD: swarmd_dev
+          POSTGRES_DB: swarmd
+        ports: ["5435:5432"]
+        options: >-
+          --health-cmd "pg_isready -U swarmd"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
@@ -52,8 +72,10 @@ jobs:
           enable-cache: true
       - run: uv sync --all-extras
       - name: pytest
-        # No network. Every test here uses a double or a fake, so a failure is
-        # unambiguously a code regression.
+        # No provider network. Every LLM call uses a double, so a failure is
+        # unambiguously a code regression rather than an outage.
+        env:
+          SWARMD_TEST_DATABASE_URL: postgres://swarmd:swarmd_dev@localhost:5435/swarmd
         run: uv run pytest -q --timeout=120
 
   chaos-gate:

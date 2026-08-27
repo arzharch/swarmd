@@ -49,10 +49,18 @@ services:
       POSTGRES_PASSWORD: swarmd_dev
       POSTGRES_DB: swarmd
     ports:
-      # Host port 5434 (NOT the default 5432/5433) so swarmd never collides with
-      # other projects' Postgres instances on this machine. Inside the compose
-      # network it's still plain 5432.
-      - "5434:5432"
+      # Host port 5435. Not 5432/5433 (other projects) and not 5434, which is
+      # already taken by another compose stack on this machine -- discovered by
+      # the bind failing, which is the only reliable way to learn this.
+      # Inside the compose network it is still plain 5432.
+      - "5435:5432"
+    volumes:
+      # NAMED VOLUME, not a bind mount and not ephemeral. Without it a
+      # `docker compose down` discards the approval queue, the audit trail and
+      # every checkpoint -- the three things the whole HITL durability story
+      # rests on. An audit trail that disappears with a container restart is
+      # not an audit trail.
+      - swarmd-postgres:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U swarmd"]
       interval: 5s
@@ -70,3 +78,10 @@ services:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       retries: 10
+
+volumes:
+  # Declared so the database survives the compose lifecycle. Redis deliberately
+  # has none: it holds only 5-minute TTL quota buckets, and persisting them
+  # would mean a stale bucket from a dead deployment throttling a live one
+  # (ADR-011).
+  swarmd-postgres:

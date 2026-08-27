@@ -41,7 +41,7 @@ spec:
           image: swarmd-frontend:latest
           ports:
             - name: http
-              containerPort: 3000
+              containerPort: 3001
           env:
             # Same-origin path, proxied by the Ingress. Baking an absolute
             # backend URL into the client would break every environment that
