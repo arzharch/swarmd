@@ -148,6 +148,31 @@ def main(argv: list[str] | None = None) -> int:
     swarm_run.add_argument("--json", action="store_true",
                            help="emit the full report as JSON")
 
+    ev = sub.add_parser("eval", help="run the evaluation suite with a control arm")
+    ev.add_argument(
+        "--arms", default="both", choices=["both", "public", "custom"],
+        help="public answers 'is this self-graded?'; custom answers 'does it "
+        "handle what it was not built for?'. Reported separately so a strong "
+        "result on one cannot hide a weak result on the other.",
+    )
+    ev.add_argument(
+        "--repeats", type=int, default=5,
+        help="runs per task per arm. Below 3 a bootstrap interval is "
+        "meaningless; each repeat costs a full run against a ~45 req/min "
+        "ceiling, so 100 tasks x 2 arms x 5 repeats is most of a day's quota.",
+    )
+    ev.add_argument(
+        "--holdout", action="store_true",
+        help="include the held-out tasks. Opt-in so a routine eval cannot "
+        "silently consume the set reserved for acceptance.",
+    )
+    ev.add_argument("--profile", default="smoke",
+                    choices=["smoke", "demo", "deep", "eval"])
+    ev.add_argument("--benchmarks", default=None, metavar="PATH",
+                    help="generate BENCHMARKS.md here (refuses simulated data)")
+    ev.add_argument("--json", default=None, metavar="PATH",
+                    help="write the full report as JSON")
+
     serve = sub.add_parser("serve", help="run the control plane and event stream")
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8000)
@@ -230,6 +255,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "swarm":
         return asyncio.run(_swarm_command(args))
+
+    if args.command == "eval":
+        return asyncio.run(_eval_command(args))
 
     if args.command == "serve":
         return _serve_command(args)
@@ -360,6 +388,58 @@ def _print_event(event: dict[str, Any]) -> None:
                   "containment", "agent_killed", "node_finished"}:
         detail = event.get("hash") or event.get("node") or event.get("reason") or ""
         print(f"  * {kind} {detail}")
+
+
+async def _eval_command(args: argparse.Namespace) -> int:
+    """Run both arms over the suite and report with confidence intervals."""
+    _ensure_examples_importable()
+    from examples.tasks.suite import suite
+    from swarmd.harnesses.sandbox import SandboxHarness
+    from swarmd.ledger import SimulatedDataRefused
+    from swarmd.router.pool import ProviderPool
+    from swarmd.swarm.evaluate import Evaluator
+    from swarmd.swarm.run import SwarmRun
+
+    try:
+        pool = ProviderPool.from_env()
+    except RuntimeError as exc:
+        print(f"no provider capacity: {exc}")
+        return 2
+
+    sandbox = SandboxHarness()
+
+    async def run_factory(task: Any, use_skills: bool, seed: int) -> Any:
+        run = SwarmRun(
+            pool,
+            profile=args.profile,
+            use_skills=use_skills,
+            sandbox=sandbox,
+            run_id=f"eval-{task.task_id}-{seed}-{'t' if use_skills else 'c'}",
+        )
+        result = await run.run(task.prompt)
+        return result, run.report(result)
+
+    tasks = suite(arms=args.arms, include_holdout=args.holdout)
+    print(f"evaluating {len(tasks)} tasks x {args.repeats} repeats x 2 arms "
+          f"= {len(tasks) * args.repeats * 2} runs")
+
+    report = await Evaluator(run_factory, repeats=args.repeats).evaluate(tasks)
+    await pool.aclose()
+
+    print()
+    print(report.render())
+
+    if args.json:
+        report.write_json(args.json)
+        print(f"\nwrote {args.json}")
+    if args.benchmarks:
+        try:
+            report.write_benchmarks(args.benchmarks)
+            print(f"wrote {args.benchmarks}")
+        except SimulatedDataRefused as exc:
+            print(f"\nBENCHMARKS.md NOT written: {exc}")
+            return 1
+    return 0
 
 
 def _serve_command(args: argparse.Namespace) -> int:
