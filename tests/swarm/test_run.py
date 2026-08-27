@@ -403,3 +403,183 @@ async def test_a_pool_produces_the_evidence_distillation_requires(tmp_path):
 
     assert result.proposed_skills, "a pool should yield repeatable-approach evidence"
     assert library.pending()
+
+
+# --- checkpoint recovery (PRD G7) -------------------------------------------
+
+
+class CountingProvider(ScriptedProvider):
+    """Counts worker generations so a redo is visible as a number."""
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.worker_calls = 0
+
+    async def complete(self, request):
+        if "STEP:" in request.prompt:
+            self.worker_calls += 1
+        return await super().complete(request)
+
+
+class KillOnce:
+    """Kills the first agent of the run, then never again."""
+
+    def __init__(self):
+        self.kills = 0
+
+    def should_kill(self):
+        if self.kills == 0:
+            self.kills += 1
+            return True
+        return False
+
+
+async def test_a_killed_node_resumes_rather_than_repeating_the_model_call():
+    """PRD G7: completed work is never redone.
+
+    The worker checkpoints after generating. A replacement receiving that
+    checkpoint must reuse the text rather than pay for it again -- which is the
+    difference between resuming and merely being deterministic enough that a
+    redo produces the same answer.
+    """
+    from swarmd.swarm.criteria import Criterion
+    from swarmd.swarm.economy import Economy
+    from swarmd.swarm.planner import PlanNode
+    from swarmd.swarm.worker import GenericWorker, WorkerContext
+
+    provider = CountingProvider()
+    criterion = Criterion.from_dict(STRONG_CRITERION)
+    economy = Economy()
+    node = PlanNode(name="solve", instruction="produce out.json")
+
+    first = economy.spawn()
+    context = WorkerContext(
+        provider=provider, criterion=criterion, economy=economy, max_repairs=0
+    )
+    outcome = await GenericWorker(first.agent_id, context).execute("t", node)
+    assert provider.worker_calls == 1
+    assert outcome.checkpoint is not None
+    assert "generate:1" in outcome.checkpoint.completed_steps
+
+    # A replacement resuming from that checkpoint must NOT call the model.
+    replacement = economy.spawn()
+    resumed = await GenericWorker(replacement.agent_id, context).execute(
+        "t", node, checkpoint=outcome.checkpoint
+    )
+    assert provider.worker_calls == 1, "the replacement redid the model call"
+    assert resumed.passed
+    assert resumed.credits_spent == 0.0, "the replacement paid for skipped work"
+
+
+async def test_a_resumed_agent_says_so_in_its_reasoning():
+    """An operator watching the dashboard must see recovery, not a silent retry."""
+    from swarmd.swarm.criteria import Criterion
+    from swarmd.swarm.economy import Economy
+    from swarmd.swarm.planner import PlanNode
+    from swarmd.swarm.worker import GenericWorker, WorkerContext
+
+    economy = Economy()
+    context = WorkerContext(
+        provider=CountingProvider(),
+        criterion=Criterion.from_dict(STRONG_CRITERION),
+        economy=economy,
+        max_repairs=0,
+    )
+    node = PlanNode(name="solve", instruction="produce out.json")
+    first = await GenericWorker(economy.spawn().agent_id, context).execute("t", node)
+    resumed = await GenericWorker(economy.spawn().agent_id, context).execute(
+        "t", node, checkpoint=first.checkpoint
+    )
+    assert "resumed" in [t["decision"] for t in resumed.thoughts]
+
+
+async def test_a_kill_between_generating_and_grading_reuses_the_generation():
+    """The interesting recovery case.
+
+    A checkpoint holding a PASSED grade short-circuits the whole attempt, which
+    is a stronger skip. This covers the partial one: generated but not yet
+    graded, so the replacement must reuse the text and grade it rather than
+    calling the model again.
+    """
+    from swarmd.swarm.criteria import Criterion
+    from swarmd.swarm.economy import Economy
+    from swarmd.swarm.planner import PlanNode
+    from swarmd.swarm.worker import GenericWorker, WorkerContext
+    from swarmd.task import Checkpoint
+
+    provider = CountingProvider()
+    economy = Economy()
+    context = WorkerContext(
+        provider=provider,
+        criterion=Criterion.from_dict(STRONG_CRITERION),
+        economy=economy,
+        max_repairs=0,
+    )
+    node = PlanNode(name="solve", instruction="produce out.json")
+
+    first = await GenericWorker(economy.spawn().agent_id, context).execute("t", node)
+    assert provider.worker_calls == 1
+    assert first.checkpoint is not None
+
+    # Truncate to the moment just after generating: killed before grading.
+    partial = Checkpoint(
+        task_id=node.name,
+        agent_id="dead",
+        completed_steps=["generate:1"],
+        data={"generate:1": first.checkpoint.data["generate:1"]},
+    )
+    resumed = await GenericWorker(economy.spawn().agent_id, context).execute(
+        "t", node, checkpoint=partial
+    )
+
+    assert provider.worker_calls == 1, "the replacement redid the model call"
+    assert "skipped_generate" in [t["decision"] for t in resumed.thoughts]
+    assert resumed.passed
+
+
+async def test_the_run_carries_a_checkpoint_across_a_chaos_kill():
+    """End to end: chaos kills, the replacement resumes, the node still passes."""
+    provider = CountingProvider()
+    run = SwarmRun(provider, profile="smoke", chaos=KillOnce())
+    result = await run.run("summarise the source records")
+
+    assert result.status == "completed"
+    assert all(r.passed for r in result.results)
+
+
+async def test_recovery_is_bounded_so_relentless_chaos_terminates():
+    """A run where chaos always wins must end rather than spin forever."""
+    class AlwaysKill:
+        def should_kill(self):
+            return True
+
+    run = SwarmRun(ScriptedProvider(), profile="smoke", chaos=AlwaysKill())
+    result = await run.run("summarise the source records")
+
+    assert result.status == "completed"          # the run itself finished
+    assert not any(r.passed for r in result.results)
+    assert any("recovery bound" in f for r in result.results for f in r.failures)
+
+
+async def test_checkpoints_are_json_serialisable():
+    """A checkpoint that cannot round-trip through a store only works in memory,
+    which is the one case where it is not needed."""
+    import json
+
+    from swarmd.swarm.criteria import Criterion
+    from swarmd.swarm.economy import Economy
+    from swarmd.swarm.planner import PlanNode
+    from swarmd.swarm.worker import GenericWorker, WorkerContext
+
+    economy = Economy()
+    context = WorkerContext(
+        provider=ScriptedProvider(),
+        criterion=Criterion.from_dict(STRONG_CRITERION),
+        economy=economy,
+        max_repairs=0,
+    )
+    outcome = await GenericWorker(economy.spawn().agent_id, context).execute(
+        "t", PlanNode(name="solve", instruction="produce out.json")
+    )
+    assert outcome.checkpoint is not None
+    json.dumps(outcome.checkpoint.to_dict())

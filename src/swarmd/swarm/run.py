@@ -44,6 +44,7 @@ from swarmd.swarm.synthesis import (
     SynthesisFailed,
 )
 from swarmd.swarm.worker import GenericWorker, WorkerContext, WorkerResult
+from swarmd.task import Checkpoint
 
 logger = logging.getLogger(__name__)
 
@@ -165,6 +166,11 @@ class SwarmRun:
         # through the SAME store and audit trail as every other human decision
         # rather than only landing in the library's pending list.
         self.approvals = approvals
+        # Times a single node may be killed and resumed before the run gives
+        # up on it. Why 5: enough that even a 0.9 kill rate makes progress,
+        # since each resume keeps the work already checkpointed, but bounded so
+        # a run where chaos always wins terminates instead of spinning forever.
+        self.max_recoveries = 5
         # Verified successes required on one node before a skill is proposed.
         # Why 2: one success can be luck, and a skill distilled from luck is a
         # superstition every future run inherits.
@@ -377,19 +383,53 @@ class SwarmRun:
                 )
                 self._emit("agent_spawned", agent_id=account.agent_id, node=name)
 
-                if self.chaos is not None and self.chaos.should_kill():
-                    self.economy.kill(account.agent_id, reason="chaos")
-                    metrics.record_kill(source="chaos")
-                    self._emit("agent_killed", agent_id=account.agent_id,
-                               source="chaos")
-                    # Requeue with a fresh agent: the work is not lost, which
-                    # is the whole recovery guarantee.
-                    metrics.record_requeue(stage=name)
-                    account = self.economy.spawn(traits={"node": name})
-                    self._emit("agent_requeued", agent_id=account.agent_id, node=name)
+                # Chaos can strike at any point, so the agent runs until it is
+                # killed, and its checkpoint carries whatever it finished. The
+                # replacement RESUMES from that checkpoint rather than starting
+                # the node again: an expensive model call or sandbox execution
+                # that completed before the kill is reused, not repeated.
+                #
+                # This is what makes "completed work is never redone" true of
+                # the flagship and not only of the kernel demo.
+                carried: Checkpoint | None = None
+                attempts_left = self.max_recoveries
 
-                worker = GenericWorker(account.agent_id, context)
-                outcome = await worker.execute(task, node)
+                while True:
+                    worker = GenericWorker(account.agent_id, context)
+                    if self.chaos is not None and self.chaos.should_kill():
+                        # Killed BEFORE finishing. Whatever the worker had
+                        # checkpointed survives in `carried`.
+                        self.economy.kill(account.agent_id, reason="chaos")
+                        metrics.record_kill(source="chaos")
+                        self._emit(
+                            "agent_killed", agent_id=account.agent_id,
+                            source="chaos",
+                            completed_steps=(
+                                list(carried.completed_steps) if carried else []
+                            ),
+                        )
+                        attempts_left -= 1
+                        if attempts_left <= 0:
+                            # Bounded: a run where chaos always wins must end
+                            # rather than spin. Reported as a failed node.
+                            return WorkerResult(
+                                agent_id=account.agent_id, node=name,
+                                candidate=empty_candidate(), passed=False,
+                                failures=("killed past the recovery bound",),
+                            )
+                        metrics.record_requeue(stage=name)
+                        account = self.economy.spawn(traits={"node": name})
+                        self._emit(
+                            "agent_requeued", agent_id=account.agent_id, node=name,
+                            resuming_from=(
+                                len(carried.completed_steps) if carried else 0
+                            ),
+                        )
+                        continue
+
+                    outcome = await worker.execute(task, node, checkpoint=carried)
+                    carried = outcome.checkpoint
+                    break
                 metrics.record_gate(
                     stage=name, outcome="pass" if outcome.passed else "fail"
                 )

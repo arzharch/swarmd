@@ -24,13 +24,15 @@ system degrades exactly when the system is busiest.
 **Containment reuses the chaos kill path.** It does not implement quarantine,
 so containment and chaos are one mechanism with one set of tests.
 
-  HONEST LIMIT, because an earlier version of this docstring overstated it:
-  in the KERNEL that kill path carries checkpoint recovery and requeue, proven
-  at kill-rate 0.9 with byte-identical output. The swarm flagship does not yet
-  run its nodes through the kernel Runtime, so a contained agent's node is
-  REDONE by a fresh agent rather than resumed from a checkpoint. The result is
-  still correct -- the integrity hash matches a clean run -- but the work is
-  repeated, not recovered. Tracked as G-3 in docs/STATUS.md.
+  That kill path carries checkpoint recovery and requeue: the contained
+  agent's replacement resumes from its checkpoint rather than redoing the
+  node, so an expensive model call that completed before containment is not
+  paid for twice. Proven in the kernel at kill-rate 0.9 with byte-identical
+  output, and in the swarm by
+  tests/swarm/test_run.py::test_a_killed_node_resumes_rather_than_repeating_the_model_call,
+  which counts provider calls rather than trusting that identical output
+  implies recovered work. An earlier version of this docstring claimed the
+  swarm half before it was true; the test exists so the claim can fail.
 """
 
 from __future__ import annotations
@@ -345,9 +347,9 @@ class RedTeam:
 
     `kill` is injected rather than implemented: it is the chaos harness's kill
     function, so containment and chaos share one mechanism and one set of tests.
-    In the kernel that path also carries checkpoint recovery; in the swarm
-    flagship it does not yet, so a contained agent's node is redone rather than
-    resumed (docs/STATUS.md G-3).
+    That path carries checkpoint recovery in both the kernel and the swarm, so
+    a contained agent's completed steps are inherited by its replacement rather
+    than repeated.
     """
 
     def __init__(

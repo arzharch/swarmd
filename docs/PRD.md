@@ -65,7 +65,7 @@ per solved task.
 | G4 | Measurable self-learning | Treatment arm (skills on) beats control arm (skills off) on the same tasks and seeds, reported with confidence intervals |
 | G5 | Rogue containment | Seeded rogue behaviours (budget siphon, criterion gaming, loop, unsafe call, library poisoning) are detected and contained; contained agents cannot affect run output |
 | G6 | Hard cost ceiling | Full flagship run completes at **≤ $0.05**; breach aborts cleanly with a report, never silently truncates |
-| G7 | Recovery under chaos | Kill agents at any rate; skill library, ledger, and approvals survive; results are unchanged (integrity hash matches). *Completed work is never redone in the kernel, proven at kill-rate 0.9; the swarm flagship currently repeats a killed node rather than resuming it — docs/STATUS.md G-3* |
+| G7 | Recovery under chaos | Kill agents at any rate; skill library, ledger, and approvals survive; results are unchanged (integrity hash matches). Completed work is never redone: the kernel proven at kill-rate 0.9, the swarm flagship verified by counting provider calls across a kill, bounded at 5 resumes per node so relentless chaos terminates |
 | G8 | Live observability | Every agent's reasoning, action, and observation visible in real time in the web UI, sourced from the real event stream |
 
 ## 6. Non-goals

@@ -208,11 +208,12 @@ saying so is better than pretending the architecture is cost-optimal.
 The loop runs end to end with no API key. 708 tests, ruff and mypy clean,
 kernel chaos gate passing at kill-rate 0.9 with matching integrity hashes.
 
-One claim to qualify: the kernel's checkpoint recovery is real and proven at
-kill-rate 0.9, but the swarm flagship does not yet route its nodes through it
-— a killed node is redone by a fresh agent rather than resumed. Results are
-unchanged either way (the integrity hash matches), but the work is repeated.
-Tracked as G-3 in [docs/STATUS.md](docs/STATUS.md).
+Checkpoint recovery holds in both halves: the kernel at kill-rate 0.9 with
+byte-identical output, and the swarm flagship, where a killed agent's
+replacement resumes from its checkpoint. That second claim is tested by
+counting provider calls rather than by comparing output, because identical
+output only proves the work was deterministic — not that it was recovered
+instead of repeated.
 
 Not yet done: a real learning curve. That needs volume — 50–200 tasks against
 live providers — and until those numbers exist with their control arm, this

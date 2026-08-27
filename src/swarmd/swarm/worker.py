@@ -30,6 +30,7 @@ from swarmd.swarm.economy import Bankrupt, Economy, estimate_cost
 from swarmd.swarm.planner import PlanNode
 from swarmd.swarm.redteam import Action, RedTeam
 from swarmd.swarm.skills import Skill, SkillLibrary
+from swarmd.task import Checkpoint
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +77,9 @@ class WorkerResult:
     contained: bool = False
     failures: tuple[str, ...] = ()
     skill_used: str = ""
+    # Progress at the moment this result was produced. Handed to a replacement
+    # agent when the original is killed, so completed steps are not redone.
+    checkpoint: Checkpoint | None = None
     thoughts: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -145,9 +149,39 @@ class GenericWorker:
 
     # -- execution ----------------------------------------------------------
 
-    async def execute(self, task: str, node: PlanNode) -> WorkerResult:
-        """Run one plan node. Bounded repairs; grading is not ours to do."""
+    async def execute(
+        self,
+        task: str,
+        node: PlanNode,
+        checkpoint: Checkpoint | None = None,
+    ) -> WorkerResult:
+        """Run one plan node, checkpointing at every step boundary.
+
+        THE GUARANTEE, and the reason this is not a plain loop: a killed
+        agent's completed work is not redone. The replacement receives the dead
+        agent's checkpoint and SKIPS every step already in it, so an expensive
+        model call or sandbox execution that finished before the kill is reused
+        rather than repeated.
+
+        Steps are attempt-scoped (generate:1, materialise:1, generate:2)
+        because a repair round is genuinely new work: a kill during attempt two
+        must resume at attempt two with attempt one's result intact, not
+        restart the whole node.
+
+        Uses the kernel's Checkpoint contract -- same type, same
+        skip-completed-steps semantics, same schema versioning -- so the
+        recovery proven at kill-rate 0.9 by the kernel demo is the same
+        mechanism operating here rather than a second implementation of it.
+        """
         ctx = self.context
+        cp = checkpoint or Checkpoint(task_id=node.name, agent_id=self.agent_id)
+        if cp.completed_steps:
+            self._think(
+                "resumed",
+                f"resuming from a checkpoint with {len(cp.completed_steps)} "
+                f"completed step(s): {', '.join(cp.completed_steps)}",
+            )
+
         skills = ctx.skills.retrieve(f"{task} {node.instruction}") if ctx.skills else []
         skill_used = skills[0].skill_id if skills else ""
         if skills:
@@ -162,58 +196,105 @@ class GenericWorker:
         candidate = Candidate()
 
         for attempt in range(1, ctx.max_repairs + 2):
+            generate_step = f"generate:{attempt}"
+            materialise_step = f"materialise:{attempt}"
+            grade_step = f"grade:{attempt}"
+
+            # An attempt already graded before the kill is skipped whole.
+            if grade_step in cp.completed_steps:
+                graded = cp.data[grade_step]
+                if graded.get("passed"):
+                    candidate = _candidate_from(cp.data.get(materialise_step, {}))
+                    return self._result(
+                        node, candidate, True, attempt, spent, (), skill_used,
+                        checkpoint=cp,
+                    )
+                failures = tuple(graded.get("failures", ()))
+                continue
+
             prompt = self.build_prompt(task, node, skills, failures)
-            cost = estimate_cost(prompt, ctx.max_tokens)
 
-            if not ctx.economy.can_afford(self.agent_id, cost):
-                self._think("out_of_budget", f"needed {cost:.0f} credits, cannot afford")
-                return self._result(
-                    node, candidate, False, attempt, spent, failures, skill_used
+            # -- step: generate --------------------------------------------
+            if generate_step in cp.completed_steps:
+                text = str(cp.data[generate_step])
+                self._think(
+                    "skipped_generate",
+                    f"attempt {attempt} was generated before the kill; reusing "
+                    f"it rather than paying for it twice",
                 )
+            else:
+                cost = estimate_cost(prompt, ctx.max_tokens)
+                if not ctx.economy.can_afford(self.agent_id, cost):
+                    self._think(
+                        "out_of_budget",
+                        f"needed {cost:.0f} credits, cannot afford",
+                    )
+                    return self._result(
+                        node, candidate, False, attempt, spent, failures,
+                        skill_used, checkpoint=cp,
+                    )
+                try:
+                    ctx.economy.spend(self.agent_id, cost, stage=node.name)
+                except Bankrupt:
+                    self._think("bankrupt", "agent exhausted its allowance")
+                    return self._result(
+                        node, candidate, False, attempt, spent, failures,
+                        skill_used, checkpoint=cp,
+                    )
+                spent += cost
 
-            try:
-                ctx.economy.spend(self.agent_id, cost, stage=node.name)
-            except Bankrupt:
-                self._think("bankrupt", "agent exhausted its allowance")
-                return self._result(
-                    node, candidate, False, attempt, spent, failures, skill_used
+                self._think(
+                    "calling_model",
+                    f"attempt {attempt} of {ctx.max_repairs + 1} for step "
+                    f"{node.name!r}",
                 )
-            spent += cost
+                text = await self._call(prompt)
+                cp = cp.with_step(generate_step, text)
 
-            self._think(
-                "calling_model",
-                f"attempt {attempt} of {ctx.max_repairs + 1} for step {node.name!r}",
-            )
-            text = await self._call(prompt)
+                if self._observe(
+                    Action(
+                        agent_id=self.agent_id, kind="llm_call", stage=node.name,
+                        credits=cost, payload=prompt,
+                    )
+                ):
+                    return self._result(
+                        node, candidate, False, attempt, spent, failures,
+                        skill_used, contained=True, checkpoint=cp,
+                    )
 
-            if self._observe(
-                Action(
-                    agent_id=self.agent_id, kind="llm_call", stage=node.name,
-                    credits=cost, payload=prompt,
-                )
-            ):
-                return self._result(
-                    node, candidate, False, attempt, spent, failures,
-                    skill_used, contained=True,
-                )
+            # -- step: materialise -----------------------------------------
+            if materialise_step in cp.completed_steps:
+                candidate = _candidate_from(cp.data[materialise_step])
+            else:
+                candidate = await self._materialise(text, node)
+                cp = cp.with_step(materialise_step, _candidate_to(candidate))
 
-            candidate = await self._materialise(text, node)
+                if self._observe(
+                    Action(
+                        agent_id=self.agent_id, kind="sandbox_exec",
+                        stage=node.name, payload=text,
+                        detail={
+                            "sandbox_violation": candidate.artifacts.pop(
+                                "_violation", ""
+                            )
+                        },
+                    )
+                ):
+                    return self._result(
+                        node, candidate, False, attempt, spent, failures,
+                        skill_used, contained=True, checkpoint=cp,
+                    )
 
-            if self._observe(
-                Action(
-                    agent_id=self.agent_id, kind="sandbox_exec", stage=node.name,
-                    payload=text,
-                    detail={"sandbox_violation": candidate.artifacts.pop(
-                        "_violation", "")},
-                )
-            ):
-                return self._result(
-                    node, candidate, False, attempt, spent, failures,
-                    skill_used, contained=True,
-                )
-
-            # The frozen criterion decides. Not the worker.
+            # -- step: grade -----------------------------------------------
+            # The frozen criterion decides. Not the worker. Free to evaluate,
+            # so it is checkpointed for resume ordering rather than for cost.
             verdict = ctx.criterion.evaluate(candidate)
+            failure_list = [f"{o.kind}: {o.detail}" for o in verdict.failures]
+            cp = cp.with_step(
+                grade_step,
+                {"passed": verdict.passed, "failures": failure_list},
+            )
+
             if verdict.passed:
                 self._think("criterion_passed", verdict.summary())
                 contained = self._observe(
@@ -229,17 +310,18 @@ class GenericWorker:
                     ctx.skills.record_use(skill_used, success=not contained)
                 return self._result(
                     node, candidate, not contained, attempt, spent, (),
-                    skill_used, contained=contained,
+                    skill_used, contained=contained, checkpoint=cp,
                 )
 
-            failures = tuple(f"{o.kind}: {o.detail}" for o in verdict.failures)
+            failures = tuple(failure_list)
             self._think("criterion_failed", verdict.summary())
 
         ctx.economy.settle(self.agent_id, verified_success=False, stage=node.name)
         if ctx.skills and skill_used:
             ctx.skills.record_use(skill_used, success=False)
         return self._result(
-            node, candidate, False, ctx.max_repairs + 1, spent, failures, skill_used
+            node, candidate, False, ctx.max_repairs + 1, spent, failures,
+            skill_used, checkpoint=cp,
         )
 
     # -- helpers ------------------------------------------------------------
@@ -311,8 +393,10 @@ class GenericWorker:
         skill_used: str,
         *,
         contained: bool = False,
+        checkpoint: Checkpoint | None = None,
     ) -> WorkerResult:
         return WorkerResult(
+            checkpoint=checkpoint,
             agent_id=self.agent_id,
             node=node.name,
             candidate=candidate,
@@ -324,6 +408,31 @@ class GenericWorker:
             skill_used=skill_used,
             thoughts=list(self.thoughts),
         )
+
+
+def _candidate_to(candidate: Candidate) -> dict[str, Any]:
+    """Checkpoint payloads must be JSON-serialisable.
+
+    A checkpoint that cannot round-trip through a durable store is one that
+    only works in memory, which is the single case where it is not needed.
+    """
+    return {
+        "output": candidate.output,
+        "artifacts": candidate.artifacts,
+        "exit_code": candidate.exit_code,
+        "stdout": candidate.stdout,
+        "stderr": candidate.stderr,
+    }
+
+
+def _candidate_from(data: dict[str, Any]) -> Candidate:
+    return Candidate(
+        output=str(data.get("output", "")),
+        artifacts=dict(data.get("artifacts") or {}),
+        exit_code=data.get("exit_code"),
+        stdout=str(data.get("stdout", "")),
+        stderr=str(data.get("stderr", "")),
+    )
 
 
 def _extract_code(text: str) -> str:

@@ -47,7 +47,7 @@ cd frontend && npm run dev
 | FR-7 | Provider pool router | **DONE** | `router/pool.py` + `router/quota.py`. Five providers, per-credential quota, empirical 429 discovery, tier ordering, Redis coordination. 63 tests |
 | FR-8 | Live UI | **DONE** | Next.js, six views, websocket only, no fixture path (CI-enforced). Runs, decisions, cost, traceability, evals & sessions, harness |
 | FR-9 | Eval harness | **DONE** | `swarm/evaluate.py`. Both arms, bootstrap CIs, paired on (task, seed), refuses a claim without a control, generates BENCHMARKS.md. 29 tests |
-| FR-10 | Recovery | **PARTIAL** | Proven in the **kernel** at kill-rate 0.9 with byte-identical output. **Not in the swarm flagship** — see G-3, the most significant gap in this document |
+| FR-10 | Recovery | **DONE** | Kernel at kill-rate 0.9, byte-identical. Swarm workers checkpoint at `generate/materialise/grade` step boundaries; a killed agent's replacement resumes, verified by counting provider calls across a kill rather than by comparing output. Bounded at 5 resumes/node |
 
 ---
 
@@ -77,7 +77,7 @@ cd frontend && npm run dev
 | 5 | Full run at or under $0.05, itemised by provider | **PASS structurally** — ceiling enforced and itemised; unverified against paid traffic since nothing has cost anything yet |
 | 6 | Eval shows treatment vs control with CIs on both arms | **PASS** — verified over HTTP: 10 runs, both arms, "no measured improvement" |
 | 7 | Frontend replays a live run, zero mock data paths | **PASS** — verified live; three CI guards enforce the no-fixture rule |
-| 8 | Kill mid-run, restart, state intact | **PARTIAL** — approvals, ledger, skills and criteria all survive; **the run itself cannot resume** (G-3) |
+| 8 | Kill mid-run, restart, state intact | **PASS** — approvals, ledger, skills and criteria survive; the run resumes from the killed agent's checkpoint rather than repeating the node |
 
 ---
 
@@ -112,30 +112,35 @@ missing `swarmd ledger` commands, which were fixed earlier this session.
 **Fix:** a `--seed-rogues` flag that injects the five behaviours into the worker
 pool. Est. small.
 
-### G-3 · The swarm flagship does not use the kernel's checkpoint recovery
-**Blocks:** acceptance criterion 8; PRD G7 as literally worded.
+### G-3 · ~~The swarm flagship does not use the kernel's checkpoint recovery~~ CLOSED
 
-This is the most significant finding of the audit, and it contradicts a comment
-in the codebase.
+Was the most significant finding of this audit, and the one place the project
+said something untrue. Recorded rather than deleted, because the interesting
+part is how it hid.
 
-`SwarmRun` does **not** use the kernel `Runtime`, writes **no checkpoints**, and
-on a chaos kill spawns a fresh agent that redoes the node from scratch. The
-integrity hash matches the clean run because the work is deterministic and
-repeated — **not** because partial progress was recovered.
+**What was wrong:** `SwarmRun` wrote no checkpoints. On a chaos kill it spawned
+a fresh agent that redid the node from scratch. The integrity hash still matched
+the clean run — which is exactly why nobody noticed. Deterministic work redone
+produces the same bytes as work recovered, so the existing chaos gate could
+never have caught this. `redteam.py` claimed containment "inherits checkpoint
+recovery"; PRD G7 claimed completed work is never redone.
 
-`redteam.py` says containment "inherits checkpoint recovery and requeue". In the
-kernel that is true and proven at kill-rate 0.9. In the swarm path there is no
-checkpoint to inherit. PRD G7 says "completed work never redone"; in the
-flagship, killed work **is** redone.
+**Fix:** `GenericWorker.execute` now takes a `Checkpoint` — the kernel's type,
+with the kernel's skip-completed-steps semantics, not a second implementation —
+and checkpoints at attempt-scoped steps (`generate:1`, `materialise:1`,
+`grade:1`). Attempt scoping matters: a repair round is genuinely new work, so a
+kill during attempt two resumes at attempt two with attempt one intact. A
+checkpoint holding a passed grade short-circuits the whole attempt.
 
-What is genuinely true today: chaos does not corrupt or lose results, and the
-kernel's recovery is real and tested. What is overclaimed: that the flagship
-resumes rather than repeats.
+`run_agent` carries the checkpoint across kills, bounded at `max_recoveries=5`
+so a run where chaos always wins terminates as a failed node rather than
+spinning. Payloads are JSON round-trippable, since a checkpoint that cannot
+reach a durable store only works in memory — the one case it is not needed for.
 
-**Fix:** either run swarm nodes through the kernel `Runtime` so they checkpoint
-at step boundaries, or correct the claim in the PRD, the red-team docstring and
-the README. The first is the right answer; the second must happen immediately if
-the first is deferred. Est. large.
+**How the claim is now falsifiable:** the test counts provider calls, not
+output bytes. `test_a_kill_between_generating_and_grading_reuses_the_generation`
+asserts `worker_calls == 1` after a resume, so a regression to redoing the work
+fails the suite instead of passing it silently.
 
 ### G-4 · No live-provider validation
 **Blocks:** acceptance criteria 2 and 5; every number in the project.
@@ -165,9 +170,6 @@ propose patches. PRD §7 lists it under the flagship.
 **Before it can be shown as finished:**
 
 1. G-2 (`--seed-rogues`) — small, closes a SPEC gate and an acceptance criterion.
-2. G-3 (checkpoint recovery, or correct the claim) — the honesty issue. Nothing
-   else in this list matters as much, because it is the one place the project
-   currently says something that is not true.
 3. G-1 (batching + cache) — makes the capacity plan accurate.
 4. G-4 (live run + curve) — needs your keys.
 
@@ -193,5 +195,7 @@ document.
   audit trail. Fixed.
 - **Port 5434 was already taken** by another stack, contradicting the comment
   claiming it avoided collisions. Moved to 5435.
-- **G-3 above** — the checkpoint-recovery claim in `redteam.py` is not true of
-  the swarm path.
+- **The checkpoint-recovery claim in `redteam.py`, the PRD and the README was
+  not true of the swarm path.** The chaos gate could not have caught it: redone
+  deterministic work hashes identically to recovered work. Fixed, and the new
+  test counts provider calls so the claim can fail.
