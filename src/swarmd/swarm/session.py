@@ -36,6 +36,7 @@ from typing import Any
 
 from swarmd.swarm.consolidate import Consolidator, Curriculum
 from swarmd.swarm.skills import SkillLibrary
+from swarmd.swarm.supervisor import WORKER_STAGE, Supervisor
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +79,7 @@ class SessionRun:
 class SessionReport:
     runs: list[SessionRun] = field(default_factory=list)
     consolidations: list[dict[str, Any]] = field(default_factory=list)
+    supervisions: list[dict[str, Any]] = field(default_factory=list)
     frontier: list[dict[str, Any]] = field(default_factory=list)
     started_ts: float = field(default_factory=time.time)
     duration_s: float = 0.0
@@ -124,6 +126,7 @@ class SessionReport:
             "first_third": self.window(0, third),
             "last_third": self.window(total - third, total),
             "consolidations": self.consolidations,
+            "supervisions": self.supervisions,
             "frontier": self.frontier,
             "detail": [r.to_dict() for r in self.runs],
             "claim": (
@@ -197,6 +200,7 @@ class SwarmSession:
         *,
         approvals: Any = None,
         consolidate_every: int = 5,
+        supervisor: Supervisor | None = None,
         auto_approve: bool = False,
         curriculum: Curriculum | None = None,
         skills_enabled: bool = True,
@@ -208,6 +212,19 @@ class SwarmSession:
         self.auto_approve = auto_approve
         self.curriculum = curriculum or Curriculum()
         self.consolidator = Consolidator(library)
+        # Fleet self-correction. Off unless one is supplied, because a patched
+        # prompt is a confound: an eval arm must be able to run with the stock
+        # prompt and know that is what it ran with.
+        from swarmd.swarm.worker import WORKER_SYSTEM
+
+        self.supervisor = supervisor
+        if self.supervisor is not None:
+            if not self.supervisor.base_prompt:
+                self.supervisor.base_prompt = WORKER_SYSTEM
+            self.consolidator.register_prompt(
+                WORKER_STAGE, self.supervisor.base_prompt
+            )
+        self._pending_patch: str = ""  # patch_id awaiting its measurement
         self.skills_enabled = skills_enabled
         if auto_approve:
             logger.warning(
@@ -221,7 +238,12 @@ class SwarmSession:
         outcomes: list[bool] = []
 
         for index, task in enumerate(tasks):
-            result, run_report = await self.run_factory(task, index)
+            # The supervisor's current prompt goes INTO the run. A patch
+            # that never reaches a worker is a report, not a correction.
+            prompt = self.supervisor.base_prompt if self.supervisor else ""
+            result, run_report = await self.run_factory(task, index, prompt)
+            if self.supervisor is not None:
+                self.supervisor.observe(result.results)
 
             # Counted from what workers ACTUALLY used, not from a separate
             # pre-run query. An earlier version queried the library with the
@@ -276,10 +298,65 @@ class SwarmSession:
                 report.frontier.append(
                     {"after_run": index, **self.curriculum.observe(outcomes).to_dict()}
                 )
+                supervision = self._supervise(index)
+                if supervision is not None:
+                    report.supervisions.append(supervision)
                 outcomes = []
 
         report.duration_s = time.monotonic() - started
         return report
+
+    def _supervise(self, index: int) -> dict[str, Any] | None:
+        """Measure the last patch, then propose the next one.
+
+        ORDER MATTERS. Measuring first means a patch is judged against the
+        window that ran under it, before the taxonomy is reset by a new
+        proposal. Proposing first would measure every patch against a window
+        that included runs from before it existed, which flatters early
+        patches and buries late ones.
+        """
+        if self.supervisor is None:
+            return None
+
+        record: dict[str, Any] = {"after_run": index}
+
+        if self._pending_patch:
+            effective = self.supervisor.measure(self._pending_patch)
+            record["measured"] = {"patch_id": self._pending_patch,
+                                  "effective": effective}
+            if effective is False:
+                # A patch is a hypothesis, and this one failed. Reverting keeps
+                # the prompt from accumulating constraints nobody can attribute
+                # an improvement to.
+                self.supervisor.rollback(self._pending_patch)
+                history = self.consolidator.prompts.get(WORKER_STAGE)
+                if history is not None:
+                    history.rollback()
+                record["rolled_back"] = self._pending_patch
+            self._pending_patch = ""
+
+        if not self.supervisor.should_intervene():
+            record["intervened"] = False
+            record["taxonomy"] = self.supervisor.taxonomy()
+            return record
+
+        patch = self.supervisor.propose()
+        if patch is None:
+            # Failures clustered on kinds the supervisor has no guidance for.
+            # Saying so is more useful than an empty patch, because it names
+            # the gap in GUIDANCE that someone should fill.
+            record["intervened"] = False
+            record["unaddressable"] = self.supervisor.taxonomy()
+            return record
+
+        history = self.consolidator.prompts.get(WORKER_STAGE)
+        if history is not None:
+            history.propose(patch.text, patch.rationale)
+        self.supervisor.record(patch)
+        self._pending_patch = patch.patch_id
+        record["intervened"] = True
+        record["patch"] = patch.to_dict()
+        return record
 
     async def _auto_approve(self) -> None:
         """Approve pending skills without a human. Development only.

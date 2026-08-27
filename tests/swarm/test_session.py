@@ -46,7 +46,7 @@ def library(tmp_path):
 
 
 def _factory(solved=True, cost=0.001, proposed=(), attempts=1, skill_used=""):
-    async def run_factory(task, index):
+    async def run_factory(task, index, system_prompt=""):
         return (
             FakeResult(
                 solved=solved, attempts=attempts, proposed=proposed,
@@ -80,7 +80,7 @@ async def test_the_ablation_state_travels_with_the_numbers(library):
 
 
 async def test_simulated_runs_are_marked_in_the_session_report(library):
-    async def run_factory(task, index):
+    async def run_factory(task, index, system_prompt=""):
         return FakeResult(), {"cost": {"total_usd": 0.0, "simulated": True}}
 
     report = await SwarmSession(run_factory, library).run(["t"] * 3)
@@ -231,7 +231,7 @@ async def test_skills_used_counts_what_workers_actually_retrieved(library):
     retrieve per node instruction, so the session reported 0 while skills were
     in use. A reported figure that does not match the run is worse than none.
     """
-    async def run_factory(task, index):
+    async def run_factory(task, index, system_prompt=""):
         result = FakeResult()
         result.results = [
             type("R", (), {"passed": True, "attempts": 1, "node": "solve",
@@ -249,7 +249,7 @@ async def test_skills_used_counts_what_workers_actually_retrieved(library):
 
 
 async def test_the_control_arm_reports_no_skill_use_even_if_workers_had_some(library):
-    async def run_factory(task, index):
+    async def run_factory(task, index, system_prompt=""):
         result = FakeResult()
         result.results = [
             type("R", (), {"passed": True, "attempts": 1, "node": "solve",

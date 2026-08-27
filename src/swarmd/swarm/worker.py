@@ -58,6 +58,11 @@ class WorkerContext:
     skills: SkillLibrary | None = None
     sandbox: Any = None
     run_id: str = ""
+    # The worker system prompt. An INPUT rather than a constant because the
+    # supervisor rewrites it between runs: a prompt that cannot be replaced
+    # cannot be improved, and a supervisor whose patches never reach a worker
+    # is a report generator.
+    system: str = WORKER_SYSTEM
     max_tokens: int = 512
     temperature: float = 0.7
     # Repair rounds inside a single node before giving up on this agent's
@@ -331,7 +336,7 @@ class GenericWorker:
 
         request = LLMRequest(
             prompt=prompt,
-            system=WORKER_SYSTEM,
+            system=self.context.system,
             temperature=self.context.temperature,
             max_tokens=self.context.max_tokens,
             metadata={"agent_id": self.agent_id, "stage": "worker"},

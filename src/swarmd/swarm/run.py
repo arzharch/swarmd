@@ -45,7 +45,12 @@ from swarmd.swarm.synthesis import (
     FrozenCriterion,
     SynthesisFailed,
 )
-from swarmd.swarm.worker import GenericWorker, WorkerContext, WorkerResult
+from swarmd.swarm.worker import (
+    WORKER_SYSTEM,
+    GenericWorker,
+    WorkerContext,
+    WorkerResult,
+)
 from swarmd.task import Checkpoint
 
 logger = logging.getLogger(__name__)
@@ -152,6 +157,7 @@ class SwarmRun:
         seed_rogues: str = "",
         agents: int | None = None,
         cache: Any = None,
+        system_prompt: str = "",
     ) -> None:
         if profile not in PROFILES:
             raise ValueError(f"unknown profile {profile!r}; known: {sorted(PROFILES)}")
@@ -181,6 +187,9 @@ class SwarmRun:
                 "responses across repeats collapse the bootstrap interval and "
                 "turn a measurement into an artefact of the first sample"
             )
+        # Empty means the stock prompt. A session hands in the supervisor's
+        # current version, which is how a patch reaches the fleet.
+        self.system_prompt = system_prompt
         self.cache = cache
         if cache is not None:
             from swarmd.router.cached import CachedProvider
@@ -441,7 +450,7 @@ class SwarmRun:
         prices is what agents choose to do -- repairs -- which is where they
         actually differ.
         """
-        from swarmd.swarm.worker import WORKER_SYSTEM, GenericWorker
+        from swarmd.swarm.worker import GenericWorker
 
         # Skills retrieved ONCE for the batch rather than per agent. Every
         # agent in a pool queries the same library with the same node text, so
@@ -460,7 +469,7 @@ class SwarmRun:
             k=k,
             max_tokens=context.max_tokens,
             temperature=context.temperature,
-            system=WORKER_SYSTEM,
+            system=context.system,
             stage=node.name,
         )
         if batch.variants:
@@ -502,6 +511,7 @@ class SwarmRun:
             sandbox=self.sandbox,
             run_id=self.run_id,
             max_repairs=self.profile.max_repairs,
+            system=self.system_prompt or WORKER_SYSTEM,
         )
 
         results: list[WorkerResult] = []

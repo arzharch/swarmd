@@ -71,6 +71,11 @@ class SessionRequest(BaseModel):
     use_skills: bool = True
     auto_approve: bool = False
     ceiling_usd: float = Field(default=0.05, gt=0.0)
+    # Fleet self-correction: the supervisor rewrites the worker prompt when
+    # criterion failures cluster, and reverts a rewrite that did not help.
+    # Off by default because a patched prompt is a confound -- an arm must be
+    # able to run with the stock prompt and know that is what it ran with.
+    supervisor: bool = False
 
 
 class ConfigPatch(BaseModel):
@@ -346,6 +351,7 @@ def _session_runner(app: FastAPI, request: SessionRequest, registry: JobRegistry
         from swarmd.swarm.run import SwarmRun
         from swarmd.swarm.session import SwarmSession
         from swarmd.swarm.skills import SkillLibrary
+        from swarmd.swarm.supervisor import Supervisor
 
         pool = app.state.provider_factory()
         library = SkillLibrary(app.state.skills_path)
@@ -353,7 +359,9 @@ def _session_runner(app: FastAPI, request: SessionRequest, registry: JobRegistry
         sandbox = SandboxHarness()
         completed = 0
 
-        async def run_factory(task: str, index: int) -> Any:
+        async def run_factory(
+            task: str, index: int, system_prompt: str = ""
+        ) -> Any:
             nonlocal completed
             run = SwarmRun(
                 pool,
@@ -369,6 +377,7 @@ def _session_runner(app: FastAPI, request: SessionRequest, registry: JobRegistry
                 # repeats collapse the bootstrap interval.
                 cache=app.state.cache,
                 run_id=f"{job.job_id}-{index:03d}",
+                system_prompt=system_prompt,
                 on_event=app.state.hub.publish,
             )
             result = await run.run(task)
@@ -388,6 +397,7 @@ def _session_runner(app: FastAPI, request: SessionRequest, registry: JobRegistry
             consolidate_every=request.consolidate_every,
             auto_approve=request.auto_approve,
             skills_enabled=request.use_skills,
+            supervisor=Supervisor() if request.supervisor else None,
         )
         return (await session.run(tasks)).to_dict()
 

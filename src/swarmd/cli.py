@@ -189,6 +189,13 @@ def main(argv: list[str] | None = None) -> int:
         "gate is what stops the library poisoning itself; every auto-approval "
         "is recorded with actor 'auto-approve' so the bypass stays visible.",
     )
+    swarm_session.add_argument(
+        "--supervisor", action="store_true",
+        help="let the supervisor rewrite the worker prompt when criterion "
+        "failures cluster, and revert a rewrite that did not improve the pass "
+        "rate. Off by default: a patched prompt is a confound, and an arm must "
+        "be able to run with the stock prompt and know that is what it ran.",
+    )
     swarm_session.add_argument("--json", action="store_true")
 
     ev = sub.add_parser("eval", help="run the evaluation suite with a control arm")
@@ -504,6 +511,7 @@ async def _session_command(args: argparse.Namespace) -> int:
     from swarmd.swarm.run import SwarmRun
     from swarmd.swarm.session import SwarmSession
     from swarmd.swarm.skills import SkillLibrary
+    from swarmd.swarm.supervisor import Supervisor
 
     try:
         pool = ProviderPool.from_env()
@@ -516,7 +524,7 @@ async def _session_command(args: argparse.Namespace) -> int:
     sandbox = SandboxHarness()
     use_skills = not args.no_skills
 
-    async def run_factory(task: str, index: int) -> Any:
+    async def run_factory(task: str, index: int, system_prompt: str = "") -> Any:
         run = SwarmRun(
             pool,
             profile=args.profile,
@@ -525,6 +533,7 @@ async def _session_command(args: argparse.Namespace) -> int:
             sandbox=sandbox,
             approvals=approvals,
             ledger_path=args.ledger,
+            system_prompt=system_prompt,
             on_event=_print_event,
         )
         result = await run.run(task)
@@ -545,6 +554,7 @@ async def _session_command(args: argparse.Namespace) -> int:
         consolidate_every=args.consolidate_every,
         auto_approve=args.auto_approve,
         skills_enabled=use_skills,
+        supervisor=Supervisor() if args.supervisor else None,
     )
     report = await session.run(tasks)
     await pool.aclose()
