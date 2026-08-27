@@ -1,0 +1,150 @@
+# Alert rules.
+#
+# Rule for inclusion: every alert here is ACTIONABLE and has a runbook entry in
+# docs/RUNBOOK.md. An alert with no action is a notification, and notifications
+# that cannot be acted on train people to ignore the ones that can.
+#
+# `for:` durations are deliberately long. This system's normal state includes
+# provider throttling and agent kills; alerting on the instant would page on
+# healthy behaviour, which is the fastest way to make an on-call rotation stop
+# reading pages.
+
+groups:
+  - name: swarmd-capacity
+    interval: 30s
+    rules:
+      - alert: SwarmdProviderPoolExhausted
+        expr: max(swarmd_provider_available) == 0
+        for: 2m
+        labels:
+          severity: page
+          runbook: RUNBOOK.md#providerpoolexhausted
+        annotations:
+          summary: "Every provider is backed off"
+          description: >-
+            No provider has been accepting requests for 2 minutes. Runs are
+            blocked on NoCapacity. Individual providers backing off is normal;
+            all of them simultaneously is not.
+
+      - alert: SwarmdRateLimitRatioHigh
+        expr: |
+          sum(rate(swarmd_rate_limited_total[10m]))
+            / clamp_min(sum(rate(swarmd_llm_calls_total[10m])), 0.001) > 0.10
+        for: 10m
+        labels:
+          severity: ticket
+          runbook: RUNBOOK.md#ratelimitratiohigh
+        annotations:
+          summary: "Over 10% of calls are being rate limited"
+          description: >-
+            The capacity plan's trigger for adding a provider. Not urgent -- the
+            pool is absorbing it -- but throughput is below what the run was
+            sized for.
+
+      - alert: SwarmdCacheHitRateCollapsed
+        expr: |
+          sum(rate(swarmd_cache_hits_total[15m]))
+            / clamp_min(
+                sum(rate(swarmd_cache_hits_total[15m]))
+                + sum(rate(swarmd_llm_calls_total[15m])), 0.001) < 0.40
+        for: 15m
+        labels:
+          severity: ticket
+          runbook: RUNBOOK.md#cachehitratecollapsed
+        annotations:
+          summary: "Cache hit rate below 40%"
+          description: >-
+            The capacity plan assumes ~60%. Below 40% the demo profile no longer
+            fits its wall-clock budget. Investigate prompt normalisation BEFORE
+            adding provider capacity -- buying capacity to paper over a cache
+            regression hides the regression.
+
+  - name: swarmd-cost
+    interval: 30s
+    rules:
+      - alert: SwarmdCostCeilingApproaching
+        expr: sum(swarmd_cost_usd_total) > 0.035
+        for: 1m
+        labels:
+          severity: ticket
+          runbook: RUNBOOK.md#costceilingapproaching
+        annotations:
+          summary: "Run spend past 70% of the $0.05 ceiling"
+          description: >-
+            Free-tier traffic should keep this at zero. Any meaningful spend
+            means paid overflow is carrying load, which is a routing question,
+            not a budget one.
+
+      - alert: SwarmdCeilingAbort
+        expr: increase(swarmd_ceiling_aborts_total[1h]) > 0
+        labels:
+          severity: ticket
+          runbook: RUNBOOK.md#ceilingabort
+        annotations:
+          summary: "A run aborted on the cost ceiling"
+          description: >-
+            Working as designed, but it means a run produced no result. Check
+            whether free capacity was unavailable or demand was mis-sized.
+
+  - name: swarmd-correctness
+    interval: 30s
+    rules:
+      - alert: SwarmdDeadLetterRateHigh
+        expr: |
+          sum(rate(swarmd_gate_outcomes_total{outcome="dead_letter"}[15m]))
+            / clamp_min(sum(rate(swarmd_gate_outcomes_total[15m])), 0.001) > 0.20
+        for: 15m
+        labels:
+          severity: ticket
+          runbook: RUNBOOK.md#deadletterratehigh
+        annotations:
+          summary: "Over 20% of items are dead-lettering"
+          description: >-
+            The repair loop is not converging. Most likely causes: the frozen
+            criterion is too strict, or a model swap degraded output quality.
+
+      - alert: SwarmdWorkLostUnderChaos
+        expr: |
+          sum(increase(swarmd_agent_kills_total[10m]))
+            - sum(increase(swarmd_requeues_total[10m])) > 5
+        for: 10m
+        labels:
+          severity: page
+          runbook: RUNBOOK.md#worklostunderchaos
+        annotations:
+          summary: "Kills are outpacing requeues"
+          description: >-
+            Every killed agent's task should be requeued with its checkpoint
+            intact. A sustained gap means the recovery path is dropping work,
+            which invalidates the integrity guarantee the whole system rests on.
+            This is the one alert that indicates a correctness bug rather than
+            a capacity problem.
+
+      - alert: SwarmdUnexpectedContainments
+        expr: sum(increase(swarmd_containments_total[15m])) > 0
+        for: 15m
+        labels:
+          severity: ticket
+          runbook: RUNBOOK.md#unexpectedcontainments
+        annotations:
+          summary: "Red-team contained agents outside a seeded-rogue run"
+          description: >-
+            Expected during --seed-rogues. Otherwise the population has evolved
+            something the detectors consider rogue, which is worth reading the
+            containment audit trail for.
+
+  - name: swarmd-hitl
+    interval: 1m
+    rules:
+      - alert: SwarmdApprovalQueueStale
+        expr: swarmd_approvals_pending > 0
+        for: 24h
+        labels:
+          severity: ticket
+          runbook: RUNBOOK.md#approvalqueuestale
+        annotations:
+          summary: "Items have been waiting on a human for 24 hours"
+          description: >-
+            A non-zero queue is normal -- it is a human queue. A queue that
+            never drains means the loop is blocked on a person who does not know
+            they are the bottleneck.

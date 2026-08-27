@@ -1,8 +1,13 @@
-# Observability + persistence stack for swarmd runs.
+# Local observability + persistence stack for swarmd runs.
+#
+# This is the DEVELOPMENT stack. Production is Kubernetes (deploy/k8s) with
+# managed Postgres and Redis; see docs/DEPLOYMENT.md. The two are kept
+# deliberately similar in shape -- same images where possible, same config file
+# paths -- so that "works locally" carries more information than usual.
 
 services:
   jaeger:
-    image: jaegertracing/all-in-one:latest
+    image: jaegertracing/all-in-one:1.62
     ports:
       - "16686:16686"   # UI
       - "4318:4318"     # OTLP HTTP
@@ -10,30 +15,58 @@ services:
       - COLLECTOR_OTLP_ENABLED=true
 
   prometheus:
-    image: prom/prometheus:latest
+    image: prom/prometheus:v3.0.1
     ports:
       - "9090:9090"
     volumes:
       - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./observability/alerts.yml:/etc/prometheus/alerts.yml:ro
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=7d
+      - --web.enable-lifecycle
 
   grafana:
-    image: grafana/grafana:latest
+    image: grafana/grafana:11.4.0
     ports:
       - "3000:3000"
     environment:
+      # Anonymous admin is fine for a local stack and MUST NOT be copied to the
+      # Kubernetes overlay, which uses an admin secret instead.
       - GF_AUTH_ANONYMOUS_ENABLED=true
       - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
+      - GF_USERS_DEFAULT_THEME=dark
     volumes:
       - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus
 
   postgres:
     image: postgres:16
     environment:
       POSTGRES_USER: swarmd
       POSTGRES_PASSWORD: swarmd_dev
-      POSTGRES_DB: leadops
+      POSTGRES_DB: swarmd
     ports:
       # Host port 5434 (NOT the default 5432/5433) so swarmd never collides with
       # other projects' Postgres instances on this machine. Inside the compose
       # network it's still plain 5432.
       - "5434:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U swarmd"]
+      interval: 5s
+      retries: 10
+
+  redis:
+    # Only needed when more than one process shares a provider credential
+    # (ADR-011). Single-process local runs use the in-process token bucket and
+    # can ignore this service entirely.
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 10

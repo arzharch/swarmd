@@ -1,0 +1,19 @@
+apiVersion: 1
+
+# Dashboards are provisioned from files in the repo, never edited in the UI.
+# A dashboard changed in Grafana lives only in that Grafana's database: it does
+# not survive a pod restart, is invisible in code review, and cannot be rolled
+# back with the change that broke it. Provisioned dashboards are set read-only
+# (allowUiUpdates: false) so the UI refuses the edit rather than silently
+# accepting one that will vanish.
+providers:
+  - name: swarmd
+    orgId: 1
+    folder: swarmd
+    type: file
+    disableDeletion: true
+    allowUiUpdates: false
+    updateIntervalSeconds: 30
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

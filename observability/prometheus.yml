@@ -1,7 +1,21 @@
 global:
   scrape_interval: 5s
+  evaluation_interval: 15s
+  external_labels:
+    env: local
+
+rule_files:
+  - /etc/prometheus/alerts.yml
 
 scrape_configs:
+  # Local (docker compose) runs: swarmd runs on the host, Prometheus in a
+  # container, so it reaches back out through host.docker.internal.
   - job_name: swarmd
     static_configs:
-      - targets: ["host.docker.internal:9100"]
+      - targets: ["host.docker.internal:9464"]
+        labels:
+          deployment: local
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

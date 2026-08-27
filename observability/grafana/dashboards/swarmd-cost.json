@@ -1,0 +1,151 @@
+{
+  "uid": "swarmd-cost",
+  "title": "swarmd · Cost and Quota",
+  "description": "Cost is a first-class signal here, not a monthly surprise. NOTE: these panels are the OPERATIONAL view and may lag or reset on pod restart. Any number that ends up in a report comes from the append-only ledger (ADR-007), never from this dashboard.",
+  "tags": ["swarmd", "cost", "finops"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "10s",
+  "time": { "from": "now-6h", "to": "now" },
+  "panels": [
+    {
+      "type": "row",
+      "title": "Spend against the ceiling",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 }
+    },
+    {
+      "type": "gauge",
+      "title": "Run spend vs $0.05 ceiling",
+      "description": "Breach aborts the run cleanly with an itemised report rather than truncating it, because a truncated run still emits numbers that look like results.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 1 },
+      "targets": [{ "expr": "sum(swarmd_cost_usd_total)", "legendFormat": "spend" }],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "decimals": 5,
+          "min": 0,
+          "max": 0.05,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 0.035 },
+              { "color": "red", "value": 0.049 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Cumulative spend by provider",
+      "description": "A flat line at zero for the free tier is the expected shape. Any slope at all means paid overflow is carrying traffic — worth knowing why.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 16, "x": 8, "y": 1 },
+      "targets": [
+        { "expr": "swarmd_cost_usd_total", "legendFormat": "{{provider}}" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "decimals": 5,
+          "custom": { "stacking": { "mode": "normal" }, "fillOpacity": 30 }
+        }
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Spend avoided by cache",
+      "description": "Priced at what each cached call would have cost. This is a query over zero-cost ledger rows, not an estimate.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 6, "w": 8, "x": 0, "y": 9 },
+      "targets": [{ "expr": "sum(swarmd_cache_savings_usd_total)" }],
+      "options": { "colorMode": "value", "graphMode": "area" },
+      "fieldConfig": {
+        "defaults": { "unit": "currencyUSD", "decimals": 5, "color": { "fixedColor": "green", "mode": "fixed" } }
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Ceiling aborts",
+      "description": "Should be zero outside the deliberate overrun test. Non-zero means a run stopped rather than overspending, which is the designed behaviour.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 6, "w": 4, "x": 8, "y": 9 },
+      "targets": [{ "expr": "sum(swarmd_ceiling_aborts_total)" }],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 1 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Per-call cost distribution (p50 / p95)",
+      "description": "Free-tier calls sit at exactly zero. A rising p95 means traffic is shifting to paid overflow.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 9 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(swarmd_call_cost_usd_bucket[5m])))",
+          "legendFormat": "p50"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(swarmd_call_cost_usd_bucket[5m])))",
+          "legendFormat": "p95"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "currencyUSD", "decimals": 6 } }
+    },
+    {
+      "type": "row",
+      "title": "Quota headroom",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 15 }
+    },
+    {
+      "type": "timeseries",
+      "title": "Permits remaining per credential",
+      "description": "Quota is keyed per credential, not per provider — two keys are two accounts and genuinely two buckets (ADR-011). All buckets at zero simultaneously is the saturation condition.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "targets": [
+        {
+          "expr": "swarmd_quota_remaining_requests",
+          "legendFormat": "{{provider}} · {{window}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Daily request budget burn",
+      "description": "Configured supply is ~15,900 requests/day. One full eval sweep consumes roughly 75% of it, so this panel is what says whether a sweep can run tonight.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "targets": [
+        {
+          "expr": "sum by (provider) (increase(swarmd_llm_calls_total[24h]))",
+          "legendFormat": "{{provider}} (24h)"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 12000 },
+              { "color": "red", "value": 15000 }
+            ]
+          }
+        }
+      }
+    }
+  ]
+}
