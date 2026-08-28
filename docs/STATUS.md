@@ -90,47 +90,63 @@ The CLI is the same operations without a browser, not a separate product.
 
 ## 5. The remaining gap
 
-### G-4 · Live runs solve, at a low rate
-**Blocks:** a QA sign-off. Not a blocker for anything structural.
+### G-4 · The baseline exists, and it is zero
+**Blocks:** a QA sign-off, and nothing else.
 
-Real providers, real runs, measured over three consecutive runs on the same
-task: **1/6, 1/8, 0/6 nodes passed**, 13-15 calls, 16-33 seconds, $0.00. Call
-that a ~10% node pass rate.
+**First real eval against live providers**, 10 runs, both arms, commit
+`5c08d7d`, recorded in [BENCHMARKS.md](BENCHMARKS.md):
 
-The pipeline is no longer the problem. Four defects stood between "infra runs"
-and "tasks get solved", all of them invisible against the simulated provider
-because it replies with bare JSON -- the one output shape where the model's
-reply and the step's answer are the same string:
+| | treatment | control |
+|---|---|---|
+| solved | **0 / 5** | **0 / 5** |
+| success rate | 0.0% CI[0.00, 0.00] | 0.0% |
+| first-pass | 0.0% | 0.0% |
+| mean tokens | 10,626 | 13,730 |
+| containments | 0 | 2 |
 
-1. **Criteria froze with unsatisfiable checks.** Models emitted
-   `artifact_exists` with no `key`. Those fail every candidate forever, so the
-   run scored 0/16 and blamed the workers. Now rejected at parse time.
-2. **The schema hint taught the failure.** It showed `"params": {}`, so models
-   copied it. Replacing that with concrete examples made them copy *those* --
-   every criterion demanded a `claims.json` and a `VERIFIED` marker regardless
-   of task. Now angle-bracket placeholders with an explicit instruction to
-   derive values from the task.
-3. **The graded output was the reply, not the answer.** Models reply with
-   fenced ```python; the sandbox ran it correctly and then `json_parses` read
-   the Python and said "not JSON". `Candidate.output` is now what the step
-   produced, with `source` keeping the reply for traceability.
-4. **An empty completion was treated as an opinion.** `openai/gpt-oss-20b` is a
-   reasoning model: on a long prompt it spent all 700 output tokens thinking
-   and returned `content=""`. Criterion synthesis reported "no proposer
-   produced a parseable criterion" and refused to run. Empty completions are
-   now provider errors, so the pool fails over.
+**Verdict: no measured improvement.** Which is the harness working -- it
+refuses to report a delta it cannot support -- and also the plainest possible
+statement of where the product is.
 
-**What is left is quality, not plumbing.** The remaining failures are the
-criterion legitimately demanding a number where the model wrote a sentence
-("achieving 94.3% accuracy" instead of `94.3`). That is what the repair loop
-and the skill library exist to fix, and it is measured by the eval harness --
-which has never been run against real providers, so there is no baseline to
-improve on.
+A task counts as solved only when EVERY node in its plan passes. Individual
+nodes do pass (measured 1/6 and 1/8 on repeated single runs), so the pipeline
+produces correct work; no run has yet produced correct work at every step.
+That gap is the product.
 
-Also visible and not yet addressed: at `smoke`'s two proposers the consensus
-threshold is `ceil(2 * 0.5) = 1`, so the merged criterion is a UNION of both
-proposals -- maximally strict. Three proposers require two votes and produce a
-saner criterion. The profile, not the merge, is what makes smoke runs hard.
+**What is proven by these runs**, and was not before today:
+
+- The whole loop executes against real models: criterion synthesis, plan
+  synthesis, batched generation, sandbox execution, chaos, red-team, ledger.
+- The red-team catches real misbehaviour, unseeded. Two containments in the
+  control arm for `unsafe_tool_call` -- models writing `requests.get` into
+  generated code -- and earlier, `criterion_gaming` for output that satisfied a
+  criterion with 17 tokens. These were not fixtures.
+- Cost is $0.00. Every provider used is free-tier.
+- The eval resumes: this baseline was produced across two interrupted chunks,
+  6 runs then 4, with no run measured twice.
+
+**Four defects were fixed to get here**, all invisible against the simulated
+provider because it replies with bare JSON -- the one output shape where the
+model's reply and the step's answer are the same string:
+
+1. Criteria froze with unsatisfiable checks (`artifact_exists` with no `key`).
+2. The schema hint showed `"params": {}`, which models copied; replacing it
+   with concrete examples made them copy *those* instead.
+3. The graded output was the model's reply, not what running it produced.
+4. Empty completions from a reasoning model were read as bad proposals rather
+   than as failures, so synthesis refused to run.
+
+**What would move the number**, in the order I would try it:
+
+- The criterion is stricter than the worker prompt is specific. Nodes fail on
+  `numeric_range` because a model wrote "achieving 94.3% accuracy" where the
+  check wants `94.3`. That is a prompt contract to tighten, not a model to
+  replace.
+- `max_repairs` is 1 on the smoke profile. The repair loop is the mechanism
+  that fixes exactly this class of failure and it gets one attempt.
+- The skill library has nothing in it. The treatment arm cannot beat the
+  control until distillation has produced something to retrieve, and
+  distillation needs two verified successes on a node.
 
 ---
 
@@ -152,23 +168,29 @@ per-credential usage journal, the frozen criterion hash, the plan hash, the
 integrity hash, the red-team audit trail, and a per-agent reasoning tape. There
 is no counter anywhere that could disagree with the evidence.
 
-**QA: NO. I cannot sign this off, and the reason is one number.**
+**QA: NO, and now there is a number rather than an impression.**
 
 The product's core claim is that generic agents solve tasks nobody scoped for
-them. Measured against real providers that currently happens about 10% of the
-time per node. A sign-off would need:
+them. Measured: **0 of 5 tasks solved, in both arms.** Nodes pass; runs do not.
 
-- an eval baseline against real providers, with both arms and confidence
-  intervals -- the harness exists and has never been run on live traffic, so
-  there is no number to regress against and no way to tell an improvement from
-  noise;
-- a node pass rate that clears a stated bar, agreed before it is measured
-  rather than after;
+The baseline that was missing now exists, which changes the character of the
+gap -- it is no longer unmeasured, it is measured and bad. What sign-off still
+needs:
+
+- a task success rate above zero, against a bar agreed before measuring;
+- enough volume for the learning curve to mean anything (50-200 tasks). At 10
+  runs the confidence intervals are [0.00, 0.00] because nothing succeeded, not
+  because the estimate is tight;
 - a load test at the `standard` profile, which has never run against real
-  providers -- every live run so far has been `smoke`.
+  providers -- every live run so far has been `smoke`, and `standard` is 500
+  agents against a daily budget of ~1,146 requests, which on its face does not
+  fit.
 
-None of those is a missing feature. They are measurements that take volume and
-provider quota, and until they exist "ready" is an opinion.
+That last point deserves its own line: **the `standard` profile cannot run on
+the current free-tier budget.** 500 agents at ~600 calls is half a day's total
+capacity for one run. Either the profile is aspirational or the capacity plan
+needs paid overflow enabled, and right now the documentation implies the first
+while the code would attempt the second.
 
 ### Smaller, and not blocking
 - No on-call rotation (single maintainer — stated, not solvable).
