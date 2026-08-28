@@ -418,9 +418,23 @@ def _budget_command(args: argparse.Namespace) -> int:
                 f"{grant['expires_days']}d)"
             )
         for window in report["windows"]:
+            # Show the TOKEN dimension when it is the one running out. Printing
+            # requests only made an exhausted provider read as "98 / 1,000"
+            # beside the words "day budget exhausted", which is the most
+            # confusing possible moment to omit a number.
             used = window["used_requests"]
             limit = window["limit_requests"]
-            shown = f"{used:,}/{limit:,}" if limit else f"{used:,}"
+            tok_used = window["used_tokens"]
+            tok_limit = window["limit_tokens"]
+            token_bound = bool(tok_limit) and (
+                not limit or (tok_used / tok_limit) > (used / max(1, limit))
+            )
+            if token_bound and tok_limit:
+                shown = f"{tok_used:,}/{tok_limit:,} tok"
+            elif limit:
+                shown = f"{used:,}/{limit:,}"
+            else:
+                shown = f"{used:,}"
             bar_width = 24
             filled = min(bar_width, int(window["fraction_used"] * bar_width))
             bar = "#" * filled + "." * (bar_width - filled)

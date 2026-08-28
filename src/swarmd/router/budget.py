@@ -576,6 +576,28 @@ class BudgetTracker:
 
     # -- planning -------------------------------------------------------
 
+    def observed_tokens_per_request(
+        self, provider: str, *, default: int = 1_000, now: float | None = None
+    ) -> int:
+        """Mean tokens per call for this provider, measured.
+
+        Needed because a request cap and a token cap are different ceilings and
+        the smaller one wins. Measured rather than assumed: the figure depends
+        on prompt size, which depends on the schema hints and retrieved skills,
+        which change.
+        """
+        now = now if now is not None else time.time()
+        rows = [
+            row
+            for row in self.journal.rows_since(now - WEEK)
+            if row.provider == provider and row.requests
+        ]
+        if not rows:
+            return default
+        requests = sum(row.requests for row in rows)
+        tokens = sum(row.tokens for row in rows)
+        return max(1, tokens // max(1, requests)) if tokens else default
+
     def daily_capacity(self, provider: str) -> tuple[int, str]:
         """Requests per day this provider can supply, and on what evidence.
 
@@ -603,8 +625,22 @@ class BudgetTracker:
             remaining = grant["remaining"] if grant else spec.grant_total
             return int(remaining // max(1, spec.grant_expires_days)), "grant"
         daily = spec.limit_for("day")
-        if daily and daily.requests:
-            return daily.requests, "daily_cap"
+        if daily and (daily.requests or daily.tokens):
+            # BOTH dimensions, because the smaller ceiling is the real one and
+            # it is not always the obvious one. Groq publishes 1,000 requests
+            # and 100,000 tokens per day; at ~1,035 tokens per call this
+            # deployment exhausted the token budget after 98 REQUESTS. Reported
+            # as 1,000/day it overstated the provider tenfold, and the run that
+            # discovered it saw "day budget exhausted" next to "98 / 1,000".
+            by_requests = daily.requests or 10**9
+            if daily.tokens:
+                per_call = self.observed_tokens_per_request(provider)
+                by_tokens = daily.tokens // max(1, per_call)
+            else:
+                by_tokens = 10**9
+            if by_tokens < by_requests:
+                return by_tokens, "daily_cap_tokens"
+            return by_requests, "daily_cap"
         minute = spec.limit_for("minute")
         if minute and minute.requests:
             return int(minute.requests * 60 * 24), "rate_only"
@@ -635,7 +671,7 @@ class BudgetTracker:
                 if entry["basis"] == basis
             )
 
-        planned = total("daily_cap")
+        planned = total("daily_cap") + total("daily_cap_tokens")
         return {
             "per_provider": per_provider,
             "sustainable_daily_requests": planned,

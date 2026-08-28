@@ -267,14 +267,26 @@ call four. The rest return `404 Not found for account`.
 ### What this sustains
 
 ```
-plannable     2,050 requests/day   from published DAILY allowances
-  week       14,350 requests
-  month      61,500 requests
-one-off          33 requests/day   from finite grants -- these stop when spent
+plannable     1,146 requests/day   from published DAILY allowances
+  week        8,022 requests
+  month      34,380 requests
+one-off          29 requests/day   from finite grants -- these stop when spent
 unverified   86,400 requests/day   upper bound from a per-minute rate with no
                                    published daily cap. Assumes 24 hours of
                                    perfect saturation. Not a plan.
 ```
+
+**Groq's binding limit is tokens, not requests, and that halved this plan.** It
+publishes 1,000 requests *and* 100,000 tokens per day. At the ~1,035 tokens per
+call this system actually sends, the token budget runs out after **98
+requests** -- so the first version of this table overstated Groq tenfold.
+Discovered by running until it broke: the CLI printed "day budget exhausted"
+beside "98 / 1,000", because it was showing the dimension that was fine.
+
+Daily capacity is now `min(request cap, token cap / observed tokens per call)`,
+with the tokens-per-call figure measured from the usage journal rather than
+assumed -- it moves with prompt size, which moves with schema hints and
+retrieved skills.
 
 Only the first figure is planned against. Folding the other two in would give a
 headline of ~88,000/day that is 98% extrapolation, which is exactly the kind of

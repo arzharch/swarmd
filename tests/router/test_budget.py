@@ -205,6 +205,59 @@ def test_the_capacity_plan_excludes_grants_from_what_is_sustainable(tmp_path):
     assert plan["month_requests"] == 3_000
 
 
+def test_a_token_cap_can_bind_before_the_request_cap(tmp_path):
+    """The correction that cut the capacity plan almost in half.
+
+    Groq publishes 1,000 requests AND 100,000 tokens per day. At the ~1,035
+    tokens per call this system actually sends, the token budget runs out after
+    98 requests -- so reporting 1,000/day overstated the provider tenfold, and
+    the operator saw "day budget exhausted" printed beside "98 / 1,000".
+    """
+    spec = BudgetSpec(
+        provider="p",
+        kind="quota",
+        limits=(Limit("day", requests=1_000, tokens=100_000),),
+    )
+    tracker = _tracker(tmp_path, {"p": spec})
+    # 20 calls at 1,000 tokens each: the observed rate.
+    for _ in range(20):
+        tracker.record(provider="p", credential="k#0", requests=1, tokens=1_000)
+
+    value, basis = tracker.daily_capacity("p")
+    assert basis == "daily_cap_tokens"
+    assert value == 100      # 100,000 tokens / 1,000 per call
+    assert value < 1_000
+
+
+def test_the_request_cap_binds_when_calls_are_small(tmp_path):
+    """The token dimension must not be assumed to dominate either."""
+    spec = BudgetSpec(
+        provider="p",
+        kind="quota",
+        limits=(Limit("day", requests=50, tokens=100_000),),
+    )
+    tracker = _tracker(tmp_path, {"p": spec})
+    for _ in range(10):
+        tracker.record(provider="p", credential="k#0", requests=1, tokens=10)
+
+    value, basis = tracker.daily_capacity("p")
+    assert basis == "daily_cap"
+    assert value == 50
+
+
+def test_tokens_per_request_is_measured_not_assumed(tmp_path):
+    """It depends on prompt size, which depends on schema hints and retrieved
+    skills, which change."""
+    tracker = _tracker(tmp_path, {"p": BudgetSpec(provider="p")})
+    tracker.record(provider="p", credential="k#0", requests=2, tokens=3_000)
+    assert tracker.observed_tokens_per_request("p") == 1_500
+
+
+def test_tokens_per_request_falls_back_when_there_is_no_history(tmp_path):
+    tracker = _tracker(tmp_path, {"p": BudgetSpec(provider="p")})
+    assert tracker.observed_tokens_per_request("p", default=777) == 777
+
+
 # --- blocking ---------------------------------------------------------------
 
 
