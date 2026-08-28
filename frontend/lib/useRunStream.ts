@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type {
+  Preflight,
   AgentState,
   ConnectionState,
   CriterionView,
@@ -48,6 +49,8 @@ interface StreamState {
   chaosEvents: SwarmEvent[];
   /** One entry per batched generation: the requests a pool did not make. */
   batches: SwarmEvent[];
+  /** Cost of this run against the remaining budget, known before it starts. */
+  preflight: Preflight | null;
 }
 
 const EMPTY: StreamState = {
@@ -61,6 +64,7 @@ const EMPTY: StreamState = {
   containments: [],
   chaosEvents: [],
   batches: [],
+  preflight: null,
 };
 
 function reduce(state: StreamState, event: SwarmEvent): StreamState {
@@ -117,6 +121,10 @@ function reduce(state: StreamState, event: SwarmEvent): StreamState {
 
     case "agent_requeued":
       next.chaosEvents = [...state.chaosEvents, event].slice(-200);
+      break;
+
+    case "preflight":
+      next.preflight = event as unknown as Preflight;
       break;
 
     case "batch_generated":

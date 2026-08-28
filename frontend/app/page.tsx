@@ -236,6 +236,26 @@ export default function Dashboard() {
               and <code>swarmd eval</code> will refuse to report from them.
             </div>
           )}
+          {stream.preflight && !stream.preflight.fits && (
+            <div className="banner warn" role="status">
+              <strong>This run will not fit today.</strong> It needs about{" "}
+              {stream.preflight.estimated_calls.toLocaleString()} provider
+              requests and{" "}
+              {stream.preflight.remaining_today.toLocaleString()} remain — short
+              by {stream.preflight.shortfall.toLocaleString()}. It will exhaust
+              the budget and stop partway. Lower the agent count, or wait for
+              the daily quotas to reset.
+            </div>
+          )}
+          {stream.preflight && stream.preflight.fits &&
+            (stream.preflight.fraction_of_remaining ?? 0) > 0.25 && (
+            <div className="banner info" role="status">
+              <strong>Large run.</strong> About{" "}
+              {stream.preflight.estimated_calls.toLocaleString()} requests,{" "}
+              {((stream.preflight.fraction_of_remaining ?? 0) * 100).toFixed(0)}%
+              of what is left today.
+            </div>
+          )}
           {seedRogues && (
             <div className="banner warn" role="status">
               <strong>Seeded run.</strong> Deliberate misbehaviour is being

@@ -314,3 +314,15 @@ export interface BudgetResponse {
   providers: ProviderBudget[];
   plan: BudgetPlan;
 }
+
+/** What a run will cost against today's remaining budget, emitted before any
+ *  work starts. The one moment an operator can still act on the number. */
+export interface Preflight {
+  agents: number;
+  profile: string;
+  estimated_calls: number;
+  remaining_today: number;
+  fits: boolean;
+  shortfall: number;
+  fraction_of_remaining: number | null;
+}
