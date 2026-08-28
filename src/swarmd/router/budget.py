@@ -215,14 +215,16 @@ BUDGETS: dict[str, BudgetSpec] = {
         kind="quota",
         limits=(
             Limit("minute", requests=20),
-            Limit("day", requests=50),
+            Limit("day", requests=1_000),
         ),
         source="https://openrouter.ai/docs/api-reference/limits",
-        checked="2026-08-28",
+        checked="2026-08-29",
         note=(
-            "50/day applies to unfunded accounts; funding $10 raises it to "
-            "1,000/day and the 20/minute cap stays. At 50/day this is a "
-            "tie-breaker, not a workhorse."
+            "1,000/day: this account is FUNDED. Confirmed 2026-08-29 via "
+            "GET /api/v1/key (is_free_tier=false, usage=$0), a metadata call "
+            "that spends no tokens. `:free` models remain $0 on a funded "
+            "account; the $10 unlocks the request cap, it is not spent by "
+            "free-model calls. The 20/minute cap is unchanged."
         ),
     ),
     "mistral-free": BudgetSpec(
