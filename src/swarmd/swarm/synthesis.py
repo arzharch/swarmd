@@ -31,6 +31,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from swarmd.swarm.criteria import (
+    CHECK_PARAMS,
     Candidate,
     Check,
     CheckError,
@@ -109,19 +110,44 @@ def attack(criterion: Criterion, task: str) -> AttackReport:
 
 # --- proposals -------------------------------------------------------------
 
-PROPOSAL_SCHEMA_HINT = json.dumps(
-    {
-        "description": "one sentence describing what success means",
-        "checks": [
-            {"kind": "<one of: " + "|".join(sorted(
-                ["output_nonempty", "contains_all", "regex_match", "json_parses",
-                 "numeric_range", "artifact_exists", "exit_code",
-                 "stdout_contains", "min_distinct_words"]
-            )) + ">", "params": {}},
-        ],
-    },
-    separators=(",", ":"),
-)
+def _schema_hint() -> str:
+    """The proposal contract, generated from the checks themselves.
+
+    The previous version showed `"params": {}` as the example and named the
+    kinds in a pipe-separated blob. Real models copied the empty object
+    faithfully, producing checks with no parameters -- which fail every
+    candidate, so the criterion was unsatisfiable and every node failed
+    forever. The simulated provider never reproduced it because its proposals
+    were hand-written with complete parameters.
+
+    Generated rather than written out so the prompt cannot drift from the code:
+    a check whose parameters change updates the instructions with it.
+    """
+    lines = [
+        "{",
+        '  "description": "one sentence describing what success means",',
+        '  "checks": [ {"kind": "...", "params": {...}} ]',
+        "}",
+        "",
+        (
+            "EVERY check needs its params. A check missing them fails every "
+            "candidate and makes the whole criterion unsatisfiable."
+        ),
+        (
+            "Values in <angle brackets> are PLACEHOLDERS describing what to "
+            "supply. Derive every value from THIS task -- copying the "
+            "placeholders, or inventing a file name or marker string the task "
+            "never mentioned, produces a criterion nothing can satisfy."
+        ),
+    ]
+    lines.extend(
+        f'  {kind:<20} params example: {example}'
+        for kind, example in CHECK_PARAMS.items()
+    )
+    return "\n".join(lines)
+
+
+PROPOSAL_SCHEMA_HINT = _schema_hint()
 
 PROPOSER_SYSTEM = (
     "You define what SUCCESS means for a task, before anyone attempts it. "
@@ -156,7 +182,15 @@ def parse_proposal(raw: str) -> Proposal:
         if start == -1 or end <= start:
             return Proposal(None, raw, "no JSON object in response")
         payload = json.loads(raw[start : end + 1])
-        return Proposal(Criterion.from_dict(payload), raw)
+        criterion = Criterion.from_dict(payload)
+        # A check missing its required parameters fails EVERY candidate, so a
+        # proposal carrying one is not a weak criterion -- it is an
+        # unsatisfiable one. Rejected here, at parse time, which is what
+        # CheckError's own docstring has always claimed happens.
+        broken = criterion.malformed()
+        if broken:
+            return Proposal(None, raw, f"malformed checks: {'; '.join(broken)}")
+        return Proposal(criterion, raw)
     except (json.JSONDecodeError, CheckError, TypeError, ValueError) as exc:
         return Proposal(None, raw, str(exc))
 

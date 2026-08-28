@@ -38,8 +38,28 @@ def test_price_math_is_per_million_tokens():
 
 def test_free_models_resolve_to_zero():
     assert price_for("openrouter", "meta-llama/llama-3.3-70b-instruct:free") is FREE
-    assert price_for("groq", "llama-3.3-70b-versatile") is FREE
-    assert price_for("cerebras", "anything") is FREE
+    assert price_for("groq", "openai/gpt-oss-20b") is FREE
+    assert price_for("google-aistudio", "gemini-3.5-flash-lite") is FREE
+
+
+def test_a_grant_backed_provider_is_free_in_dollars():
+    """NVIDIA costs no money and is still finite.
+
+    Money and quota are different resources: the grant it spends is tracked in
+    router/budget.py. A provider can be free and exhausted at once, and only
+    the first of those belongs in a cost ledger.
+    """
+    assert price_for("nvidia-nim", "nvidia/nemotron-3-super-120b-a12b") is FREE
+
+
+def test_cerebras_is_no_longer_priced_free():
+    """It returns 402 "Payment required" now, so $0 would under-report spend.
+
+    This is the direction the error matters in: a paid provider priced at zero
+    disables the ceiling for every call it serves.
+    """
+    with pytest.raises(UnpricedModel):
+        price_for("cerebras", "gpt-oss-120b")
 
 
 def test_known_paid_model_resolves_to_its_table_entry():

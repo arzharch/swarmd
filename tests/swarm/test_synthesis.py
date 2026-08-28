@@ -280,3 +280,61 @@ def test_check_dataclass_is_hashable_for_deduplication():
     assert Check("exit_code", {"expected": 0}).canonical() == (
         Check("exit_code", {"expected": 0}).canonical()
     )
+
+
+# --- malformed checks, found by the first real-provider run ----------------
+
+
+def test_a_check_missing_its_required_parameter_is_malformed():
+    """`artifact_exists` with no `key` can never pass, whatever a worker does."""
+    from swarmd.swarm.criteria import Criterion
+
+    criterion = Criterion.from_dict(
+        {
+            "description": "d",
+            "checks": [
+                {"kind": "artifact_exists", "params": {}},
+                {"kind": "contains_all", "params": {}},
+            ],
+        }
+    )
+    broken = criterion.malformed()
+    assert len(broken) == 2
+    assert any("artifact_exists" in b for b in broken)
+
+
+def test_a_well_formed_check_is_not_reported_as_malformed():
+    """Failing a probe is what a check is FOR. Only unsatisfiable is malformed."""
+    from swarmd.swarm.criteria import Criterion
+
+    criterion = Criterion.from_dict(
+        {
+            "description": "d",
+            "checks": [
+                {"kind": "contains_all", "params": {"substrings": ["nothing-like-this"]}},
+                {"kind": "json_parses", "params": {"required_keys": ["absent"]}},
+            ],
+        }
+    )
+    assert criterion.malformed() == []
+
+
+def test_a_proposal_with_malformed_checks_is_rejected_at_parse_time():
+    """The bug this covers cost a whole real run: 0 of 16 nodes passed.
+
+    A frozen criterion carrying an unsatisfiable check grades every attempt as
+    a failure forever, and reports it as the workers' fault. Against the
+    simulated provider it never appeared, because the stub always emitted
+    complete parameters.
+    """
+    import json as _json
+
+    raw = _json.dumps(
+        {
+            "description": "extract the claims",
+            "checks": [{"kind": "artifact_exists", "params": {}}],
+        }
+    )
+    proposal = parse_proposal(raw)
+    assert not proposal.ok
+    assert "malformed" in (proposal.error or "")

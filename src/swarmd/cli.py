@@ -21,6 +21,10 @@ Commands:
     swarmd providers probe
         What the pool currently believes about each credential (ADR-008).
 
+    swarmd providers budget
+        What is left in each window -- hour, 5-hour session, day, week, month
+        -- and whether the configured providers can carry a week or a month.
+
     swarmd serve
         The control plane the dashboard talks to. The service is the primary
         surface; these commands are the same operations without a browser.
@@ -107,6 +111,12 @@ def main(argv: list[str] | None = None) -> int:
         "probe",
         help="send one tiny request per provider to discover what is actually live",
     )
+    budget = providers_sub.add_parser(
+        "budget",
+        help="what is left this hour, session, day, week and month",
+    )
+    budget.add_argument("--json", action="store_true")
+
     probe.add_argument(
         "--allow-data-training",
         action="store_true",
@@ -351,6 +361,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "providers":
+        if args.providers_command == "budget":
+            return _budget_command(args)
         return asyncio.run(_providers_command(args))
 
     if args.command == "swarm":
@@ -372,6 +384,87 @@ def main(argv: list[str] | None = None) -> int:
 
     parser.error(f"unknown command: {args.command}")
     return 2
+
+
+def _budget_command(args: argparse.Namespace) -> int:
+    """Report remaining capacity per provider, per window.
+
+    Reads the usage journal, so it answers for the machine rather than for one
+    process: a budget consumed by this morning's run is gone whether or not
+    that process is still alive.
+    """
+    import json as _json
+
+    from swarmd.router.budget import BudgetTracker
+
+    tracker = BudgetTracker()
+    reports = tracker.report_all()
+    plan = tracker.capacity_plan()
+
+    if args.json:
+        print(_json.dumps({"providers": reports, "plan": plan}, indent=2))
+        return 0
+
+    for report in reports:
+        blocked = report["blocked"]
+        head = f"{report['provider']}  [{report['kind']}]"
+        print(f"\n{head}{'  BLOCKED: ' + blocked if blocked else ''}")
+
+        grant = report["grant"]
+        if grant:
+            print(
+                f"  grant        {grant['remaining']:>7,} of {grant['total']:,} left"
+                f"   ({grant['fraction_used']:.0%} used, expires in "
+                f"{grant['expires_days']}d)"
+            )
+        for window in report["windows"]:
+            used = window["used_requests"]
+            limit = window["limit_requests"]
+            shown = f"{used:,}/{limit:,}" if limit else f"{used:,}"
+            bar_width = 24
+            filled = min(bar_width, int(window["fraction_used"] * bar_width))
+            bar = "#" * filled + "." * (bar_width - filled)
+            print(
+                f"  {window['window']:<12} {shown:>15}  [{bar}] "
+                f"resets in {_duration(window['resets_in_s'])}"
+            )
+        if report["note"]:
+            print(f"  note: {report['note']}")
+
+    print("\n--- can this run for a week? a month? ---")
+    print(
+        f"plannable     {plan['sustainable_daily_requests']:,} requests/day "
+        f"from published DAILY allowances"
+    )
+    print(
+        f"  week        {plan['week_requests']:,} requests"
+    )
+    print(
+        f"  month       {plan['month_requests']:,} requests"
+    )
+    print(
+        f"one-off       {plan['grant_backed_daily_requests']:,} requests/day "
+        f"from finite grants -- these stop when spent and do not come back"
+    )
+    print(
+        f"unverified    {plan['rate_extrapolated_upper_bound']:,} requests/day "
+        f"upper bound from per-minute rates with no published daily cap."
+    )
+    print(
+        "              That last figure assumes a full day of perfect "
+        "saturation. It is not a plan."
+    )
+    return 0
+
+
+def _duration(seconds: float) -> str:
+    if seconds >= 86400:
+        return f"{seconds / 86400:.1f}d"
+    if seconds >= 3600:
+        return f"{seconds / 3600:.1f}h"
+    if seconds >= 60:
+        return f"{seconds / 60:.0f}m"
+    return f"{seconds:.0f}s"
 
 
 async def _providers_command(args: argparse.Namespace) -> int:

@@ -51,11 +51,22 @@ class ModelPrice:
 
 FREE = ModelPrice(0.0, 0.0)
 
-# Providers whose entire offering used here is free-tier.
+# Providers whose entire offering used here is free-tier, in DOLLARS.
 # "simulated" is priced free because it never touches a network. Its rows
 # carry simulated=True, which is what stops them being read as a real $0 run.
+#
+# `nvidia-nim` is $0 and still finite: it spends a grant of ~1,000 credits that
+# expires after 30 days. Money and quota are different resources, so they are
+# tracked in different places -- dollars here, credits in router/budget.py. A
+# provider can be free and exhausted at the same time, and only one of those
+# two facts belongs in a cost ledger.
+#
+# `cerebras` was removed. Its key now returns 402 "Payment required", so its
+# access is no longer free -- and a provider priced at $0 that actually bills
+# would under-report real spend, which is the one error this table exists to
+# prevent. If it is re-enabled with a card, it needs a PRICES entry.
 FREE_PROVIDERS = frozenset(
-    {"groq", "cerebras", "google-aistudio", "mistral-free", "simulated"}
+    {"groq", "google-aistudio", "mistral-free", "nvidia-nim", "simulated"}
 )
 
 PRICES: dict[str, ModelPrice] = {

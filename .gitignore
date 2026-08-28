@@ -30,3 +30,8 @@ frontend/node_modules/
 frontend/.next/
 frontend/out/
 frontend/next-env.d.ts
+
+# Durable operator state: the cross-run usage journal that long-window budgets
+# are summed from. Machine-local by nature -- committing it would mean one
+# developer's spent quota became everyone's.
+.swarmd/

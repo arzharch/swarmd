@@ -193,6 +193,44 @@ def _check_min_distinct_words(c: Candidate, params: dict[str, Any]) -> CheckOutc
     )
 
 
+# What each check REQUIRES, as data, so the proposal prompt can state the
+# contract instead of showing `"params": {}` and hoping.
+#
+# This existed only in the checks' own `_p(params, "key")` calls, which the
+# model proposing a criterion cannot read. It copied the empty example, emitted
+# checks with no parameters, and every one of them failed every candidate --
+# the first real-provider run graded 0 of 16 nodes and blamed the workers.
+#
+# Kept beside CHECK_KINDS so a new check with a required parameter that is not
+# declared here is visible in review as an obviously missing line.
+CHECK_PARAMS: dict[str, str] = {
+    # Values are ANGLE-BRACKET PLACEHOLDERS describing what to supply, never
+    # plausible literals. Both failure modes have now been observed against
+    # real models, one after fixing the other:
+    #
+    #   `"params": {}`            copied faithfully -> checks with no
+    #                             parameters -> unsatisfiable criterion
+    #   `{"key": "claims.json"}`  copied faithfully -> every criterion demanded
+    #                             a file called claims.json and a stdout marker
+    #                             reading VERIFIED, whatever the task was
+    #
+    # A concrete example is an instruction to copy it. The shape has to be
+    # legible without any of it being usable as-is.
+    "output_nonempty": '{"min_chars": <integer>}',
+    "contains_all": '{"substrings": [<strings that must appear in the output>]}',
+    "regex_match": '{"pattern": "<regex the output must match>"}',
+    "json_parses": '{"required_keys": [<keys the JSON object must contain>]}',
+    "numeric_range": (
+        '{"key": "<artifact key holding the number>", '
+        '"min": <number>, "max": <number>}'
+    ),
+    "artifact_exists": '{"key": "<artifact key the step must write>"}',
+    "exit_code": '{"expected": <integer, usually 0>}',
+    "stdout_contains": '{"substring": "<text the program must print>"}',
+    "min_distinct_words": '{"min_distinct": <integer>}',
+}
+
+
 CHECK_KINDS = {
     "output_nonempty": _check_output_nonempty,
     "contains_all": _check_contains_all,
@@ -254,6 +292,47 @@ class Criterion:
                     re.compile(str(check.params.get("pattern", "")))
                 except re.error as exc:
                     raise CheckError(f"invalid regex: {exc}") from exc
+
+    def malformed(self) -> list[str]:
+        """Checks that can never pass, whatever a worker produces.
+
+        A check missing a required parameter -- `artifact_exists` with no
+        `key`, `contains_all` with no `substrings` -- raises `CheckError` on
+        every candidate. `evaluate` turns that into a failed outcome, so the
+        criterion grades every attempt as a failure forever, and the run
+        reports 0/16 nodes passed with no indication that the criterion itself
+        is the problem.
+
+        That is not hypothetical: it is what the first real-provider run did.
+        Against the simulated provider it never appeared, because the stub
+        emitted proposals whose parameters were always complete.
+
+        Dry-run against a deliberately rich candidate: anything that raises
+        here is malformed regardless of input, as opposed to merely failing on
+        this particular input.
+        """
+        probe = Candidate(
+            output='{"summary": "probe", "count": 1}',
+            artifacts={"probe": "1"},
+            exit_code=0,
+            stdout="probe",
+        )
+        broken = []
+        for check in self.checks:
+            try:
+                CHECK_KINDS[check.kind](probe, check.params)
+            except CheckError as exc:
+                broken.append(f"{check.kind}: {exc}")
+            except KeyError:
+                broken.append(f"{check.kind}: unknown check kind")
+            except Exception:  # noqa: BLE001, S112 - see below
+                # Raising something OTHER than CheckError means the check ran
+                # and disliked the probe, which is exactly what a check is for.
+                # Not logged: this is the expected path for most checks against
+                # a probe they were never written for, so logging it would be
+                # noise at the volume of every criterion ever frozen.
+                continue
+        return broken
 
     def evaluate(self, candidate: Candidate) -> CriterionResult:
         """Grade a candidate. Every check runs, even after one fails.

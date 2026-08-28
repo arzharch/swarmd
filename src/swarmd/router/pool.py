@@ -32,6 +32,7 @@ from typing import Any
 
 from swarmd.ledger import CostAccount
 from swarmd.observability import metrics
+from swarmd.router.budget import BudgetTracker
 from swarmd.router.providers import (
     LLMRequest,
     LLMResponse,
@@ -61,53 +62,94 @@ class ProviderSpec:
     hint_tpm: int = 6_000
 
 
+# EVERY MODEL ID BELOW WAS CALLED BEFORE IT WAS WRITTEN DOWN, on 2026-08-28,
+# with the keys in this deployment. That is not ceremony. The previous table
+# was assembled from documentation and every single entry in it was wrong:
+#
+#   groq            llama-3.3-70b-versatile   404 - the llama models are gone
+#   cerebras        (all four)                402 - free tier now needs a card
+#   google          gemini-2.5-flash          404 - "no longer available to
+#                                                   new users"
+#   openrouter      nvidia/nemotron-3-ultra   400 - not a valid model ID
+#
+# A provider table that has never been called is a list of plausible strings.
+# `swarmd providers probe` re-runs this check; run it when calls start failing
+# for a reason that looks like an outage, because a silently retired model
+# looks exactly like one.
+#
+# Latency and throughput are measured on the prompt shape workers actually
+# send -- a step, a requirement, JSON only -- not on a one-token ping, which
+# measures the network and nothing else.
+
 REGISTRY: dict[str, ProviderSpec] = {
+    # Fastest by a wide margin: 384 tok/s, 0.81s to a complete structured
+    # answer, roughly 4x the next provider. Ordered first for that reason.
     "groq": ProviderSpec(
         name="groq",
         base_url="https://api.groq.com/openai/v1",
         api_key_env="GROQ_API_KEY",
-        models=("llama-3.3-70b-versatile", "llama-3.1-8b-instant"),
+        models=("openai/gpt-oss-20b", "openai/gpt-oss-120b", "qwen/qwen3.8-27b"),
         hint_rpm=30,
-        hint_tpm=6_000,
+        hint_tpm=12_000,
     ),
-    "cerebras": ProviderSpec(
-        name="cerebras",
-        base_url="https://api.cerebras.ai/v1",
-        api_key_env="CEREBRAS_API_KEY",
-        models=("llama-3.3-70b", "llama3.1-8b"),
-        hint_rpm=30,
-        hint_tpm=30_000,
-    ),
+    # Second-fastest and by far the largest daily allowance. The `-lite`
+    # models answer in ~1.2s; plain `gemini-3.5-flash` took 5.5s on the same
+    # prompt, which is why it is last in this tuple rather than first.
     "google-aistudio": ProviderSpec(
         name="google-aistudio",
         base_url="https://generativelanguage.googleapis.com/v1beta/openai",
         api_key_env="GOOGLE_API_KEY",
-        models=("gemini-2.5-flash", "gemini-2.5-flash-lite"),
+        models=(
+            "gemini-3.5-flash-lite",
+            "gemini-flash-lite-latest",
+            "gemini-3.5-flash",
+        ),
         hint_rpm=15,
         hint_tpm=250_000,
     ),
+    # A GRANT, not a tier: ~1,000 credits that never refill and expire 30 days
+    # after issue (see router/budget.py). Ranked behind the replenishing free
+    # tiers deliberately -- spending a finite pool first because it costs
+    # nothing is how the month's burst capacity disappears in week one.
+    #
+    # Note the model IDs: `/v1/models` lists 83 entries and this account can
+    # call four of them. The rest return 404 "Not found for account", so the
+    # catalogue is not an entitlement list.
+    "nvidia-nim": ProviderSpec(
+        name="nvidia-nim",
+        base_url="https://integrate.api.nvidia.com/v1",
+        api_key_env="NVIDIA_NIM_API_KEY",
+        models=(
+            "nvidia/nemotron-3-super-120b-a12b",
+            "nvidia/nemotron-3-nano-30b-a3b",
+            "openai/gpt-oss-20b",
+        ),
+        tier="free_grant",
+        hint_rpm=40,
+        hint_tpm=60_000,
+    ),
+    # 50 requests/day on an unfunded account. Real, and small enough that it is
+    # a tie-breaker rather than a workhorse. `minimax-m3:free` is the one of
+    # the three previously listed that both exists and answers.
     "openrouter": ProviderSpec(
         name="openrouter",
         base_url="https://openrouter.ai/api/v1",
         api_key_env="OPENROUTER_API_KEY",
-        models=(
-            "z-ai/glm-5.2:free",
-            "minimax/minimax-m3:free",
-            "nvidia/nemotron-3-ultra-550b:free",
-        ),
+        models=("minimax/minimax-m3:free",),
         hint_rpm=20,
         hint_tpm=20_000,
     ),
-    # Quota is granted in exchange for consenting to have prompts used for
-    # training. Never enabled unless the caller passes allow_data_training.
+    # Quota granted in exchange for consenting to have prompts used for
+    # training. Never enabled unless the caller passes allow_data_training,
+    # which is off in this deployment.
     "mistral-free": ProviderSpec(
         name="mistral-free",
         base_url="https://api.mistral.ai/v1",
         api_key_env="MISTRAL_API_KEY",
-        models=("mistral-small-latest", "open-mistral-nemo"),
+        models=("open-mistral-nemo", "mistral-small-latest"),
         tier="free_data_training",
         hint_rpm=60,
-        hint_tpm=50_000,
+        hint_tpm=500_000,
     ),
     # Paid overflow. Cheapest capable model with a large context window, which
     # is what an agent carrying retrieved skills actually needs.
@@ -122,7 +164,22 @@ REGISTRY: dict[str, ProviderSpec] = {
     ),
 }
 
-TIER_RANK = {"simulated": 0, "free": 1, "free_data_training": 2, "paid": 3}
+# Cerebras is NOT in this table. Its key returns 402 "Payment required to
+# access this resource" on every model, so its free tier no longer exists for
+# new accounts without a card on file. Listing it would advertise capacity the
+# pool cannot use, and the pool would keep trying it and keep failing.
+
+# Ordering is the cost strategy in one line. `free_grant` sits between the
+# replenishing free tiers and the ones with a non-money price, because a grant
+# is free but FINITE: using it before a tier that refills tomorrow trades a
+# permanent resource for a renewable one.
+TIER_RANK = {
+    "simulated": 0,
+    "free": 1,
+    "free_grant": 2,
+    "free_data_training": 3,
+    "paid": 4,
+}
 
 
 def credentials_for(spec: ProviderSpec) -> list[tuple[str, str]]:
@@ -424,6 +481,7 @@ class ProviderPool(Provider):
         allow_paid: bool = False,
         max_wait_s: float = 30.0,
         quota: QuotaBackend | None = None,
+        budget: BudgetTracker | None = None,
     ) -> None:
         if not slots:
             raise ValueError("ProviderPool needs at least one provider")
@@ -433,6 +491,12 @@ class ProviderPool(Provider):
         self.max_wait_s = max_wait_s
         self.quota = quota if quota is not None else build_quota(None)
         self._quota_ready = False
+        # Long-window budgets: hour, 5-hour session, day, week, month. The
+        # quota bucket above governs the next second; this governs whether
+        # there is anything left to spend this week. Separate objects because
+        # they answer different questions and have different lifetimes -- the
+        # bucket is in memory, the budget survives restarts.
+        self.budget = budget if budget is not None else BudgetTracker()
 
     async def _ensure_quota_configured(self) -> None:
         """Seed each credential's bucket from its published limit, once.
@@ -463,6 +527,7 @@ class ProviderPool(Provider):
         include: list[str] | None = None,
         max_wait_s: float = 30.0,
         quota: QuotaBackend | None = None,
+        budget: BudgetTracker | None = None,
     ) -> ProviderPool:
         """Build a pool from whichever provider keys are actually present.
 
@@ -494,6 +559,7 @@ class ProviderPool(Provider):
                 allow_paid=allow_paid,
                 max_wait_s=max_wait_s,
                 quota=quota,
+                budget=budget,
             )
 
         slots: list[_Slot] = []
@@ -529,6 +595,7 @@ class ProviderPool(Provider):
             allow_paid=allow_paid,
             max_wait_s=max_wait_s,
             quota=quota,
+            budget=budget,
         )
 
     # -- routing ------------------------------------------------------------
@@ -552,6 +619,17 @@ class ProviderPool(Provider):
 
             for slot in ordered:
                 if not slot.state.available():
+                    continue
+
+                # Budget gate, BEFORE the quota gate. The quota bucket refills,
+                # so waiting on it is worth doing; a spent daily quota or an
+                # exhausted grant does not refill on any timescale this call
+                # can wait for, so the right move is to route elsewhere rather
+                # than queue. Checking it second would mean sleeping on a
+                # bucket for a provider that has nothing left to give.
+                blocked = self.budget.blocked(slot.spec.name)
+                if blocked:
+                    errors.append(f"{slot.spec.name}: {blocked}")
                     continue
 
                 # Quota gate. Asking permission before sending is what keeps N
@@ -596,6 +674,17 @@ class ProviderPool(Provider):
                         continue  # try the next model on the same provider
 
                     slot.state.record_success()
+                    # Recorded per CREDENTIAL, because that is the unit every
+                    # provider meters. Two Google keys are two budgets, and a
+                    # tracker that summed them would report the pair as one
+                    # exhausted account.
+                    self.budget.record(
+                        provider=slot.spec.name,
+                        credential=slot.credential_id,
+                        model=resp.model,
+                        requests=1,
+                        tokens=resp.tokens_in + resp.tokens_out,
+                    )
                     cost = 0.0
                     if self.account is not None:
                         cost = self.account.charge_call(
