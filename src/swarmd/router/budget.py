@@ -180,34 +180,63 @@ class BudgetSpec:
 # generous free tier for a provider that refuses every call would be the most
 # misleading entry in this table.
 BUDGETS: dict[str, BudgetSpec] = {
+    # RESEARCHED AND REFUTED 2026-08-29 by independent agents against the
+    # official documentation AND against this deployment's own usage journal.
+    # Two of yesterday's "BLOCKED" states turned out to be self-inflicted:
+    # this table said groq allowed 100,000 tokens/day and openrouter 50
+    # requests/day, and BudgetTracker refused further calls against those
+    # figures. Groq had accepted 101,522 tokens with no 429; openrouter had
+    # accepted 51 requests. The providers never said no. The table did.
+    #
+    # A declared limit that is tighter than the real one is not "safe": it
+    # throws away capacity the operator paid for and reports an outage that
+    # did not happen. The numbers below are what the official pages say,
+    # marked where the official page says nothing.
     "groq": BudgetSpec(
         provider="groq",
         kind="quota",
         limits=(
-            Limit("minute", requests=30, tokens=12_000),
-            Limit("day", requests=1_000, tokens=100_000),
+            # Per MODEL, per the official table. gpt-oss-20b/120b: 8K TPM,
+            # 200K TPD. qwen/qwen3.8-27b: 8K TPM, 2M TPD -- ten times the
+            # daily tokens, which makes it the model to route to when the
+            # others are spent. TPM binds first: at 8K/minute one reasoning-
+            # heavy reply can be most of a minute's budget.
+            Limit("minute", requests=30, tokens=8_000),
+            Limit("day", requests=1_000, tokens=200_000),
         ),
         source="https://console.groq.com/docs/rate-limits",
-        checked="2026-08-28",
+        checked="2026-08-29",
         note=(
-            "Per-model. Measured fastest of every provider here: 384 tok/s on "
-            "openai/gpt-oss-20b, 0.81s to a complete structured answer."
+            "Official numbers, confirmed by four fetches. The official page "
+            "does NOT state how the daily window resets -- not rolling, not a "
+            "timezone, nothing. Blog claims of midnight UTC are unsourced. "
+            "Treated as ROLLING until a response header proves otherwise: the "
+            "x-ratelimit-reset-* headers are the only ground truth Groq "
+            "provides, and the pacer reads them. Yesterday's 100K/day figure "
+            "in this table was wrong by half."
         ),
     ),
     "google-aistudio": BudgetSpec(
         provider="google-aistudio",
         kind="quota",
         limits=(
-            Limit("minute", requests=15, tokens=250_000),
+            # Google publishes NO per-model numbers; it redirects to a private
+            # AI Studio dashboard. The journal shows 16 successful
+            # gemini-3.5-flash-lite calls inside one rolling minute, so 15 RPM
+            # is wrong for the model actually in use. 30 is the figure secondary
+            # sources give for the flash-lite line; the pacer learns the real
+            # one from 429s and headers.
+            Limit("minute", requests=30, tokens=250_000),
             Limit("day", requests=1_000),
         ),
         resets_at_pacific_midnight=True,
         source="https://ai.google.dev/gemini-api/docs/rate-limits",
-        checked="2026-08-28",
+        checked="2026-08-29",
         note=(
-            "Google no longer publishes per-model numbers in its docs -- it "
-            "directs you to AI Studio, which is itself the argument for "
-            "discovering limits from 429s (ADR-008). These are conservative."
+            "Only the midnight-Pacific daily reset is officially stated. Every "
+            "number here is secondary-source or observed, and the official "
+            "page says as much: it directs you to the dashboard. 1,000/day is "
+            "a conservative floor; the pacer widens it from observed headers."
         ),
     ),
     "openrouter": BudgetSpec(
@@ -223,8 +252,9 @@ BUDGETS: dict[str, BudgetSpec] = {
             "1,000/day: this account is FUNDED. Confirmed 2026-08-29 via "
             "GET /api/v1/key (is_free_tier=false, usage=$0), a metadata call "
             "that spends no tokens. `:free` models remain $0 on a funded "
-            "account; the $10 unlocks the request cap, it is not spent by "
-            "free-model calls. The 20/minute cap is unchanged."
+            "account; the $10 unlocks the request cap and is not consumed by "
+            "free-model calls. The 20/minute cap is official; whether it is a "
+            "rolling or fixed minute is not stated."
         ),
     ),
     "mistral-free": BudgetSpec(
@@ -235,11 +265,14 @@ BUDGETS: dict[str, BudgetSpec] = {
             Limit("month", tokens=1_000_000_000),
         ),
         source="https://help.mistral.ai/en/articles/225174",
-        checked="2026-08-28",
+        checked="2026-08-29",
         note=(
-            "1 req/s sustained. The billion-token month is effectively "
-            "unreachable at this scale, so the per-second rate is the real "
-            "constraint. Requires SWARMD_ALLOW_DATA_TRAINING."
+            "1 req/s sustained, 500K TPM, 1B tokens/month. The official docs "
+            "publish limit CATEGORIES, not values -- the numbers are from "
+            "Mistral's help centre and are unverified against the admin "
+            "dashboard. Enabled for this deployment: the operator has "
+            "consented to the Experiment tier's data-training terms in "
+            "exchange for its capacity, which has no daily cap."
         ),
     ),
     "nvidia-nim": BudgetSpec(

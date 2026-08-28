@@ -88,9 +88,14 @@ REGISTRY: dict[str, ProviderSpec] = {
         name="groq",
         base_url="https://api.groq.com/openai/v1",
         api_key_env="GROQ_API_KEY",
-        models=("openai/gpt-oss-20b", "openai/gpt-oss-120b", "qwen/qwen3.8-27b"),
+        # Order is by DAILY headroom, not latency. All three share 30 RPM and
+        # 8K TPM, but qwen/qwen3.8-27b carries 2,000,000 tokens/day against
+        # 200,000 for the gpt-oss pair -- ten times the runway. A day of
+        # swarm work is hundreds of thousands of tokens, so the model with the
+        # deepest daily well goes first and the fast ones take the overflow.
+        models=("qwen/qwen3.8-27b", "openai/gpt-oss-20b", "openai/gpt-oss-120b"),
         hint_rpm=30,
-        hint_tpm=12_000,
+        hint_tpm=8_000,
     ),
     # Second-fastest and by far the largest daily allowance. The `-lite`
     # models answer in ~1.2s; plain `gemini-3.5-flash` took 5.5s on the same
