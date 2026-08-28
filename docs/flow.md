@@ -1328,6 +1328,125 @@ POST /api/runs x2 (identical)     run 1: 8 calls, 4 cache entries
 
 ---
 
+## 2026-08-28 - Building the image, and looking at the screen
+
+Two things had never been done: the container image had never been built, and
+nobody had looked at the dashboard at full size. Both were assumed fine because
+their code read fine. Neither was.
+
+### The deployment artifact did not exist
+
+`docker build -f deploy/Dockerfile` failed on the first try, and had always
+failed. Three defects in sequence, each hidden behind the one before it:
+
+**`uv sync` could not package the project.** pyproject declares
+`readme = "README.md"`; the Dockerfile copied `src/` and `examples/` and not the
+readme, so the build backend died on a missing file. The CI job that builds and
+scans images existed and had never run, because the workflow watched `main` in
+a repo whose branch is `master` -- fixed earlier this week, so the first real CI
+run would have failed at this line.
+
+**The image installed the wrong extras.** `metrics`, `otel`, `redis` -- not
+`serve`, not `postgres`. The manifest runs `swarmd serve` against Postgres, so
+the container started, printed "serve needs the 'serve' extra", and exited. The
+extras are the deployment contract however optional their name sounds.
+
+**The default command bound container-loopback.** `docker run -p 8000:8000`
+connected to nothing: the server was up and listening where the published port
+could not reach it. Kubernetes passes `--host` explicitly and never hit this;
+anyone running the image directly did.
+
+None of the three is subtle. All three were invisible without running a build.
+
+### Then the deployment CrashLoopBackOffed
+
+With a working image, `kubectl apply -k overlays/dev` on a real cluster (k3s,
+k8s 1.31) produced a control plane that restarted forever. The reason was in its
+own logs: the manifest launches it with `--host 0.0.0.0`, and the app refuses to
+bind off-host with no `SWARMD_API_TOKEN` (ADR-013). The base Secret ships that
+key as an empty placeholder.
+
+The guard was right and the manifest was wrong. Prod was fine -- its
+ExternalSecret pulls a real token -- so this was dev-only, which is exactly the
+environment where someone new to the project would meet it first.
+
+**Alternatives considered.** Setting `SWARMD_SIMULATED_PROVIDER=true` in the dev
+overlay would have made the cluster usable immediately, and a guard test
+forbids it in any manifest with a rationale I agree with: a deployed environment
+serving synthetic responses looks alive and does nothing. The dev overlay
+patches in an obviously-fake token instead, and a cluster with no provider keys
+stays healthy-and-not-ready, which is the honest signal.
+
+**What the exercise also produced**, and could not have been read from the
+manifests:
+
+- A fresh cluster rejects three resources: `ServiceMonitor`, `PodMonitor` and
+  `PrometheusRule` need the Prometheus Operator. `apply` reports it *after*
+  everything else applied, so the exit code is non-zero on a mostly-successful
+  deploy. Now a documented prerequisite.
+- `rollout undo` does not update `last-applied-configuration`, so the next
+  `kubectl apply` re-applies the version you just rolled back from. kubectl
+  warns, and the warning scrolls past in an incident. Now in the runbook.
+
+Rollback itself is no longer a documented intention: v1 deployed and Ready, v2
+rolled out, `undo` restored v1, each step gated on `rollout status`, with
+`maxUnavailable: 0` holding capacity throughout. Auth was verified in the
+deployed posture too -- 401 without the token, 202 with it -- and a full chaos
+run with five seeded rogues completed inside the cluster.
+
+Four guard tests now cover the image and the token, each verified by
+reintroducing its defect and watching the test fail.
+
+### The dashboard had never been looked at
+
+Screenshots at 1600x1000, which is the first time anyone had seen it at size.
+
+**Two thirds of the viewport was empty.** `.card { max-height: 460px }` with
+`align-content: start` meant the panels stopped at 460px on a 900px screen --
+while the agent table clipped mid-row *inside* its card. Scrollable content
+that looks truncated, above a half-screen of background. Cards now stretch to
+the row they are in, and the `tall` prop that opted individual cards out of the
+old cap is gone rather than left as a no-op.
+
+**The agent-count field read as disabled.** It is `type="number"`, and the
+stylesheet's input rule listed `input[type="text"], select`. Adding the type to
+the selector did not fix the render, and rather than keep chasing the cascade I
+fixed the actual UX problem: it is now a labelled pill matching the chaos and
+skills controls, with `auto` as the placeholder because empty means "let the
+profile decide" -- a real choice, not an unset value. A bare box with a faint
+placeholder is ambiguous even when it is styled correctly.
+
+**A long decision name printed on top of its own reasoning.**
+`grid-template-columns: 136px 1fr` plus a mono identifier with no break
+opportunity: `rogue_blocked_by_criterion` overflowed its track and overlapped
+the text beside it. `minmax(0, 136px)` and `overflow-wrap: anywhere`.
+
+**The reasoning panel was empty on arrival**, wasting a third of the screen. It
+now selects the first agent that has recorded thoughts -- not simply the first
+agent, since an idle one would trade an empty panel for one that looks broken.
+
+**Views were not linkable.** The view was React state only, so "look at the cost
+panel" was a set of instructions rather than a URL, Back did nothing, and a
+reload always landed on the live run. Now in the fragment, via `replaceState` so
+Back does not walk through every panel someone glanced at.
+
+### Gate evidence
+
+```
+docker build -f deploy/Dockerfile        BUILD_OK (first successful build)
+docker run ... /healthz                  {"status":"ok"}
+kubectl apply -k overlays/dev            applied; control plane Ready
+kubectl rollout undo                     v2 -> v1, Ready, no downtime
+POST /api/runs (no token)                401
+POST /api/runs (token)                   202, run completed, rogue gate passed
+kubeconform -strict (dev/prod)           23 and 24 resources, 0 invalid
+promtool check rules                     SUCCESS: 10 rules found
+ruff / mypy / pytest                     clean, clean, 803 passed
+tsc --noEmit / next build                clean, built
+```
+
+---
+
 ## Next up
 
 - [x] Kernel, pipeline, harnesses, gates, HITL state machine, router

@@ -1,8 +1,9 @@
 # Status
 
-**Generated:** 2026-08-28 · **Commit:** `b3587c3` · **Tests:** 807 passed, 1 skipped
+**Generated:** 2026-08-28 · **Commit:** `aefe50b` · **Tests:** 803 passed, 9 skipped
 **Gates:** ruff clean · mypy clean (54 files) · frontend typechecks and builds ·
-kernel chaos integrity at kill-rate 0.9 · red-team gate passes with five seeded rogues
+kernel chaos integrity at kill-rate 0.9 · red-team gate passes with five seeded rogues ·
+image builds and serves · manifests validate against real k8s schemas · rollback exercised on a cluster
 
 The single authoritative list of what is built and what is not, checked against
 [PRD.md](PRD.md), [SPEC.md](SPEC.md) and the acceptance criteria rather than
@@ -110,7 +111,8 @@ consequently unmeasured, and each has a specific way it could be wrong:
 
 ### Smaller, and not blocking
 - No on-call rotation (single maintainer — stated, not solvable).
-- Rollback documented but never exercised against a real cluster.
+- Rollback exercised on k3s, not on EKS. The difference there is the load
+  balancer's deregistration delay, not the rollback.
 - The kernel `Runtime` and the swarm executor share the `Checkpoint` contract
   but not the loop. A deliberate duplication with a real cost; unifying them is
   the next structural refactor, not a correctness gap.
@@ -163,3 +165,29 @@ spending *more*, one call at a time, past the limit that had just fired.
 **Three ADRs were cited 32 times and did not exist** (007, 008, 010), and
 ADR-001's supersession link pointed at the wrong file. `swarmd bench` was
 documented in the CLI's own docstring and never written.
+
+**The container image had never been built.** `uv sync` could not package the
+project — pyproject declares a readme the Dockerfile never copied. Behind that:
+the image installed neither the `serve` nor the `postgres` extra, so it exited
+at startup saying so, and its default command bound container-loopback, so a
+published port reached nothing. The CI job that builds and scans images existed
+and had never run.
+
+**The deployment CrashLoopBackOffed on every apply.** The manifest launches the
+control plane with `--host 0.0.0.0`; the app refuses to bind off-host with no
+operator token (ADR-013, correctly), and the base Secret ships that key empty.
+Prod was unaffected — its ExternalSecret carries a real token — so this hit
+exactly the environment a newcomer meets first. Found by applying the manifests
+to a real cluster; fixed, with four guard tests each verified by reintroducing
+its defect.
+
+**Two alert links resolved nowhere.** The runbook had one combined heading for
+two alerts, and the guard substring-matched the whole document rather than its
+headings, so it certified a dead link. Both fixed.
+
+**The dashboard wasted two thirds of the viewport.** Cards were capped at 460px
+and packed to the top, so panels stopped mid-screen while their own content
+clipped mid-row. Also: the agent-count field rendered unstyled and read as
+disabled, a long decision name printed on top of its own reasoning, and the
+reasoning panel was empty on arrival. Found by taking a screenshot, which
+nobody had done.
