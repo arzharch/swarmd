@@ -90,65 +90,70 @@ The CLI is the same operations without a browser, not a separate product.
 
 ## 5. The remaining gap
 
-### G-4 · The system solves tasks. 20%, from a standing start of 0%.
-**Blocks:** nothing structural. This is now a quality number to improve, with a
-baseline to improve it against.
+### G-4 · The system solves tasks. Self-learning is measured, and NEGATIVE.
+**Blocks:** an unconditional QA sign-off.
 
-**Eval on live providers**, 10 runs, both arms, in
-[BENCHMARKS.md](BENCHMARKS.md):
+**Task solving works.** 8/8 nodes repeatably on live providers, 20% at task
+level over the suite, $0.00. That was 0% this morning; four mechanisms were
+rejecting correct work and are fixed.
+
+**Self-learning does not, and now there is evidence rather than an absence of
+it.** The measurement that was impossible for most of this project's life has
+now run twice.
+
+#### First: the ablation was not an ablation
+
+`swarmd eval` constructed `SwarmRun(use_skills=use_skills)` and never passed
+`skills=`. Since `self.skills = skills if use_skills else None` evaluates to
+`None` when `skills` is `None`, **both arms ran with no library**. The
+treatment and control arms were byte-identical code paths.
+
+Every "no measured improvement" this project has reported was therefore a null
+result generator, not a measurement. An A/B test whose arms are the same code
+cannot produce anything else, at any sample size. Fixed: the library is passed
+to both arms, and `use_skills` gates retrieval, so the only variable between
+arms is whether a skill may be read.
+
+#### Then: with a real library, skills made it WORSE
+
+11 skills distilled from a training session, human-gate approved, retrieved by
+the treatment arm:
 
 | | treatment | control |
 |---|---|---|
-| solved | 1 / 5 | 1 / 5 |
-| success rate | 20.0% CI[0.00, 0.60] | 20.0% |
-| first-pass | 20.0% | 0.0% |
-| cost per solved | $0.000000 | $0.000000 |
+| solved | 0 / 5 | **2 / 5** |
+| node pass rate | 56.7% | **65.6%** |
+| pass@1 | 0% | 40% |
 
-**Verdict: no measured improvement** — correct at n=5, and the harness saying so
-rather than reporting the first-pass difference as a win is the behaviour it
-exists for.
+Verdict from the harness: **no measured improvement, delta -0.400.** It
+declines to call that a regression at n=5 because the intervals overlap, which
+is the correct reading and not a hedge.
 
-Single tasks now solve completely and repeatably: **6/6 nodes** on two
-different tasks, at $0.00.
+**Diagnosis.** Distillation was writing skills anchored to plan node names --
+`"For steps like 'extract_dates': ..."`. Plan node names are generated fresh
+for every run, so retrieval was injecting confident instructions about a step
+the reading plan does not have. A worker told how to do `extract_dates` while
+executing `tokenize` is worse off than one told nothing, which is exactly what
+the retrieval threshold's own docstring predicts.
 
-**Four defects were rejecting correct work.** All were found by running against
-real models and reading what agents actually produced:
+**Fix applied, not yet measured:** skills now describe the kind of work and the
+output shape it produced, with no node name. The library was rebuilt and reads
+`"When a step calls for this: Return a list of all date strings found in the
+paragraph. Produce a JSON object with these fields: ..."`.
 
-1. **Workers were never shown the criterion.** They saw the task, the step and
-   their own past failures -- never the specification they were graded on. The
-   criterion demanded an artifact key `accuracy`; the plan step said "extract
-   the first claim"; the worker produced correct data under keys nothing was
-   looking for, three attempts running. Solving against a hidden spec makes
-   success accidental. `Criterion.as_requirements()` now renders the frozen
-   checks into the prompt.
+**The re-measurement did not run**, because the day's provider budget was spent
+on the two that did:
 
-   This does not weaken ADR-009: the criterion is authored, attacked and
-   content-addressed before any worker exists, and grading happens elsewhere.
-   The guarantee is that the target cannot move, not that it is secret.
+```
+groq         101,522 / 100,000 tokens   BLOCKED (resets in 1 day)
+openrouter        51 / 50 requests      BLOCKED
+nvidia-nim         0 / 1,000 credits    GRANT EXHAUSTED, does not refill
+google           496 / 1,000 requests   429 under load
+```
 
-2. **A direct JSON answer was not treated as an artifact set.** Agents replying
-   `{"accuracy": 94.3, "baseline": 82.1}` -- correct, complete -- failed every
-   `artifact_exists` check, because artifacts only came from sandbox execution.
-   Answering directly and writing `artifacts.json` are the same claim.
-
-3. **The red-team was containing correct answers.** `criterion_gaming` flagged
-   any passing submission under 20 tokens. For an extraction task the right
-   answer is six tokens. The detector only ever sees submissions that already
-   passed the frozen criterion, so brevity is evidence the task had a short
-   answer, not that the answer was empty. Now it requires short **and**
-   repetitive; judging whether a short answer is substantive needs the task,
-   which the criterion knows and a runtime detector does not. A bare `"ok"` was
-   added to the adversarial attack set so that judgement stays where it belongs.
-
-4. **Two proposers made consensus a union.** `ceil(2 × 0.5) = 1`, so every
-   check either proposer thought of survived: 13 checks where three proposers
-   produce 3-5. Three everywhere now.
-
-**What would move 20% further**, in order: the skill library is still empty, so
-the treatment arm has nothing to retrieve and cannot beat control until
-distillation has fired; `repeats=1` makes the interval [0.00, 0.60], so the
-number needs volume before it means much; and the remaining failures are
-concentrated in the harder wrangling tasks rather than spread evenly.
+That is the budget system reporting exactly what it was built to report,
+including the finite grant reaching zero. It is also the honest reason G4
+carries a measured negative and an unmeasured fix rather than a result.
 
 ---
 
@@ -170,23 +175,28 @@ per-credential usage journal, the frozen criterion hash, the plan hash, the
 integrity hash, the red-team audit trail, and a per-agent reasoning tape. There
 is no counter anywhere that could disagree with the evidence.
 
-**QA: a conditional yes on function, still no on evidence.**
+**QA: still conditional, and I am not signing it off today.**
 
 The product's core claim is that generic agents solve tasks nobody scoped for
 them. That now happens: 20% of tasks end to end, 6/6 nodes on repeated single
 runs, at $0.00. The claim is demonstrated rather than asserted, which it was
 not this morning.
 
-What I still will not sign:
+What I will not sign, in order of how much it matters:
 
+- **The learning claim is measured negative.** Skills made the treatment arm
+  worse: 0/5 against 2/5. A diagnosis exists and a fix is applied, but the
+  re-measurement has not run. Signing off on self-learning today would mean
+  signing off on a hypothesis.
 - **Volume.** n=5 gives CI[0.00, 0.60]. That interval admits almost any true
-  value, so 20% is a measurement, not yet a property.
-- **The learning claim.** The skill library is empty, so the treatment arm has
-  nothing to retrieve. Until distillation fires and a curve exists with its
-  control, no improvement may be claimed -- and the harness enforces this by
-  refusing.
-- **Scale.** Every live run has been `smoke`. `standard` and `deep` are now
-  sized to the measured budget and have never been run against real providers.
+  value, so 20% is a measurement, not a property.
+- **Scale.** Every live run has been `smoke`. `standard` and `deep` are sized
+  to the measured budget and have never been run against real providers.
+
+What changed today is that all three are now *measurable*. The ablation
+compares two different things, pass@k and node pass rate are reported, and the
+eval resumes rather than losing a sweep to an interruption. The blockers are
+measurements that need quota, not features that need building.
 
 The profiles were resized as part of this: `standard` was 500 agents and ~600
 calls against a measured budget of ~1,146 requests/day -- half a day of total
