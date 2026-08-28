@@ -320,7 +320,7 @@ export function EvalReportPanel({ jobs }: { jobs: JobSummary[] }) {
   }
 
   return (
-    <Card title="Latest eval result" meta={`${report.total_runs} runs`} tall>
+    <Card title="Latest eval result" meta={`${report.total_runs} runs`}>
       {report.simulated && (
         <div style={{ marginBottom: 12 }}>
           <span className="pill killed">simulated · not evidence</span>
@@ -533,7 +533,7 @@ export function HarnessPanel() {
 
   const a = config.adjustable;
   return (
-    <Card title="Harness" tall>
+    <Card title="Harness">
       <div className="rail-section" style={{ padding: "0 0 8px" }}>
         Adjustable
       </div>
@@ -714,7 +714,7 @@ export function ReviewPanel() {
     });
 
   return (
-    <Card title="Awaiting review" meta={approvals ? `${approvals.length}` : undefined} tall>
+    <Card title="Awaiting review" meta={approvals ? `${approvals.length}` : undefined}>
       <p style={{ margin: "0 0 12px", color: "var(--text-muted)" }}>
         A skill approved here is inherited by every future run. This is the most
         consequential decision in the system and the least obvious one.

@@ -22,16 +22,17 @@ import type {
 export function Card({
   title,
   meta,
-  tall,
   children,
 }: {
   title: string;
   meta?: React.ReactNode;
-  tall?: boolean;
   children: React.ReactNode;
 }) {
+  // No `tall` variant any more. Cards stretch to the row they are in, so a
+  // per-card height override was a prop that opted one card out of the layout
+  // and, once the cap was removed, did nothing at all.
   return (
-    <section className={tall ? "card tall" : "card"}>
+    <section className="card">
       <header>
         <h2>{title}</h2>
         {meta ? <span className="meta">{meta}</span> : null}
@@ -251,10 +252,10 @@ export function ReasoningPanel({ agent }: { agent: AgentState | null }) {
 
 const ALERT_KINDS = new Set(["containment", "run_failed", "node_error", "agent_killed"]);
 
-export function EventLog({ events, tall }: { events: SwarmEvent[]; tall?: boolean }) {
+export function EventLog({ events }: { events: SwarmEvent[] }) {
   const recent = events.slice(-400).reverse();
   return (
-    <Card title="Event stream" meta={events.length ? `${events.length}` : undefined} tall={tall}>
+    <Card title="Event stream" meta={events.length ? `${events.length}` : undefined}>
       {recent.length === 0 ? (
         <Empty hint="This panel renders the websocket stream. There is no fixture path.">
           Waiting for a run.

@@ -188,17 +188,27 @@ export function TopBar({
         <option value="deep">deep · ~40 min</option>
       </select>
 
-      <input
-        className="agents"
-        type="number"
-        min={1}
-        max={2000}
-        value={agents}
-        onChange={(e) => onAgents(e.target.value)}
-        placeholder="agents"
-        aria-label="Agent count"
+      {/* A LABELLED field, not a bare number box. An empty input whose only
+          hint is a faint placeholder reads as disabled -- and this is the one
+          control an operator most needs to know is editable. The label carries
+          the border and states the unit, so the box holds only digits and its
+          purpose survives being empty. */}
+      <label
+        className="field"
         title="How many agents to run. Empty uses the profile's figure. Generation is batched, so a pool costs one call per node regardless of size; repairs are still one call each, which is what the advisory cap of 32 per node is for. Above it, the cost ceiling is what stops the run."
-      />
+      >
+        <span>agents</span>
+        <input
+          className="agents"
+          type="number"
+          min={1}
+          max={2000}
+          value={agents}
+          onChange={(e) => onAgents(e.target.value)}
+          placeholder="auto"
+          aria-label="Agent count"
+        />
+      </label>
 
       <select
         value={seedRogues}

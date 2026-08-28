@@ -316,7 +316,10 @@ a { color: var(--blue); text-decoration: none; }
 
 .workspace {
   display: grid;
-  grid-template-rows: auto auto 1fr;
+  grid-template-rows: auto auto minmax(0, 1fr);
+  /* Views that stack two boards (Traceability, Evals) add implicit rows.
+     Without this they were auto-sized and ran off the bottom of the screen. */
+  grid-auto-rows: minmax(0, 1fr);
   min-height: 0;
   background: var(--bg-app);
 }
@@ -339,11 +342,45 @@ a { color: var(--blue); text-decoration: none; }
 
 /* The agent-count box. Narrow on purpose: it holds at most four digits, and a
    full-width field next to the task input would read as a second task field. */
-.topbar input.agents {
-  width: 88px;
-  flex: 0 0 auto;
-  text-align: right;
+/* The agent-count field. Bordered on the LABEL rather than the input, for the
+   same reason the chaos and skills controls are: a bare input reads as
+   disabled when it is empty, and this one is empty by default because empty
+   means "let the profile decide" -- a real choice, not an unset value.
+
+   `auto` as the placeholder rather than `agents`: the label already says what
+   the field is, so the placeholder can say what happens if you leave it. */
+.topbar .field {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 36px;
+  padding: 0 10px 0 var(--spacing-12);
+  background: var(--bg);
+  border: var(--stroke-thin) solid var(--border);
+  border-radius: var(--radius-pill);
+  color: var(--text-muted);
+  font-size: var(--font-size-13);
+  transition: border-color var(--duration-ultra-fast) var(--curve-easy-ease);
 }
+.topbar .field:hover { background: var(--bg-subtle); }
+.topbar .field:focus-within {
+  border-color: var(--border-selected);
+  box-shadow: 0 0 0 3px var(--selected-soft);
+}
+.topbar .field > span { user-select: none; }
+.topbar input.agents {
+  width: 52px;
+  flex: 0 0 auto;
+  height: 100%;
+  padding: 0;
+  text-align: right;
+  font-family: var(--mono);
+  font-size: var(--font-size-13);
+  color: var(--text-strong);
+  background: transparent;
+  border: none;
+}
+.topbar input.agents:focus { outline: none; box-shadow: none; }
 
 /* ============================================================
    Controls
@@ -388,7 +425,7 @@ button.ghost:hover:not(:disabled) { background: var(--bg-subtle); border-color: 
 
 button.icon { width: 36px; padding: 0; }
 
-input[type="text"], select {
+input[type="text"], input[type="number"], select {
   height: 36px;
   padding: 0 var(--spacing-12);
   font-family: inherit;
@@ -400,7 +437,19 @@ input[type="text"], select {
   transition: border-color var(--duration-ultra-fast) var(--curve-easy-ease);
 }
 input[type="text"] { flex: 1; min-width: 260px; }
-input[type="text"]:focus, select:focus {
+/* The agent count is at most four digits. A field sized like the task input
+   would read as a second task field, and the spinners steal width from the
+   digits without being useful at this range. */
+input[type="number"] { width: 96px; text-align: right; }
+/* Spinners off: at a range of 1-2000 they steal width from the digits and
+   invite click-incrementing a number that wants to be typed.
+   `appearance: none`, NOT `textfield` -- the latter restores the platform
+   widget look and took the border and background with it, which is why this
+   field rendered flat next to its neighbours and read as disabled. */
+input[type="number"]::-webkit-outer-spin-button,
+input[type="number"]::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+input[type="number"] { -moz-appearance: textfield; appearance: none; }
+input[type="text"]:focus, input[type="number"]:focus, select:focus {
   outline: none;
   border-color: var(--border-selected);
   box-shadow: 0 0 0 3px var(--selected-soft);
@@ -484,7 +533,12 @@ input::placeholder { color: var(--text-faint); }
   padding: var(--spacing-16);
   overflow: auto;
   min-height: 0;
-  align-content: start;
+  /* stretch, not start: the cards fill the height the viewport actually has.
+     Packing to the top left two thirds of a 1000px screen empty while the
+     agent table clipped mid-row inside a 460px card -- the content was
+     scrollable and looked truncated, which is the worst of both. */
+  align-content: stretch;
+  grid-auto-rows: minmax(min(240px, 100%), 1fr);
 }
 .board.cols-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 .board.cols-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -500,7 +554,6 @@ input::placeholder { color: var(--text-faint); }
   display: flex;
   flex-direction: column;
   min-height: 0;
-  max-height: 460px;
   background: var(--bg-panel);
   border: var(--stroke-thin) solid var(--border-soft);
   border-radius: var(--radius-lg);
@@ -509,7 +562,6 @@ input::placeholder { color: var(--text-faint); }
   transition: box-shadow var(--duration-normal) var(--curve-decelerate-mid);
 }
 .card:hover { box-shadow: var(--shadow-sm); }
-.card.tall { max-height: none; }
 
 .card > header {
   display: flex;
@@ -599,13 +651,27 @@ dl.kv dd { margin: 0; text-align: right; font-family: var(--mono); font-variant-
 
 .thought {
   display: grid;
-  grid-template-columns: 136px 1fr;
+  /* minmax(0, ...) rather than a bare 136px: a decision name is a mono
+     identifier with no break opportunity in it, so a long one -- like
+     `rogue_blocked_by_criterion` -- overflowed its track and printed ON TOP of
+     the reasoning text beside it. */
+  grid-template-columns: minmax(0, 136px) 1fr;
   gap: var(--spacing-8);
   padding: 5px 0;
   border-bottom: var(--stroke-thin) solid var(--border-soft);
 }
 .thought:last-child { border-bottom: none; }
-.thought .decision { font-family: var(--mono); font-size: var(--font-size-12); color: var(--text-strong); }
+/* The tape packs an agent id in front of the decision, so the same 136px
+   column that fits `criterion_passed` alone breaks it as `criterion_pas /
+   sed`. Mono identifiers have no good break point, so the fix is width. */
+.thought.wide { grid-template-columns: minmax(0, 208px) 1fr; }
+.thought .decision {
+  font-family: var(--mono);
+  font-size: var(--font-size-12);
+  color: var(--text-strong);
+  /* Break inside the identifier rather than escaping the column. */
+  overflow-wrap: anywhere;
+}
 .thought .reasoning { color: var(--text-muted); }
 
 /* ============================================================

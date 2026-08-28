@@ -124,7 +124,6 @@ export function LedgerPanel({ runId }: { runId: string | null }) {
   return (
     <Card
       title="Ledger"
-      tall
       meta={data ? `${rows.length} of ${data.total}` : undefined}
     >
       {!runId ? (
@@ -270,7 +269,7 @@ export function ReasoningTape({ events }: { events: SwarmEvent[] }) {
   );
 
   return (
-    <Card title="Reasoning tape" tall meta={thoughts.length ? `${thoughts.length}` : undefined}>
+    <Card title="Reasoning tape" meta={thoughts.length ? `${thoughts.length}` : undefined}>
       {thoughts.length === 0 ? (
         <p className="empty">
           No reasoning recorded yet.
@@ -280,7 +279,7 @@ export function ReasoningTape({ events }: { events: SwarmEvent[] }) {
         </p>
       ) : (
         thoughts.map((thought) => (
-          <div className="thought" key={thought.seq}>
+          <div className="thought wide" key={thought.seq}>
             <span className="decision">
               <span style={{ color: "var(--text-faint)", marginRight: 6 }}>
                 {String(thought.agent_id ?? "")}

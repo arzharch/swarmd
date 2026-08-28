@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   AgentGrid,
   CostPanel,
@@ -27,7 +27,7 @@ import {
   ReviewPanel,
   SessionPanel,
 } from "@/components/control";
-import { Rail, TopBar, type ViewId } from "@/components/shell";
+import { Rail, TopBar, VIEWS, type ViewId } from "@/components/shell";
 import { useRunStream } from "@/lib/useRunStream";
 import type {
   CostView,
@@ -39,6 +39,32 @@ import type {
 export default function Dashboard() {
   const stream = useRunStream();
   const [view, setView] = useState<ViewId>("run");
+
+  // The view lives in the URL fragment, so a view is a place you can link to.
+  // Without it "look at the cost panel for run X" is a set of instructions
+  // rather than a link, browser Back does nothing, and a reload always lands
+  // on the live run -- which is the wrong view for anyone arriving to read a
+  // finished one.
+  //
+  // The fragment rather than a path: this is a single-page dashboard whose
+  // server route is the same for every view, and a fragment needs no router,
+  // no server change, and survives the static export.
+  useEffect(() => {
+    const apply = () => {
+      const id = window.location.hash.replace(/^#/, "");
+      if (VIEWS.some((v) => v.id === id)) setView(id as ViewId);
+    };
+    apply();
+    window.addEventListener("hashchange", apply);
+    return () => window.removeEventListener("hashchange", apply);
+  }, []);
+
+  const selectView = useCallback((next: ViewId) => {
+    setView(next);
+    // replaceState, not a hash assignment: pushing an entry per click would
+    // make Back walk through every panel someone glanced at.
+    window.history.replaceState(null, "", `#${next}`);
+  }, []);
   const [task, setTask] = useState(
     "extract every numeric claim from the supplied report and verify each one",
   );
@@ -97,6 +123,19 @@ export default function Dashboard() {
     () => stream.agents.find((a) => a.agent_id === selected) ?? null,
     [stream.agents, selected],
   );
+
+  // Show SOMEONE's reasoning rather than an empty third of the screen. The
+  // first agent with recorded thoughts is picked, not simply the first agent:
+  // an idle or killed agent has nothing to show, so defaulting to it would
+  // trade an empty panel for a panel that looks broken.
+  //
+  // Only while nothing is selected, so this never fights the user's click, and
+  // a selection that disappears between runs falls back rather than sticking.
+  useEffect(() => {
+    if (selected && stream.agents.some((a) => a.agent_id === selected)) return;
+    const speaking = stream.agents.find((a) => a.thoughts.length > 0);
+    if (speaking) setSelected(speaking.agent_id);
+  }, [stream.agents, selected]);
 
   // Taint is read from the ledger, not from a UI setting. If any row in the
   // run was synthetic the banner shows, and there is no way to configure it
@@ -162,7 +201,7 @@ export default function Dashboard() {
     <div className="shell">
       <Rail
         view={view}
-        onView={setView}
+        onView={selectView}
         counts={counts}
         runId={stream.activeRun}
         runStatus={stream.runStatus}
