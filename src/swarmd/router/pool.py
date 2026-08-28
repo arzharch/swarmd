@@ -33,6 +33,7 @@ from typing import Any
 from swarmd.ledger import CostAccount
 from swarmd.observability import metrics
 from swarmd.router.budget import BudgetTracker
+from swarmd.router.pacer import Pacer, PauseCause
 from swarmd.router.providers import (
     LLMRequest,
     LLMResponse,
@@ -40,6 +41,7 @@ from swarmd.router.providers import (
     ProviderError,
 )
 from swarmd.router.quota import QuotaBackend, build_quota
+from swarmd.router.ration import Ration, build_ration
 
 # --- provider catalogue ----------------------------------------------------
 #
@@ -513,6 +515,8 @@ class ProviderPool(Provider):
         max_wait_s: float = 30.0,
         quota: QuotaBackend | None = None,
         budget: BudgetTracker | None = None,
+        ration: Ration | None = None,
+        pacer: Pacer | None = None,
     ) -> None:
         if not slots:
             raise ValueError("ProviderPool needs at least one provider")
@@ -528,6 +532,17 @@ class ProviderPool(Provider):
         # they answer different questions and have different lifetimes -- the
         # bucket is in memory, the budget survives restarts.
         self.budget = budget if budget is not None else BudgetTracker()
+        # The SESSION ration: how much of a daily allowance this 6-hour slot
+        # may spend. The budget tracker above answers "is there anything left
+        # today"; this answers "is there anything left NOW", which is the
+        # question that stops a single afternoon from consuming a day.
+        self.ration = ration if ration is not None else build_ration(
+            self.budget, os.environ.get("SWARMD_REDIS_URL")
+        )
+        # One pause per pool, shared by every agent in the air. Assigned by the
+        # run so its events reach the run's stream; a pool built without one
+        # still works and simply waits without narrating.
+        self.pacer = pacer if pacer is not None else Pacer()
 
     async def _ensure_quota_configured(self) -> None:
         """Seed each credential's bucket from its published limit, once.
@@ -559,6 +574,8 @@ class ProviderPool(Provider):
         max_wait_s: float = 30.0,
         quota: QuotaBackend | None = None,
         budget: BudgetTracker | None = None,
+        ration: Ration | None = None,
+        pacer: Pacer | None = None,
     ) -> ProviderPool:
         """Build a pool from whichever provider keys are actually present.
 
@@ -591,6 +608,8 @@ class ProviderPool(Provider):
                 max_wait_s=max_wait_s,
                 quota=quota,
                 budget=budget,
+                ration=ration,
+                pacer=pacer,
             )
 
         slots: list[_Slot] = []
@@ -627,6 +646,8 @@ class ProviderPool(Provider):
             max_wait_s=max_wait_s,
             quota=quota,
             budget=budget,
+            ration=ration,
+            pacer=pacer,
         )
 
     # -- routing ------------------------------------------------------------
@@ -647,6 +668,10 @@ class ProviderPool(Provider):
         while True:
             ordered = self._ordered()
             quota_waits: list[float] = []
+            # Providers that have capacity today but not in this session. Kept
+            # apart from `errors` because the remedy is different: an error
+            # means try elsewhere, a ration refusal means come back later.
+            ration_waits: list[PauseCause] = []
 
             for slot in ordered:
                 if not slot.state.available():
@@ -661,6 +686,38 @@ class ProviderPool(Provider):
                 blocked = self.budget.blocked(slot.spec.name)
                 if blocked:
                     errors.append(f"{slot.spec.name}: {blocked}")
+                    continue
+
+                # RATION gate. The budget gate above asks whether the DAY has
+                # anything left; this asks whether this six-hour session does.
+                # Without it a single run empties a day in an afternoon and the
+                # next session has nothing -- which is exactly what happened on
+                # 2026-08-28, when one eval sweep took the NVIDIA grant from
+                # 1,000 to 0 and left groq token-blocked for the rest of the
+                # day.
+                #
+                # A refusal here is NOT an error and must not be appended to
+                # `errors`: the capacity exists, it is simply not this
+                # session's to spend yet. It is collected as a pause candidate
+                # so that if EVERY provider refuses, the run waits rather than
+                # failing.
+                grant = await self.ration.reserve(
+                    provider=slot.spec.name,
+                    credential=slot.credential_id,
+                    model=slot.provider.models[0],
+                )
+                if not grant.admitted:
+                    ration_waits.append(
+                        PauseCause(
+                            reason=grant.decision.reason,
+                            provider=slot.spec.name,
+                            credential=slot.credential_id,
+                            dimension=grant.decision.dimension,
+                            used=grant.decision.used,
+                            envelope=grant.decision.envelope,
+                            resumes_at=grant.decision.resumes_at,
+                        )
+                    )
                     continue
 
                 # Quota gate. Asking permission before sending is what keeps N
@@ -680,6 +737,13 @@ class ProviderPool(Provider):
                     try:
                         resp = await slot.provider.complete_with(model, request)
                     except RateLimited as exc:
+                        # The request stands against the ration even though it
+                        # failed: several providers count a 429 toward the
+                        # daily allowance, so releasing it here would let a
+                        # throttled run spend its day discovering that.
+                        await self.ration.settle(
+                            grant, tokens=0, outcome="rate_limited"
+                        )
                         slot.state.record_429(exc.retry_after_s)
                         metrics.record_rate_limited(
                             provider=slot.spec.name, model=model
@@ -695,6 +759,7 @@ class ProviderPool(Provider):
                         errors.append(f"{slot.spec.name}: 429")
                         break  # whole provider is throttled, not just this model
                     except ProviderError as exc:
+                        await self.ration.settle(grant, tokens=0, outcome="error")
                         slot.state.record_error()
                         metrics.record_llm_error(
                             provider=slot.spec.name,
@@ -704,6 +769,12 @@ class ProviderPool(Provider):
                         errors.append(str(exc))
                         continue  # try the next model on the same provider
 
+                    # The estimate becomes the measurement. Until this
+                    # call the ration held a forecast; leaving it there would
+                    # ration the rest of the session against a guess.
+                    await self.ration.settle(
+                        grant, tokens=resp.tokens_in + resp.tokens_out
+                    )
                     slot.state.record_success()
                     # Recorded per CREDENTIAL, because that is the unit every
                     # provider meters. Two Google keys are two budgets, and a
@@ -739,6 +810,29 @@ class ProviderPool(Provider):
                     )
                     return resp
 
+            # RATION PAUSE, checked before the short-wait path. A spent
+            # session ration is not an outage and not a backoff: the capacity
+            # exists and belongs to a later slot, so the honest response is to
+            # wait for that slot rather than to fail a run that could finish.
+            #
+            # This is deliberately NOT bounded by max_wait_s. That deadline
+            # exists for transient unavailability measured in seconds; a
+            # session boundary is measured in hours, and applying a 30-second
+            # patience to a 4-hour wait would turn "come back later" into "this
+            # run cannot complete", which is the outcome the whole module
+            # exists to prevent.
+            if ration_waits and not any(s.state.available() for s in ordered):
+                # The soonest returning capacity across every refused provider.
+                # Waiting for the latest would idle through openings.
+                soonest = min(ration_waits, key=lambda c: c.resumes_at)
+                await self.pacer.park(soonest, agent_id=agent_id)
+                # Woken: re-enter the loop and re-evaluate from scratch. The
+                # ration may have refilled, another provider may have recovered,
+                # or the operator may have unlocked capacity -- none of which
+                # this frame's stale decisions know about.
+                deadline = time.monotonic() + self.max_wait_s
+                continue
+
             # Nothing usable right now. Wait for the soonest opening -- from
             # either a backoff expiring or a quota bucket refilling -- if that
             # fits inside the deadline.
@@ -747,9 +841,21 @@ class ProviderPool(Provider):
             waits = [w for w in waits if w != float("inf")]
             now = time.monotonic()
             if not waits or now >= deadline:
+                detail = "; ".join(errors[-5:])
+                if ration_waits:
+                    # Say WHICH ration ran out. "no provider capacity" on its
+                    # own sent an operator hunting for an outage that was not
+                    # happening.
+                    detail = (
+                        detail
+                        + ("; " if detail else "")
+                        + "; ".join(
+                            f"{c.provider}: {c.reason} ({c.dimension})"
+                            for c in ration_waits[:3]
+                        )
+                    )
                 raise NoCapacity(
-                    f"no provider capacity within {self.max_wait_s}s; "
-                    + "; ".join(errors[-5:])
+                    f"no provider capacity within {self.max_wait_s}s; {detail}"
                 )
             sleep_for = min(min(waits), deadline - now)
             if sleep_for <= 0:
@@ -757,6 +863,14 @@ class ProviderPool(Provider):
             await asyncio.sleep(sleep_for)
 
     # -- introspection ------------------------------------------------------
+
+    def pace_status(self) -> dict[str, Any]:
+        """Whether the pool is paused, why, and when it comes back.
+
+        Separate from `status()` because that is per-provider and a pause is a
+        property of the whole pool: every agent is waiting on the same clock.
+        """
+        return self.pacer.status()
 
     def status(self) -> list[dict[str, Any]]:
         """Live view of the pool. Feeds the CLI probe and the dashboard."""
@@ -823,4 +937,9 @@ class ProviderPool(Provider):
         return list(await asyncio.gather(*(one(s) for s in self._slots)))
 
     async def aclose(self) -> None:
+        # The pacer holds a heartbeat task while paused. Closing providers and
+        # leaving it running strands a timer on a loop that is about to go
+        # away -- harmless in production where the process exits, and a hang
+        # in a test suite where the next test inherits it.
+        await self.pacer.aclose()
         await asyncio.gather(*(s.provider.aclose() for s in self._slots))
