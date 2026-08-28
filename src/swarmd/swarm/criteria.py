@@ -43,13 +43,27 @@ from typing import Any
 
 @dataclass(frozen=True, slots=True)
 class Candidate:
-    """What gets graded: an agent's output plus whatever running it produced."""
+    """What gets graded: what the step PRODUCED, plus how it produced it.
+
+    `output` is the answer, not the transcript. For a step that writes code,
+    the answer is what running the code produced -- not the source. Grading the
+    source was a real failure: every real-provider run scored 0/N because
+    models replied with a fenced ```python block, the sandbox ran it correctly,
+    and then a `json_parses` check read the Python and reported "not JSON".
+
+    `source` keeps the raw model reply so traceability does not lose it. It is
+    deliberately not what checks read: a criterion asking "is the answer valid
+    JSON with these keys" means the answer.
+    """
 
     output: str = ""
     artifacts: dict[str, Any] = field(default_factory=dict)
     exit_code: int | None = None
     stdout: str = ""
     stderr: str = ""
+    # The raw model reply when `output` was derived from running it. Empty when
+    # the reply IS the output.
+    source: str = ""
 
 
 # --- checks ----------------------------------------------------------------
@@ -220,11 +234,21 @@ CHECK_PARAMS: dict[str, str] = {
     "contains_all": '{"substrings": [<strings that must appear in the output>]}',
     "regex_match": '{"pattern": "<regex the output must match>"}',
     "json_parses": '{"required_keys": [<keys the JSON object must contain>]}',
+    # ARTIFACTS ARE KEYS IN ONE JSON OBJECT, NOT FILENAMES. Both halves of the
+    # system have to agree on this and for a while they did not: the worker
+    # prompt says "write results to artifacts.json", so proposers reasonably
+    # read `key` as a file name and asked for `numeric_claims.json`. The worker
+    # obliged by writing {"numeric_claims.json": {...}} -- correct data, nested
+    # one level too deep -- and every check for a top-level `accuracy` failed
+    # against a run that had actually extracted the accuracy.
     "numeric_range": (
-        '{"key": "<artifact key holding the number>", '
-        '"min": <number>, "max": <number>}'
+        '{"key": "<top-level key in artifacts.json, e.g. accuracy -- '
+        'NOT a filename>", "min": <number>, "max": <number>}'
     ),
-    "artifact_exists": '{"key": "<artifact key the step must write>"}',
+    "artifact_exists": (
+        '{"key": "<top-level key the step must put in artifacts.json, '
+        'e.g. claims -- NOT a filename>"}'
+    ),
     "exit_code": '{"expected": <integer, usually 0>}',
     "stdout_contains": '{"substring": "<text the program must print>"}',
     "min_distinct_words": '{"min_distinct": <integer>}',

@@ -285,8 +285,34 @@ class OpenAICompatProvider(Provider):
 
         data = resp.json()
         usage = data.get("usage", {})
+        message = data["choices"][0]["message"]
+        text = message.get("content") or ""
+
+        if not text.strip():
+            # AN EMPTY COMPLETION IS A FAILURE, not an answer, and saying so
+            # here is what makes the pool fail over instead of handing "" to a
+            # caller that has no way to tell it apart from a bad reply.
+            #
+            # This is not a theoretical case. `openai/gpt-oss-20b` is a
+            # REASONING model: given a long prompt it spends the entire output
+            # budget thinking and returns content="" with completion_tokens at
+            # the cap. Criterion synthesis then reported "no proposer produced
+            # a parseable criterion" and refused to run -- blaming the models
+            # for output they were never given room to write.
+            #
+            # Raised rather than retried in place: the pool already knows how
+            # to try the next model and the next provider, and duplicating that
+            # here would give one failure two different recovery paths.
+            finish = data["choices"][0].get("finish_reason", "?")
+            raise ProviderError(
+                f"{self.name}/{model}: empty completion "
+                f"(finish_reason={finish}, completion_tokens="
+                f"{usage.get('completion_tokens', 0)}). A reasoning model that "
+                f"exhausts max_tokens before answering looks exactly like this."
+            )
+
         return LLMResponse(
-            text=data["choices"][0]["message"]["content"],
+            text=text,
             provider=self.name,
             model=model,
             latency_s=time.monotonic() - start,

@@ -274,7 +274,12 @@ class SwarmRun:
                     prompt=prompt,
                     system=system,
                     temperature=0.4,
-                    max_tokens=700,
+                    # Room to reason AND answer. Reasoning models spend output
+                    # tokens on thinking, so a budget sized for the answer
+                    # alone returns an empty completion -- which is what
+                    # gpt-oss-20b did to every criterion proposal until the
+                    # schema hint grew and pushed it over the edge.
+                    max_tokens=2000,
                     metadata={
                         "stage": stage,
                         "agent_id": f"{stage}-agent",

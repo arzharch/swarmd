@@ -153,7 +153,13 @@ PROPOSER_SYSTEM = (
     "You define what SUCCESS means for a task, before anyone attempts it. "
     "You do not solve the task. You produce machine-checkable criteria that "
     "empty, constant, or prompt-echoing output would FAIL. Prefer checks over "
-    "concrete artifacts and exit codes to checks over prose."
+    "concrete artifacts and exit codes to checks over prose.\n"
+    "\n"
+    "THE ARTIFACT CONTRACT, which your checks are graded against: a worker "
+    "writes ONE flat JSON object to artifacts.json. Its top-level keys are the "
+    "values being reported, so `artifact_exists` and `numeric_range` take one "
+    "of those keys -- `accuracy`, `claims` -- never a file name. The graded "
+    "output IS that object, so `json_parses` sees it directly."
 )
 
 

@@ -19,6 +19,7 @@ on success it would be the first thing selection pressure learned to exploit.
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from dataclasses import dataclass, field
@@ -36,9 +37,16 @@ logger = logging.getLogger(__name__)
 
 WORKER_SYSTEM = (
     "You execute one step of a plan for a task you did not design. Produce the "
-    "artifact the step asks for and nothing else. If the step calls for code, "
-    "emit runnable Python that writes its results to artifacts.json. Do not "
-    "claim success; something else decides that."
+    "artifact the step asks for and nothing else. Do not claim success; "
+    "something else decides that.\n"
+    "\n"
+    "If the step calls for code, emit runnable Python that writes ONE FLAT "
+    "JSON OBJECT to artifacts.json. Its top-level keys are the values you are "
+    "reporting -- {\"accuracy\": 94.3, \"claims\": [...]} -- with real "
+    "types, not strings wrapping whole sentences. Do NOT nest your result "
+    "under a filename key: artifacts.json is the file, its keys are the "
+    "answer. That mismatch is graded as a miss even when the numbers are "
+    "right, because the criterion looks for the key it asked for."
 )
 
 
@@ -351,12 +359,25 @@ class GenericWorker:
             return ""
 
     async def _materialise(self, text: str, node: PlanNode) -> Candidate:
-        """Turn model output into a gradeable Candidate.
+        """Turn a model reply into a gradeable Candidate.
 
-        If the output looks like code and a sandbox is available, it is
-        executed and the run's artifacts become the candidate's — which is how
-        an objectively checkable claim ("accuracy was 0.94") gets produced
-        rather than asserted.
+        THE OUTPUT IS THE ANSWER, NOT THE REPLY. This distinction is the whole
+        function, and getting it wrong made every real-provider run score 0/N.
+
+        The worker prompt tells agents to write results to artifacts.json, and
+        real models comply: they reply with a fenced ```python block. The old
+        version ran that code correctly and then set `output` to the fenced
+        SOURCE, so a criterion checking `json_parses` read Python and said "not
+        JSON" -- for a step that had in fact succeeded.
+
+        So, in order of what the step actually produced:
+
+          artifacts   the contract the prompt states. Serialised as the answer.
+          stdout      a program that printed its result instead of writing it.
+          the reply   no code ran; the reply IS the answer, un-fenced.
+
+        The simulated provider never surfaced this because it replied with bare
+        JSON, which is the one shape where source and answer coincide.
         """
         code = _extract_code(text)
         if code and self.context.sandbox is not None:
@@ -365,14 +386,25 @@ class GenericWorker:
             artifacts = dict(result.artifacts)
             if result.violation:
                 artifacts["_violation"] = result.violation
+
+            if artifacts:
+                answer = json.dumps(artifacts, sort_keys=True, default=str)
+            elif result.stdout.strip():
+                answer = result.stdout.strip()
+            else:
+                # Nothing produced. Keeping the source here is deliberate: the
+                # criterion should fail this, and a repair round is more useful
+                # when the agent can see what it submitted.
+                answer = text
             return Candidate(
-                output=text,
+                output=answer,
+                source=text,
                 artifacts=artifacts,
                 exit_code=result.exit_code,
                 stdout=result.stdout,
                 stderr=result.stderr,
             )
-        return Candidate(output=text)
+        return Candidate(output=_unfence(text))
 
     def _observe(self, action: Action) -> bool:
         """Report an action to the red-team. Returns True if contained."""
@@ -423,6 +455,7 @@ def _candidate_to(candidate: Candidate) -> dict[str, Any]:
     """
     return {
         "output": candidate.output,
+        "source": candidate.source,
         "artifacts": candidate.artifacts,
         "exit_code": candidate.exit_code,
         "stdout": candidate.stdout,
@@ -433,11 +466,38 @@ def _candidate_to(candidate: Candidate) -> dict[str, Any]:
 def _candidate_from(data: dict[str, Any]) -> Candidate:
     return Candidate(
         output=str(data.get("output", "")),
+        source=str(data.get("source", "")),
         artifacts=dict(data.get("artifacts") or {}),
         exit_code=data.get("exit_code"),
         stdout=str(data.get("stdout", "")),
         stderr=str(data.get("stderr", "")),
     )
+
+
+def _unfence(text: str) -> str:
+    """Strip a markdown fence around a non-code answer.
+
+    A model asked for JSON commonly returns it inside ```json fences. That is a
+    presentation wrapper, not part of the answer, and leaving it on makes every
+    `json_parses` check fail on output that is otherwise exactly right.
+
+    Only strips when the whole reply is one fenced block: a fence in the middle
+    of prose is content, and cutting it out would change the answer.
+    """
+    stripped = text.strip()
+    fence = "```"
+    if not stripped.startswith(fence) or stripped.count(fence) < 2:
+        return text
+    body = stripped[len(fence) :]
+    first_newline = body.find("\n")
+    if first_newline == -1:
+        return text
+    language = body[:first_newline].strip().lower()
+    if language not in {"", "json", "text"}:
+        return text
+    inner = body[first_newline + 1 :]
+    closing = inner.rfind(fence)
+    return inner[:closing].strip() if closing != -1 else text
 
 
 def _extract_code(text: str) -> str:
