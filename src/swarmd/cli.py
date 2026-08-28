@@ -244,6 +244,11 @@ def main(argv: list[str] | None = None) -> int:
                     choices=["smoke", "standard", "deep", "eval"])
     ev.add_argument("--benchmarks", default=None, metavar="PATH",
                     help="generate BENCHMARKS.md here (refuses simulated data)")
+    ev.add_argument(
+        "--journal", default=".swarmd/eval.jsonl", metavar="PATH",
+        help="append each completed run here so an interrupted eval resumes "
+        "rather than starting over. Delete it to force a clean measurement.",
+    )
     ev.add_argument("--json", default=None, metavar="PATH",
                     help="write the full report as JSON")
 
@@ -718,7 +723,12 @@ async def _eval_command(args: argparse.Namespace) -> int:
     print(f"evaluating {len(tasks)} tasks x {args.repeats} repeats x 2 arms "
           f"= {len(tasks) * args.repeats * 2} runs")
 
-    report = await Evaluator(run_factory, repeats=args.repeats).evaluate(tasks)
+    # Journalled, so an interrupted eval resumes instead of discarding every
+    # run it already paid for. A 20-run sweep takes ~20 minutes against free
+    # tiers; losing it to a terminated shell means spending the quota twice.
+    report = await Evaluator(
+        run_factory, repeats=args.repeats, journal=args.journal
+    ).evaluate(tasks)
     await pool.aclose()
 
     print()

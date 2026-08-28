@@ -355,7 +355,12 @@ def _eval_runner(app: FastAPI, request: EvalRequest, registry: JobRegistry) -> A
             registry.progress(job, completed)
             return result, run.report(result)
 
-        report = await Evaluator(run_factory, repeats=request.repeats).evaluate(tasks)
+        # Journalled per job, so a control-plane restart mid-sweep resumes.
+        report = await Evaluator(
+            run_factory,
+            repeats=request.repeats,
+            journal=f".swarmd/eval-{job.job_id}.jsonl",
+        ).evaluate(tasks)
         return report.to_dict()
 
     return run

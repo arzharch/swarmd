@@ -11,6 +11,7 @@ the project defensible:
 from __future__ import annotations
 
 import json
+from typing import ClassVar
 
 import pytest
 
@@ -330,3 +331,71 @@ def test_a_dirty_tree_is_reported_as_dirty():
 
     sha = _git_sha()
     assert sha == "unknown" or len(sha) >= 7
+
+
+# --- an eval that is killed must not lose what it paid for -----------------
+
+
+async def test_an_interrupted_eval_resumes_instead_of_starting_over(tmp_path):
+    """The gap that cost three attempts and a chunk of a day's free quota.
+
+    A 20-run eval took 21 minutes and wrote nothing until the last run
+    finished, so every interruption discarded the whole measurement AND the
+    provider requests it had spent. Strange property for a system whose
+    headline guarantee is that killed work is resumed rather than repeated.
+    """
+    from swarmd.swarm.evaluate import Evaluator, Task
+
+    tasks = [Task(task_id="t1", arm="custom", domain="d", prompt="p", seed=1)]
+    calls: list[tuple[str, bool, int]] = []
+
+    async def factory(task, use_skills, seed):
+        calls.append((task.task_id, use_skills, seed))
+        if len(calls) > 2:
+            raise RuntimeError("killed")
+        return _fake_result(), {"cost": {"total_usd": 0.0}}
+
+    journal = tmp_path / "eval.jsonl"
+    with pytest.raises(RuntimeError):
+        await Evaluator(factory, repeats=2, journal=journal).evaluate(tasks)
+
+    assert len(calls) == 3           # two recorded, the third died
+    first_pass = list(calls)
+
+    # A second attempt must skip what the first already measured.
+    calls.clear()
+
+    async def good_factory(task, use_skills, seed):
+        calls.append((task.task_id, use_skills, seed))
+        return _fake_result(), {"cost": {"total_usd": 0.0}}
+
+    report = await Evaluator(
+        good_factory, repeats=2, journal=journal
+    ).evaluate(tasks)
+
+    assert len(report.outcomes) == 4, "every unit must be present in the report"
+    redone = set(calls) & set(first_pass[:2])
+    assert not redone, f"re-ran work already measured: {redone}"
+
+
+async def test_an_eval_without_a_journal_still_works(tmp_path):
+    """Journalling is durability, not a dependency."""
+    from swarmd.swarm.evaluate import Evaluator, Task
+
+    async def factory(task, use_skills, seed):
+        return _fake_result(), {"cost": {"total_usd": 0.0}}
+
+    report = await Evaluator(factory, repeats=1).evaluate(
+        [Task(task_id="t1", arm="custom", domain="d", prompt="p", seed=1)]
+    )
+    assert len(report.outcomes) == 2
+
+
+def _fake_result():
+    class R:
+        status = "completed"
+        duration_s = 0.1
+        results: ClassVar[list] = []
+        contained: ClassVar[list] = []
+
+    return R()

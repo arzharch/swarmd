@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import random
 import statistics
 import time
@@ -450,27 +451,91 @@ class Evaluator:
       5 repeats is already about 75% of a day's free quota.
     """
 
-    def __init__(self, run_factory: Any, *, repeats: int = 5) -> None:
+    def __init__(
+        self,
+        run_factory: Any,
+        *,
+        repeats: int = 5,
+        journal: str | Path | None = None,
+    ) -> None:
         # run_factory(task, use_skills, seed) -> awaitable RunResult+report, so
         # this module never imports a provider and the harness is testable
         # without a network.
         self.run_factory = run_factory
         self.repeats = repeats
+        # Where completed runs are recorded as they finish. An eval is the
+        # longest operation this system performs -- 20 runs took 21 minutes --
+        # and it used to write nothing until the last one finished, so any
+        # interruption threw away the whole measurement and every provider
+        # request it had spent.
+        #
+        # That is a strange property for a system whose headline guarantee is
+        # that killed work is resumed rather than repeated. The kernel
+        # checkpoints, the swarm checkpoints, and the eval did not.
+        self.journal = Path(journal) if journal else None
 
     async def evaluate(self, tasks: list[Task]) -> EvalReport:
         started = time.monotonic()
         report = EvalReport(repeats=self.repeats)
+
+        # Anything already measured is not measured again. Keyed on
+        # (task, seed, arm) because that triple IS the experimental unit -- the
+        # pairing the whole comparison rests on.
+        done = self._load_journal()
+        if done:
+            logger.info(
+                "resuming eval: %d run(s) already recorded, skipping them",
+                len(done),
+            )
+            report.outcomes.extend(done.values())
 
         for task in tasks:
             for repeat in range(self.repeats):
                 seed = task.seed + repeat
                 # Both arms, same task, same seed. The pairing is the point.
                 for use_skills in (True, False):
+                    key = (task.task_id, seed, use_skills)
+                    if key in done:
+                        continue
                     outcome = await self._one(task, use_skills, seed)
                     report.outcomes.append(outcome)
+                    self._record(outcome)
 
         report.duration_s = time.monotonic() - started
         return report
+
+    # -- durability -----------------------------------------------------
+
+    def _load_journal(self) -> dict[tuple[str, int, bool], TaskOutcome]:
+        if not self.journal or not self.journal.exists():
+            return {}
+        done: dict[tuple[str, int, bool], TaskOutcome] = {}
+        for line in self.journal.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                data = json.loads(line)
+                outcome = TaskOutcome(**data)
+            except Exception:  # noqa: BLE001 - a torn line costs one run
+                logger.warning("skipping unreadable eval journal row")
+                continue
+            done[(outcome.task_id, outcome.seed, outcome.treatment)] = outcome
+        return done
+
+    def _record(self, outcome: TaskOutcome) -> None:
+        if not self.journal:
+            return
+        try:
+            self.journal.parent.mkdir(parents=True, exist_ok=True)
+            with self.journal.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(outcome.to_dict()) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+        except OSError as exc:
+            # Losing durability degrades resumability. Refusing to continue
+            # would throw away the runs already paid for.
+            logger.warning("eval journal unwritable: %s", exc)
 
     async def _one(self, task: Task, use_skills: bool, seed: int) -> TaskOutcome:
         result, run_report = await self.run_factory(task, use_skills, seed)
