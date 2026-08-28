@@ -143,30 +143,52 @@ fired.
 
 ---
 
-## CostCeilingApproaching / CeilingAbort
+## CostCeilingApproaching
 
-**Severity:** ticket
+**Severity:** ticket · run spend past 70% of the ceiling
 
-**What it means.** Free-tier traffic should hold spend at exactly zero. Any
+**What it means.** Free-tier traffic should hold spend at exactly zero, so any
 meaningful spend means paid overflow is carrying load. That is a *routing*
 question, not a budget one — the interesting thing is why free capacity was
 unavailable, not that money was spent.
 
 **Confirm:**
 ```bash
-# Cost by provider, straight from the ledger -- authoritative, unlike the dashboard
+# Cost by provider, straight from the ledger -- authoritative, unlike the
+# dashboard, because every figure is a sum over rows (ADR-007).
 swarmd ledger report --run <run_id>
 ```
 
+**Do now:** nothing to the ceiling. Find out why free capacity ran out — the
+same investigation as `RateLimitRatioHigh`, since paid overflow is only reached
+when the free tiers are exhausted or unavailable.
+
+**Prevent:** the same fixes as `RateLimitRatioHigh`.
+
+---
+
+## CeilingAbort
+
+**Severity:** ticket · a run stopped rather than overspending
+
+**What it means.** The ceiling did its job. This alert is not a failure report;
+it is the record of a control working, and the run's itemised report is the
+useful artifact.
+
+**Confirm:**
+```bash
+swarmd ledger report --run <run_id>    # which stage consumed the budget
+```
+
 **Do now:**
-- Ceiling abort is working as designed: the run stopped rather than
-  overspending. Read the itemised report to see which stage consumed the budget.
+- Read the itemised report before touching anything. A run that aborted at the
+  ceiling produced a partial result and said so; it did not truncate silently.
 - If the ceiling is genuinely too low for the workload, raise
   `SWARMD_COST_CEILING_USD` **deliberately and in a commit**, not as a hotfix.
   The value being a decision is the entire point of having it.
-
-**Prevent:** the same fixes as `RateLimitRatioHigh` — paid overflow is only
-reached when free capacity runs out.
+- If spend climbed faster than expected, check `BatchingDegraded` first: a run
+  that fell back to one call per agent costs N times the requests, and on a paid
+  tier that is also N times the money.
 
 ---
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ipaddress
 import pathlib
+import re
 
 import pytest
 import yaml
@@ -225,15 +226,25 @@ def test_every_alert_has_a_runbook_entry():
     )
     runbook = (REPO / "docs" / "RUNBOOK.md").read_text(encoding="utf-8").lower()
 
+    # Match against the runbook's actual HEADINGS, not against its whole text.
+    # Substring-matching the document was too weak to be useful: two alerts
+    # linked #costceilingapproaching and #ceilingabort while the runbook had a
+    # single combined "## CostCeilingApproaching / CeilingAbort" heading, so
+    # both links resolved to nothing and this test passed anyway. A guard that
+    # accepts a dead link is worse than no guard, because it certifies it.
+    headings = {
+        re.sub(r"[^a-z0-9]", "", line)
+        for line in re.findall(r"^##\s+(.+)$", runbook, re.MULTILINE)
+    }
+
     missing = []
     for group in alerts["groups"]:
         for rule in group["rules"]:
             anchor = rule["labels"].get("runbook", "")
             assert anchor, f"{rule['alert']} declares no runbook link"
-            heading = anchor.split("#", 1)[-1]
-            if heading not in runbook.replace(" ", "").replace("/", ""):
-                missing.append(rule["alert"])
-    assert missing == [], f"alerts with no runbook section: {missing}"
+            if anchor.split("#", 1)[-1] not in headings:
+                missing.append(f"{rule['alert']} -> {anchor}")
+    assert missing == [], f"alerts whose runbook link resolves nowhere: {missing}"
 
 
 @pytest.mark.parametrize("path", ["observability/alerts.yml", "observability/prometheus.yml"])
