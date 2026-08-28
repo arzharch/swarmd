@@ -1447,6 +1447,147 @@ tsc --noEmit / next build                clean, built
 
 ---
 
+## 2026-08-28 - Real keys, and what they said
+
+Six provider keys arrived. The work was meant to be "add NVIDIA and track the
+limits". Most of it turned out to be finding out that the provider table this
+project had shipped with was fiction.
+
+### Every model ID in the registry was wrong
+
+Probed with the real keys before writing anything down:
+
+| Configured | Reality |
+|---|---|
+| groq `llama-3.3-70b-versatile` | 404 -- the llama models are gone from Groq |
+| cerebras (all four) | **402 Payment required** -- the free tier needs a card now |
+| google `gemini-2.5-flash` | 404 "no longer available to new users" |
+| openrouter `nvidia/nemotron-3-ultra-550b:free` | 400 "not a valid model ID" |
+| openrouter `z-ai/glm-5.2:free` | 429 rate-limited upstream |
+
+Two of six providers had a single working model between them. A provider table
+assembled from documentation and never called is a list of plausible strings,
+and this one had been carried, commented and tested for the life of the
+project.
+
+The same held for NVIDIA. Its `/v1/models` lists 83 entries; this account can
+call **four**. The rest return `404 Not found for account`, so the catalogue is
+not an entitlement list. The model IDs I had researched from documentation --
+`nvidia/llama-3.1-nemotron-nano-8b-v1`, `meta/llama-3.2-3b-instruct` -- were
+not among them.
+
+Everything in the registry is now measured on the prompt shape workers actually
+send, not on a one-token ping, which measures the network and nothing else.
+Groq turned out to be roughly 4x faster than anything else available (384 tok/s,
+0.81s to a complete structured answer) and is ordered first for that reason.
+
+### Decision: three kinds of limit, not one
+
+**Problem.** "Track the limits" sounds like one number per provider. It is not.
+Cerebras replenishes continuously, Google resets at midnight Pacific, and
+NVIDIA hands out ~1,000 credits that never refill and **expire after 30 days**.
+
+**Decision.** `router/budget.py` models three kinds -- RATE, QUOTA, GRANT --
+because what running out MEANS differs, and that is what an operator needs
+before deciding whether to wait.
+
+The grant is the one that punishes optimism. It costs $0, so the obvious move
+is to spend it first; do that and it is gone in week one and the month has no
+burst capacity left. So `TIER_RANK` gained `free_grant`, sorting *behind* the
+replenishing free tiers despite both being free.
+
+**Alternatives considered.**
+
+*One number per provider.* Simple, and it makes a finite pool look like an
+income. The capacity plan would have reported NVIDIA's 40 req/min as 57,600
+requests a day, for a pool holding a thousand.
+
+*Model the grant as a very large daily quota.* Same error, more arithmetic.
+
+### Decision: windows, including a five-hour session
+
+Six windows: minute, hour, **session (5h)**, day, week, month. The session
+window is there because it is the unit work is planned in -- "can I run this
+afternoon" is not answerable from a per-minute rate.
+
+Usage is summed from an append-only journal rather than held in counters, the
+same reasoning as ADR-007, and for a sharper reason here: a per-month counter
+in a process is a process wearing a month's name. Keyed per credential, because
+that is the unit providers meter.
+
+Google's daily quota resets on a wall clock, so it is modelled that way,
+daylight saving included. An hour of error at that boundary is an hour in which
+the system believes it has a fresh quota and does not.
+
+**A mistake caught by using it.** The first capacity plan reported 88,450
+requests/day sustainable. 86,400 of that was Mistral's per-minute rate
+multiplied out to 24 hours -- a number that assumes perfect saturation for a
+full day and that nobody meant as a promise. It was 98% of the headline. The
+plan now counts only published *daily* allowances (2,050/day) and reports
+grants and rate extrapolations beside it, labelled.
+
+**And a test-hygiene bug the feature created.** The journal is deliberately
+durable and machine-wide, which makes it exactly the wrong thing to leave
+pointed at its default path in a test suite. A test run wrote 36 requests into
+the operator's live journal and `swarmd providers budget` reported them as
+consumed quota. Now isolated in an autouse conftest fixture, with a test
+pinning the environment override that makes the isolation possible.
+
+### Then the first real run happened, and it solved nothing
+
+The infrastructure worked immediately -- criterion synthesis, planning,
+batching, chaos, red-team, ledger, 26 calls, 51.8s, $0.00. **0 of 16 nodes
+passed.**
+
+*The criterion had frozen with unsatisfiable checks.* Models emitted
+`artifact_exists` with no `key` and `contains_all` with no `substrings`. Those
+raise `CheckError` on every candidate, which `evaluate` converts into a failed
+outcome -- so the criterion graded every attempt as a failure forever and the
+report blamed the workers. `CheckError`'s own docstring said "raised at parse
+time, never at grade time"; the implementation did the opposite.
+
+Invisible against the simulated provider, whose proposals were hand-written
+with complete parameters. Now rejected at parse time.
+
+*Then the fix taught a new failure.* The schema hint had shown `"params": {}`,
+which models copied. Replacing it with concrete examples made them copy those:
+every criterion demanded a file called `claims.json` and a stdout marker
+reading `VERIFIED`, whatever the task was. A concrete example is an instruction
+to copy it. The examples are now angle-bracket placeholders with an explicit
+instruction to derive values from the task.
+
+*Still open.* Real models answer with fenced ```python blocks; the sandbox runs
+them and puts results in artifacts, but `candidate.output` stays the fenced
+source, so a `json_parses` check over the output fails by construction. That is
+a design question -- should a criterion grade the artifact or the output? --
+rather than a bug, and it is the next thing to resolve.
+
+**Follow-up questions this invites.**
+- *Was the simulated provider worth having, if it hid all of this?* Yes, and
+  the lesson is narrower than "mocks lie": it hid failures in the SHAPE of
+  model output, which is precisely what it was standing in for. It never hid a
+  failure in the orchestration around it.
+- *Should the criterion be relaxed until runs pass?* No. A criterion tuned
+  until the system passes is a benchmark the system wrote for itself, which is
+  the failure ADR-009 exists to prevent. The mismatch gets fixed on the
+  worker/criterion contract, not by lowering the bar.
+
+### Gate evidence
+
+```
+swarmd providers probe        4/4 providers live
+swarmd providers budget       2,050 req/day plannable, 61,500/month
+                              nvidia grant 997/1000, expires 30d
+GET /api/providers/budget     same figures, read by a FRESH process from the
+                              journal an earlier CLI run wrote -- cross-process
+                              persistence, which is the whole point
+swarm run (real providers)    completed, 26 calls, 51.8s, $0.00, 0/16 solved
+ruff / mypy / pytest          clean, clean, 835 passed
+tsc --noEmit / next build     clean, built
+```
+
+---
+
 ## Next up
 
 - [x] Kernel, pipeline, harnesses, gates, HITL state machine, router
@@ -1467,8 +1608,13 @@ tsc --noEmit / next build                clean, built
 - [x] Checkpoint recovery in the swarm, tested by counting calls not comparing output
 - [x] Rogue seeding with per-detector attribution; SPEC Phase 8 gate runs in CI
 - [x] Agent count selectable per run from the service, dashboard and CLI
-- [ ] Live validation: run against real providers; measure the actual cache hit
-      rate, and whether a real model returns K genuinely distinct variants
+- [x] Live providers wired and measured: 4/4 live, registry corrected against
+      reality, NVIDIA added as a grant-backed tier, Cerebras removed (402)
+- [x] Budgets tracked across minute/hour/5h session/day/week/month, summed from
+      a durable per-credential journal, surfaced in CLI, API and dashboard
+- [ ] Make real runs SOLVE: the criterion/worker output contract mismatch
+      (fenced code vs JSON output) is the open half of G-4
+- [ ] The learning curve: 50-200 tasks with the control arm, once runs pass
 - [ ] The learning curve: 50-200 tasks with the control arm, then and only then
       generate BENCHMARKS.md and make an improvement claim
 - [x] Product posture: operator token, edge allowlist, rate limits, JSON logs
