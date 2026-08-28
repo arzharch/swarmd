@@ -37,6 +37,7 @@ from swarmd.swarm.planner import (
 )
 from swarmd.swarm.redteam import RedTeam
 from swarmd.swarm.rogues import RogueSeeder, parse_patterns
+from swarmd.swarm.runstore import RunState, RunStore
 from swarmd.swarm.skills import SkillLibrary
 from swarmd.swarm.synthesis import (
     PROPOSAL_SCHEMA_HINT,
@@ -208,6 +209,9 @@ class SwarmRun:
         agents: int | None = None,
         cache: Any = None,
         system_prompt: str = "",
+        no_wait: bool = False,
+        store: RunStore | None = None,
+        state: RunState | None = None,
     ) -> None:
         if profile not in PROFILES:
             raise ValueError(f"unknown profile {profile!r}; known: {sorted(PROFILES)}")
@@ -277,6 +281,29 @@ class SwarmRun:
         # The pool owns the budget tracker; the run borrows it to answer
         # "does this fit" before spending anything.
         self.budget = getattr(provider, "budget", None)
+        # Durable working set. A ration pause lasts hours, which is long
+        # enough to cross a laptop sleep or a deploy, so the criterion, plan
+        # and batch drafts have to outlive this process or the run buys them
+        # twice.
+        self.store = store if store is not None else RunStore()
+        self.state = state if state is not None else RunState(
+            run_id=self.run_id,
+            task="",
+            profile=self.profile.name,
+            agents=self.agents,
+        )
+        # A pacer pause is where persistence matters most, so the run tells the
+        # pacer to checkpoint on the way in and to clear the marker on the way
+        # back out.
+        pacer = getattr(provider, "pacer", None)
+        if pacer is not None:
+            pacer.run_id = self.run_id
+            pacer.emit = self._emit_pace
+            pacer.on_pause = self._on_pause
+            pacer.on_resume = self._on_resume
+            pacer.checkpoint_path = str(self.store.path_for(self.run_id))
+            pacer.no_wait = no_wait
+        self.no_wait = no_wait
         self.redteam = RedTeam(kill=self._contain)
         # Deliberate misbehaviour, injected into this run. The red-team is NOT
         # told which agents are seeded: it either notices or the gate fails.
@@ -293,6 +320,42 @@ class SwarmRun:
         # to the run, and one pool may serve several runs over its lifetime.
         if hasattr(self.provider, "account"):
             self.provider.account = self.account
+
+    # -- durability ---------------------------------------------------------
+
+    def persist(self) -> None:
+        """Write the working set. Called at every boundary that costs money.
+
+        Cheap by design -- one atomic file replace -- because the alternative
+        is persisting only at the end, which is exactly when a paused run has
+        already been lost.
+        """
+        self.state.run_id = self.run_id
+        self.state.agents = self.agents
+        self.state.balances = {
+            agent_id: account.balance
+            for agent_id, account in self.economy._accounts.items()
+        }
+        self.state.contained = sorted(self.redteam.contained_agents)
+        self.store.save(self.state)
+
+    def _emit_pace(self, event: dict[str, Any]) -> None:
+        """Pacer events reach the run's stream, so a pause is visible live."""
+        kind = str(event.pop("kind", "pace"))
+        self._emit(kind, **event)
+
+    def _on_pause(self, cause: Any) -> None:
+        """Checkpoint before waiting. The pause may outlive the process."""
+        self.state.status = "paused"
+        self.state.paused_reason = getattr(cause, "reason", "")
+        self.state.resumes_at = float(getattr(cause, "resumes_at", 0.0))
+        self.persist()
+
+    def _on_resume(self, cause: Any) -> None:
+        self.state.status = "running"
+        self.state.paused_reason = ""
+        self.state.resumes_at = 0.0
+        self.persist()
 
     # -- events -------------------------------------------------------------
 
@@ -437,6 +500,13 @@ class SwarmRun:
             detail={"hash": frozen.hash, "attempts": frozen.attempts},
         )
         self._emit("criterion_frozen", **frozen.to_dict())
+        # N proposer calls, content-addressed. Persisted immediately: losing it
+        # to a restart means buying it again, and resuming under a DIFFERENT
+        # criterion would grade the second half of a run against a target the
+        # first half never saw.
+        self.state.criterion = frozen.criterion.to_dict()
+        self.state.criterion_hash = frozen.hash
+        self.persist()
         return frozen
 
     async def _synthesize_plan(self, task: str) -> Plan:
@@ -454,6 +524,8 @@ class SwarmRun:
             },
         )
         self._emit("plan_selected", **selection.plan.to_dict())
+        self.state.plan = selection.plan.to_dict()
+        self.persist()
         return selection.plan
 
     def estimated_calls(self, nodes: int = 3) -> int:
@@ -795,6 +867,12 @@ class SwarmRun:
                 batches[name] = await self._batch_generate(
                     task, plan.node(name), context, pool
                 )
+                # One provider call bought K variants. Persisting them here
+                # means a restart mid-level reuses them instead of paying for
+                # the same batch twice -- the single most expensive thing a
+                # crash can lose.
+                self.state.drafts[name] = list(batches[name].variants)
+            self.persist()
 
             # Concurrency bound. Every agent the operator asked for runs;
             # at most MAX_IN_FLIGHT of them are in the air at once, so a wide
@@ -821,12 +899,17 @@ class SwarmRun:
             for item in level_results:
                 if isinstance(item, WorkerResult):
                     results.append(item)
+                    # Node finished. Recorded so a resume skips it rather than
+                    # re-running work that already passed its criterion.
+                    self.state.results.append(item.to_dict())
+                    self.state.remember(item.checkpoint)
                 elif isinstance(item, BaseException):
                     # One node failing must not abort the level. The gate will
                     # record it as a failure, which is the honest outcome.
                     logger.warning("node raised: %s", item)
                     self._emit("node_error", detail=str(item)[:200])
 
+            self.persist()
             self.economy.reap()
             self.economy.reproduce()
 
