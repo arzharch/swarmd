@@ -740,3 +740,56 @@ async def test_preflight_reports_a_run_that_fits():
     )
     run = SwarmRun(provider, profile="smoke")
     assert run.preflight()["fits"] is True
+
+
+def test_a_distilled_skill_records_an_approach_not_an_answer():
+    """The library-poisoning bug the system was generating on its own.
+
+    Distillation used to store the longest successful OUTPUT as the skill's
+    instruction. Live, that captured `{"accuracy": 94.3, "baseline": 82.1}` and
+    offered it to every future run as advice -- the specific answer to one task
+    presented as a general method. A later run on different numbers would be
+    handed the wrong ones and told they worked.
+    """
+    from swarmd.swarm.criteria import Candidate
+    from swarmd.swarm.planner import PlanNode
+    from swarmd.swarm.worker import WorkerResult
+
+    run = SwarmRun(ScriptedProvider(), profile="smoke")
+    node = PlanNode(name="extract", instruction="pull the numbers out")
+    outcomes = [
+        WorkerResult(
+            agent_id=f"a{i}", node="extract", passed=True,
+            candidate=Candidate(
+                output='{"accuracy": 94.3}',
+                artifacts={"accuracy": 94.3, "baseline": 82.1},
+            ),
+        )
+        for i in range(2)
+    ]
+
+    instruction = run._distil_instruction("extract", node, outcomes)
+
+    assert "94.3" not in instruction, "the answer leaked into the skill"
+    assert "82.1" not in instruction
+    assert "accuracy (float)" in instruction
+    assert "pull the numbers out" in instruction
+
+
+def test_distillation_without_artifacts_describes_the_step_only():
+    """Nothing structured to generalise from, so no method is invented."""
+    from swarmd.swarm.criteria import Candidate
+    from swarmd.swarm.planner import PlanNode
+    from swarmd.swarm.worker import WorkerResult
+
+    run = SwarmRun(ScriptedProvider(), profile="smoke")
+    node = PlanNode(name="summarise", instruction="write one paragraph")
+    outcomes = [
+        WorkerResult(
+            agent_id="a1", node="summarise", passed=True,
+            candidate=Candidate(output="some prose"),
+        )
+    ]
+    instruction = run._distil_instruction("summarise", node, outcomes)
+    assert "write one paragraph" in instruction
+    assert "JSON object" not in instruction

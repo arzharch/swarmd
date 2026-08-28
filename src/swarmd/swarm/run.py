@@ -832,6 +832,49 @@ class SwarmRun:
 
         return results
 
+    def _distil_instruction(
+        self, node: str, plan_node: PlanNode | None, outcomes: list[Any]
+    ) -> str:
+        """Turn repeated successes into an APPROACH, not an answer.
+
+        This used to be `max(outputs, key=len)` -- the longest successful
+        output, stored verbatim as the skill's instruction. Live, that
+        distilled `{"accuracy": 94.3, "baseline": 82.1}` and offered it to
+        every future run as advice.
+
+        That is worse than useless. It is the specific answer to one task
+        presented as a general method, so a later run on different numbers is
+        handed the wrong ones and told they worked. It is also exactly what the
+        red-team's `library_poisoning` detector exists to catch, which means
+        the system was reliably generating the thing it was built to reject.
+
+        A skill has to describe HOW. What generalises from a set of successes
+        is the SHAPE they share -- which keys, of which types -- and the step
+        that produced them. The values are what must not carry over.
+        """
+
+        shapes: dict[str, str] = {}
+        for outcome in outcomes:
+            for key, value in (outcome.candidate.artifacts or {}).items():
+                if key.startswith("_"):
+                    continue
+                shapes.setdefault(key, type(value).__name__)
+
+        what = plan_node.instruction if plan_node else node
+        if not shapes:
+            # Nothing structured to generalise from. Describe the step and stop
+            # rather than inventing a method nobody demonstrated.
+            return f"For steps like {node!r}: {what}"
+
+        fields = ", ".join(f"{k} ({v})" for k, v in sorted(shapes.items()))
+        return (
+            f"For steps like {node!r}: {what} "
+            f"Produce a JSON object with these fields: {fields}. "
+            f"Values must come from the task at hand -- this records the shape "
+            f"that satisfied the criterion {len(outcomes)} times, not the "
+            f"answer, which will differ."
+        )
+
     async def _distill(self, task: str, result: RunResult) -> list[str]:
         """Turn verified successes into candidate skills, pending a human.
 
@@ -862,7 +905,14 @@ class SwarmRun:
                 by_node.setdefault(outcome.node, []).append(outcome)
 
         proposed: list[str] = []
+        plan = result.plan
         for node, outcomes in by_node.items():
+            plan_node = None
+            if plan is not None:
+                try:
+                    plan_node = plan.node(node)
+                except Exception:  # noqa: BLE001 - a missing node is not fatal
+                    plan_node = None
             if len(outcomes) < self.min_evidence:
                 self._emit(
                     "skill_skipped",
@@ -871,9 +921,7 @@ class SwarmRun:
                 )
                 continue
 
-            instruction = max(
-                (o.candidate.output for o in outcomes), key=len
-            )[:600]
+            instruction = self._distil_instruction(node, plan_node, outcomes)
             try:
                 if gate is not None:
                     skill, request = await gate.submit(
