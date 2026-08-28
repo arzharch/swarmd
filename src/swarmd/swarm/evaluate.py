@@ -351,6 +351,13 @@ class EvalReport:
             "",
             (f"Runs: {data['total_runs']} · repeats: {data['repeats']}"
              f" · wall clock: {data['duration_s']}s"),
+            f"Measured on commit `{_git_sha()}`, {_utc_stamp()}.",
+            "",
+            ("A benchmarks file that does not say which code produced it "
+             "cannot be checked. This one was written after a 20-run eval "
+             "whose numbers described a configuration that had been changed "
+             "while it ran -- the file looked current and was not, and nothing "
+             "in it could have told you."),
             "",
             ("Every figure is computed from the append-only ledger (ADR-007), "
              "and no improvement is reported without its paired control arm."),
@@ -389,6 +396,40 @@ class EvalReport:
 
     def write_json(self, path: str | Path) -> None:
         Path(path).write_text(json.dumps(self.to_dict(), indent=2), encoding="utf-8")
+
+
+def _git_sha() -> str:
+    """The commit the measurement ran against.
+
+    Best-effort: a missing git, or a tarball with no history, must not stop a
+    report from being written. "unknown" is honest and rare; refusing to
+    produce numbers because provenance is unavailable would be worse.
+    """
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+        sha = result.stdout.strip()
+        if not sha:
+            return "unknown"
+        dirty = subprocess.run(
+            ["git", "status", "--porcelain"],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+        # A dirty tree means the code that ran is not the code the SHA names,
+        # which is exactly the situation this line exists to expose.
+        return f"{sha}-dirty" if dirty.stdout.strip() else sha
+    except Exception:  # noqa: BLE001 - provenance is best-effort
+        return "unknown"
+
+
+def _utc_stamp() -> str:
+    from datetime import UTC, datetime
+
+    return datetime.now(tz=UTC).strftime("%Y-%m-%d %H:%M UTC")
 
 
 def _fmt(value: Any) -> str:

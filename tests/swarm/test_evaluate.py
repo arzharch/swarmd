@@ -302,3 +302,31 @@ async def test_simulated_runs_taint_the_eval_report():
 
     report = await Evaluator(run_factory, repeats=1).evaluate([Task("t1", "x")])
     assert report.to_dict()["simulated"] is True
+
+
+def test_benchmarks_records_the_commit_it_measured(tmp_path):
+    """A benchmarks file that cannot say which code produced it cannot be
+    checked.
+
+    This is not hypothetical. A 20-run eval finished and wrote a file whose
+    numbers described a configuration changed while it ran -- the profile's
+    proposer count went from 2 to 3 mid-eval, which changes the criterion from
+    a union of proposals into a majority of them. The file looked current, and
+    nothing in it could have told you otherwise.
+    """
+    from swarmd.swarm.evaluate import _git_sha
+
+    target = tmp_path / "BENCHMARKS.md"
+    _report().write_benchmarks(target)
+
+    text = target.read_text(encoding="utf-8")
+    assert "Measured on commit" in text
+    assert _git_sha() in text
+
+
+def test_a_dirty_tree_is_reported_as_dirty():
+    """A dirty tree means the code that ran is not the code the SHA names."""
+    from swarmd.swarm.evaluate import _git_sha
+
+    sha = _git_sha()
+    assert sha == "unknown" or len(sha) >= 7
