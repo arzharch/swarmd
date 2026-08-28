@@ -85,6 +85,12 @@ class TaskOutcome:
     containments: int
     status: str
     simulated: bool = False
+    # Node-level detail. A task is solved only when EVERY node passes, so the
+    # task rate hides how close a run came: 7 of 8 nodes and 0 of 8 both report
+    # "not solved". For a system whose unit of work is the node, that is the
+    # number that says whether the thing is nearly working or not working.
+    nodes_total: int = 0
+    nodes_passed: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -138,6 +144,12 @@ class ArmSummary:
     mean_tokens: float
     mean_duration_s: float
     containments: int
+    # pass@k for the k values a run of this size can support. Absent keys mean
+    # there were not enough attempts to compute them honestly.
+    pass_at_k: dict[int, float] = field(default_factory=dict)
+    # Nodes passed over nodes attempted, across every run in the arm. Moves
+    # long before the task rate does, which makes it the leading indicator.
+    node_pass_rate: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -147,10 +159,37 @@ class ArmSummary:
         }
 
 
+def pass_at_k(outcomes: list[TaskOutcome], k: int) -> float | None:
+    """Fraction of TASKS solved by at least one of k attempts.
+
+    The metric that matches what this system actually is. A population search
+    that solves a task on its third try has solved it; reporting only the mean
+    per-attempt success rate describes a single agent, not a swarm, and
+    understates a population by exactly the amount the population is for.
+
+    Computed by grouping attempts per task, which is why repeats matter: with
+    `--repeats 1` there is one attempt per task and pass@1 is the only honest
+    figure. Returns None when there are fewer than k attempts for some task
+    rather than silently reporting pass@fewer -- a metric that quietly changes
+    meaning is worse than a missing one.
+    """
+    by_task: dict[str, list[TaskOutcome]] = {}
+    for outcome in outcomes:
+        by_task.setdefault(outcome.task_id, []).append(outcome)
+    if not by_task:
+        return None
+    if any(len(attempts) < k for attempts in by_task.values()):
+        return None
+    solved = sum(
+        1 for attempts in by_task.values() if any(a.solved for a in attempts[:k])
+    )
+    return round(solved / len(by_task), 4)
+
+
 def summarise(outcomes: list[TaskOutcome], label: str) -> ArmSummary:
     if not outcomes:
         return ArmSummary(label, 0, 0, 0.0, (0.0, 0.0), None, (0.0, 0.0),
-                          0.0, 0.0, 0.0, 0)
+                          0.0, 0.0, 0.0, 0, {}, 0.0)
     solved = [o for o in outcomes if o.solved]
     successes = [1.0 if o.solved else 0.0 for o in outcomes]
     # Cost per SOLVED task: a run that failed cheaply is not efficient.
@@ -174,6 +213,18 @@ def summarise(outcomes: list[TaskOutcome], label: str) -> ArmSummary:
             statistics.fmean([o.duration_s for o in outcomes]), 2
         ),
         containments=sum(o.containments for o in outcomes),
+        pass_at_k={
+            k: value
+            for k in (1, 3, 5)
+            if (value := pass_at_k(outcomes, k)) is not None
+        },
+        node_pass_rate=(
+            round(
+                sum(o.nodes_passed for o in outcomes)
+                / max(1, sum(o.nodes_total for o in outcomes)),
+                4,
+            )
+        ),
     )
 
 
@@ -319,6 +370,11 @@ class EvalReport:
                  f"{baseline['success_ci'][1]:.2f}]  "
                  f"$/solved {_fmt(baseline['cost_per_solved'])}  "
                  f"first-pass {baseline['first_pass_rate']:.1%}"),
+                (f"    nodes      treatment {treated['node_pass_rate']:.1%}  "
+                 f"control {baseline['node_pass_rate']:.1%}   "
+                 f"(nodes passed / nodes attempted -- moves before the task "
+                 f"rate does)"),
+                _pass_at_k_line(treated, baseline),
                 f"    VERDICT: {comparison.get('verdict')}"
                 + (
                     f"  delta={comparison.get('success_rate_delta'):+.3f}"
@@ -378,6 +434,7 @@ class EvalReport:
                 ("success rate", "success_rate", lambda v: f"{v:.1%}"),
                 ("cost per solved", "cost_per_solved", _fmt),
                 ("first-pass rate", "first_pass_rate", lambda v: f"{v:.1%}"),
+                ("node pass rate", "node_pass_rate", lambda v: f"{v:.1%}"),
                 ("mean tokens", "mean_tokens", str),
                 ("containments", "containments", str),
             ]
@@ -397,6 +454,28 @@ class EvalReport:
 
     def write_json(self, path: str | Path) -> None:
         Path(path).write_text(json.dumps(self.to_dict(), indent=2), encoding="utf-8")
+
+
+def _pass_at_k_line(treated: dict[str, Any], baseline: dict[str, Any]) -> str:
+    """pass@k side by side, or an honest note about why it is absent.
+
+    A population search that solves a task on its third attempt has solved it.
+    Reporting only per-attempt success describes one agent rather than a swarm.
+    """
+    tk = treated.get("pass_at_k") or {}
+    bk = baseline.get("pass_at_k") or {}
+    ks = sorted({int(k) for k in tk} & {int(k) for k in bk})
+    if not ks:
+        return (
+            "    pass@k     not computed: needs repeats > 1, so that a task "
+            "has more than one attempt to pass on"
+        )
+    parts = [
+        f"pass@{k} T{float(tk[k] if k in tk else tk[str(k)]):.0%}/"
+        f"C{float(bk[k] if k in bk else bk[str(k)]):.0%}"
+        for k in ks
+    ]
+    return "    pass@k     " + "  ".join(parts)
 
 
 def _git_sha() -> str:
@@ -560,4 +639,6 @@ class Evaluator:
             containments=len(result.contained),
             status=result.status,
             simulated=bool(cost.get("simulated", False)),
+            nodes_total=len(result.results),
+            nodes_passed=len(passed),
         )

@@ -245,6 +245,12 @@ def main(argv: list[str] | None = None) -> int:
     ev.add_argument("--benchmarks", default=None, metavar="PATH",
                     help="generate BENCHMARKS.md here (refuses simulated data)")
     ev.add_argument(
+        "--skills", default=None, metavar="PATH",
+        help="skill library the TREATMENT arm retrieves from. Without it both "
+        "arms run with no library and the comparison cannot show learning -- "
+        "which is what it did, silently, until this flag existed.",
+    )
+    ev.add_argument(
         "--journal", default=".swarmd/eval.jsonl", metavar="PATH",
         help="append each completed run here so an interrupted eval resumes "
         "rather than starting over. Delete it to force a clean measurement.",
@@ -719,6 +725,7 @@ async def _eval_command(args: argparse.Namespace) -> int:
     from swarmd.router.pool import ProviderPool
     from swarmd.swarm.evaluate import Evaluator
     from swarmd.swarm.run import SwarmRun
+    from swarmd.swarm.skills import SkillLibrary
 
     try:
         pool = ProviderPool.from_env()
@@ -728,11 +735,41 @@ async def _eval_command(args: argparse.Namespace) -> int:
 
     sandbox = SandboxHarness()
 
+    # THE TREATMENT ARM NEEDS A LIBRARY, and for a long time it did not have
+    # one. `SwarmRun` was constructed with `use_skills=True` and no `skills=`,
+    # so `self.skills = skills if use_skills else None` evaluated to None in
+    # BOTH arms. The ablation switch toggled a flag that gated an object that
+    # was never passed, and the two arms were byte-identical.
+    #
+    # That is why G4 kept reporting "no measured improvement" at any sample
+    # size: not because learning was absent, but because the experiment could
+    # not express it. An A/B test whose arms are the same code is a null result
+    # generator.
+    library = SkillLibrary(args.skills) if args.skills else None
+    if library is not None:
+        approved = len(library.approved())
+        print(
+            f"treatment arm retrieves from {args.skills}: "
+            f"{approved} approved skill(s)"
+        )
+        if not approved:
+            # Said out loud, because an empty library makes the arms identical
+            # again and the result would look like a measurement.
+            print(
+                "  ! the library is empty, so both arms will behave "
+                "identically. Build one with `swarmd swarm session "
+                "--auto-approve --skills <path>` first."
+            )
+
     async def run_factory(task: Any, use_skills: bool, seed: int) -> Any:
         run = SwarmRun(
             pool,
             profile=args.profile,
             use_skills=use_skills,
+            # Passed in BOTH arms. `use_skills` is what makes the difference:
+            # the control arm holds the same library and is forbidden to read
+            # it, so the only variable between arms is retrieval.
+            skills=library,
             sandbox=sandbox,
             run_id=f"eval-{task.task_id}-{seed}-{'t' if use_skills else 'c'}",
         )

@@ -399,3 +399,66 @@ def _fake_result():
         contained: ClassVar[list] = []
 
     return R()
+
+
+# --- pass@k and node-level metrics -----------------------------------------
+
+
+def _o(task_id, seed, solved, nodes_passed=1, nodes_total=1, treatment=True):
+    from swarmd.swarm.evaluate import TaskOutcome
+
+    return TaskOutcome(
+        task_id=task_id, arm="custom", domain="d", seed=seed,
+        treatment=treatment, solved=solved, cost_usd=0.0, tokens=0,
+        duration_s=1.0, first_pass=solved, containments=0, status="completed",
+        nodes_total=nodes_total, nodes_passed=nodes_passed,
+    )
+
+
+def test_pass_at_k_counts_a_task_solved_by_any_attempt():
+    """A population that solves a task on its third try has solved it.
+
+    Reporting only per-attempt success describes one agent rather than a swarm,
+    and understates a population by exactly the amount the population is for.
+    """
+    from swarmd.swarm.evaluate import pass_at_k
+
+    outcomes = [
+        _o("t1", 1, False), _o("t1", 2, False), _o("t1", 3, True),
+        _o("t2", 1, False), _o("t2", 2, False), _o("t2", 3, False),
+    ]
+    assert pass_at_k(outcomes, 1) == 0.0      # neither solved first try
+    assert pass_at_k(outcomes, 3) == 0.5      # t1 solved within three
+
+
+def test_pass_at_k_is_absent_rather_than_wrong_when_attempts_are_short():
+    """A metric that quietly changes meaning is worse than a missing one."""
+    from swarmd.swarm.evaluate import pass_at_k
+
+    assert pass_at_k([_o("t1", 1, True)], 5) is None
+
+
+def test_node_pass_rate_moves_before_the_task_rate_does():
+    """7 of 8 nodes and 0 of 8 both report "not solved" at task level.
+
+    For a system whose unit of work is the node, that distinction is the
+    difference between nearly working and not working.
+    """
+    from swarmd.swarm.evaluate import summarise
+
+    nearly = summarise([_o("t1", 1, False, nodes_passed=7, nodes_total=8)], "t")
+    nowhere = summarise([_o("t1", 1, False, nodes_passed=0, nodes_total=8)], "t")
+
+    assert nearly.success_rate == nowhere.success_rate == 0.0
+    assert nearly.node_pass_rate == 0.875
+    assert nowhere.node_pass_rate == 0.0
+
+
+def test_the_summary_reports_pass_at_k_it_can_compute():
+    from swarmd.swarm.evaluate import summarise
+
+    outcomes = [_o("t1", i, i == 2) for i in range(3)]
+    summary = summarise(outcomes, "treatment")
+    assert 1 in summary.pass_at_k
+    assert 3 in summary.pass_at_k
+    assert 5 not in summary.pass_at_k       # only three attempts exist
