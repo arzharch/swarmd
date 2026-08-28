@@ -35,13 +35,33 @@ v2 deliberately capped concurrency at 10–50 agents and disclaimed scale. v3 re
 population search, market selection, and multi-proposal criterion synthesis all degrade to
 theatre at N=20.
 
-This reversal is bounded by physics, not ambition. Pooled free-tier throughput across
-Groq, Cerebras, Google AI Studio, Mistral, and OpenRouter is roughly 86,000 TPM, about
-**34 LLM calls per minute**. A thousand agents each calling a model per step is impossible
-at any budget we will accept.
+This reversal is bounded by physics, not ambition — and the physics has since been
+MEASURED rather than estimated, which moved the numbers.
+
+The estimate here was ~86,000 TPM across five providers. What the keys actually buy
+(docs/CAPACITY.md section 7, measured 2026-08-28):
+
+- **Cerebras is gone.** Its free tier now requires a card; every call returns 402.
+- **Groq's binding limit is tokens, not requests**: 100,000/day, which at the ~1,035
+  tokens this system sends per call is **98 requests a day**, not the 1,000 its request
+  quota advertises.
+- Plannable capacity across everything configured: **~1,146 requests/day.**
+
+A thousand agents each calling a model per step is not merely expensive, it is a
+day's entire budget for one run. That is not a reason to abandon population size; it is
+the reason rationing is the runtime's job.
 
 So the stance is precise: **1000 agents, of which few are talking to a model at any
-instant.** Skill retrieval, sandboxed execution, verification, ledger accounting, and
+instant** — and the operator chooses the number, because only they know what the task is
+worth. `--agents 1000` is honoured exactly; `preflight` prices it against the remaining
+daily budget before the run starts, and says plainly when it will not fit. Profiles are
+sized to what a day actually holds (`standard` = 24 agents, ~90 calls, a dozen a day)
+rather than to an aspiration.
+
+Batched generation is what makes a wide population affordable at all: one call returns K
+candidates, so generation costs one request per plan node regardless of pool width.
+Repairs remain one call each, which is why cost still grows with population and why the
+preflight exists. Skill retrieval, sandboxed execution, verification, ledger accounting, and
 red-team log scanning are all free. The LLM is a rationed resource and the runtime's job is
 rationing it — cache, batch, route, and refuse. Scale claims are always paired with cost
 per solved task.
@@ -62,7 +82,7 @@ per solved task.
 | G1 | Unknown-task competence | System accepts a task it was never designed for, produces a frozen success criterion and an executable plan, with no code change |
 | G2 | Verifier-first correctness | Success criterion authored and adversarially red-teamed *before* solving begins; gaming attempts on a seeded weak criterion are caught |
 | G3 | Runtime plan synthesis | The stage DAG is generated per task and executed by the existing executor; cycle-free, dependency-correct |
-| G4 | Measurable self-learning | Treatment arm (skills on) beats control arm (skills off) on the same tasks and seeds, reported with confidence intervals |
+| G4 | Measurable self-learning | Treatment arm (skills on) beats control arm (skills off) on the same tasks and seeds, reported with confidence intervals. **NOT YET SHOWN**: both arms measured at 20%, because the skill library is empty and the treatment arm has nothing to retrieve. The measurement apparatus works and reports the non-result rather than a small positive |
 | G5 | Rogue containment | Seeded rogue behaviours (budget siphon, criterion gaming, loop, unsafe call, library poisoning) are detected and contained; contained agents cannot affect run output |
 | G6 | Hard cost ceiling | Full flagship run completes at **≤ $0.05**; breach aborts cleanly with a report, never silently truncates |
 | G7 | Recovery under chaos | Kill agents at any rate; skill library, ledger, and approvals survive; results are unchanged (integrity hash matches). Completed work is never redone: the kernel proven at kill-rate 0.9, the swarm flagship verified by counting provider calls across a kill, bounded at 5 resumes per node so relentless chaos terminates |
@@ -223,16 +243,38 @@ this is documented in the README rather than buried.
 
 ## 13. Acceptance criteria (v0.1)
 
-1. All SPEC phase gates pass
-2. A task from the held-out custom arm, never seen in development, runs end to end with no
-   code change: criterion frozen, DAG synthesized, executed, verified, skill proposed
-3. Chaos at kill-rate 0.2 across every stage; run completes; skill library and ledger
-   integrity hashes match the clean run
-4. All five seeded rogue behaviours detected and contained; none reach run output
-5. Full run cost at or under $0.05, itemised by provider in the ledger
-6. Eval report shows treatment vs control with confidence intervals on both arms
-7. Frontend replays a live run with per-agent reasoning visible; zero mock data paths
-8. Process killed mid-run and restarted: criterion, library, ledger, approvals intact
+Status as of 2026-08-28, against live providers. `docs/STATUS.md` carries the
+evidence for each; this table carries the verdict.
+
+| # | Criterion | Status |
+|---|---|---|
+| 1 | All SPEC phase gates pass | **PASS** except the live acceptance run in Phase 11 |
+| 2 | A held-out task runs end to end with no code change: criterion frozen, DAG synthesized, executed, verified | **PASS** — 6/6 nodes on live providers, repeatably, on tasks not used in development |
+| 3 | Chaos at kill-rate 0.2 across every stage; integrity hashes match | **PASS** — verified at 0.9 in CI |
+| 4 | All five seeded rogue behaviours detected and contained; none reach run output | **PASS** — and four of the five now also fire on *unseeded* live runs |
+| 5 | Full run cost at or under $0.05, itemised by provider | **PASS** — measured $0.000000; every provider used is free-tier |
+| 6 | Eval report shows treatment vs control with CIs on both arms | **PASS** — 20% vs 20%, CI[0.00, 0.60], "no measured improvement" |
+| 7 | Frontend replays a live run, zero mock data paths | **PASS** — CI-enforced |
+| 8 | Process killed mid-run and restarted: state intact | **PASS** — and the eval itself now resumes, which it did not |
+
+**The one that is not yet met is G4, measurable self-learning.** Both arms score
+20%. That is not a failure of the eval -- it is the eval working: the skill
+library is empty, so the treatment arm has nothing to retrieve and there is no
+mechanism by which it could beat control. Distillation requires two verified
+successes on the same node before it will propose a skill, and at a 20% task
+success rate that has not happened yet.
+
+The honest reading: **the system solves tasks; it has not yet been shown to
+learn.** Those are different claims and only the first is currently supported.
+
+### What a v1.0 sign-off requires
+
+1. Volume: n=5 gives CI[0.00, 0.60]. 50-200 tasks before the success rate is a
+   property rather than a measurement.
+2. A learning curve with its control arm, which needs the library to be
+   non-empty, which needs a higher success rate first.
+3. `standard` and `deep` exercised against real providers. Every live run so
+   far has been `smoke`.
 
 ## 14. Risks and mitigations
 
