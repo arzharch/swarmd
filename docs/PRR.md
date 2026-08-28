@@ -92,7 +92,7 @@ a review with no partials has usually been graded generously.
 | Config changes roll pods | PASS | kustomize ConfigMap hash suffix |
 | Database migrations are expand/contract | PASS | Documented; the moment you most want to roll back is right after a migration |
 | Environment parity | PASS | Same manifests, overlays differ only where justified |
-| Rollback tested | **PARTIAL** | `rollout undo` documented; not yet exercised against a real cluster |
+| Rollback tested | PASS | Exercised on a real cluster (k3s, k8s 1.31): v1 deployed and Ready, v2 rolled out, `rollout undo` restored v1, each step gated on `rollout status`. `maxUnavailable: 0` held throughout. Not yet exercised on EKS, where the difference is the load balancer's deregistration delay, not the rollback |
 
 ## 8. Cost
 

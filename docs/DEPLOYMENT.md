@@ -141,6 +141,25 @@ Deployment is not `kubectl apply` and hope.
    error rate and dashboard freshness.
 6. **Roll forward** if the canary is clean; `rollout undo` if not.
 
+**Cluster prerequisites, learned by applying these manifests to an empty one.**
+`kubectl apply -k` exits non-zero on a cluster without the Prometheus Operator:
+`ServiceMonitor`, `PodMonitor` and `PrometheusRule` are custom resources, and
+their absence is reported as "ensure CRDs are installed first" after everything
+else has already applied. Install `kube-prometheus-stack` before the first
+apply, or expect a partial success with a failing exit code.
+
+**A cluster with no provider credentials is healthy and NOT ready, by design.**
+`/healthz` returns 200 and `/readyz` returns 503 listing zero providers, so the
+pod is not restarted and takes no work. That is the intended signal, not a
+fault: without credentials there is no capacity, and a pod that accepted runs
+anyway would fail them one by one. Supply keys, or expect an unready
+deployment.
+
+**The control plane refuses to start bound off-host without an operator token**
+(ADR-013). Prod reads one from Secrets Manager through an ExternalSecret; dev
+patches in an obviously-fake local value. A deployment whose token is empty
+CrashLoopBackOffs with the reason in its logs.
+
 **Automatic rollback triggers**, agreed in advance:
 - Any SLO-2 (chaos integrity) failure — no budget, no judgement call
 - Error rate over 5% for 5 minutes

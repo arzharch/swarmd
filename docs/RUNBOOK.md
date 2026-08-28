@@ -320,7 +320,20 @@ kubectl -n swarmd rollout status deploy/swarmd-control-plane --timeout=5m
 
 # Rollback
 kubectl -n swarmd rollout undo deploy/swarmd-control-plane
+kubectl -n swarmd rollout status deploy/swarmd-control-plane --timeout=5m
 ```
+
+**After a rollback, re-apply from the manifests you rolled back TO.** `rollout
+undo` changes the live Deployment without updating the
+`kubectl.kubernetes.io/last-applied-configuration` annotation, so the next
+`kubectl apply` re-applies the version you just rolled back from. kubectl warns
+about this and the warning scrolls past in an incident. The rollback is not
+finished until git and the cluster agree.
+
+**Verified, not assumed.** This sequence was exercised end to end against a
+real cluster: v1 deployed and Ready, v2 rolled out, `rollout undo` restored v1,
+with `rollout status` gating each step and `maxUnavailable: 0` holding capacity
+throughout.
 
 **In-flight runs survive a control-plane rollout.** Runs are Jobs with their
 own pods; replacing control-plane pods does not touch them, and all run state

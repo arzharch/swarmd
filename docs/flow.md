@@ -1357,7 +1357,12 @@ POST /api/runs x2 (identical)     run 1: 8 calls, 4 cache entries
 - [x] Narrow the egress NetworkPolicy to provider CIDRs -- done in
       deploy/k8s/base/rbac-and-config.yaml, with the failure mode it introduces
       written next to it: a provider changing ranges looks like an outage
-- [ ] Exercise rollback against a real cluster
+- [x] Rollback exercised on a real cluster (k3s): v1 Ready, v2 out, undo back
+      to v1, each step gated on rollout status. Surfaced the apply/undo
+      annotation trap, now in the runbook
+- [x] The image builds and the deployment starts: three defects found by doing
+      it -- missing README build input, missing serve/postgres extras, and a
+      default command binding container-loopback. Guarded by tests
 - [x] Debt cleared: no unmarked mock on any user-facing path. make_router
       raises instead of downgrading, FallbackRouter no longer recommends a
       mock tail, and 'mock' now aliases the tainted simulated provider
