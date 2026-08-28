@@ -1588,6 +1588,150 @@ tsc --noEmit / next build     clean, built
 
 ---
 
+## 2026-08-28 - From 0% to 20%: five mechanisms rejecting correct work
+
+The system executed flawlessly and solved nothing. Every fix below came from
+reading what agents actually produced rather than from reasoning about the
+design, and four of the five were mechanisms working exactly as written while
+being wrong.
+
+### The agents were right and the system said no
+
+The clearest moment. An agent replied:
+
+    {"accuracy": 94.3, "baseline": 82.1}
+
+Correct, complete, extracted from the source text. It was rejected twice over:
+
+**`artifact_exists` did not see it.** Artifacts came only from sandbox
+execution, so an agent that answered directly had, as far as the criterion was
+concerned, produced nothing. Answering `{"accuracy": 94.3}` and writing that
+same object to `artifacts.json` are the same claim; only one of them counted.
+
+**The red-team contained it as gaming.** `criterion_gaming` flagged any passing
+submission under 20 tokens, and the correct answer is six. The detector only
+ever sees submissions that ALREADY PASSED the frozen criterion -- given that,
+brevity is evidence the task had a short answer, not that the answer was empty.
+It now requires short AND repetitive.
+
+That change moves a judgement rather than deleting it. Deciding whether a short
+answer is substantive requires knowing the task; the criterion knows it, a
+runtime detector does not. So a bare `"ok"` joined the adversarial attack set:
+a criterion that a one-word answer satisfies must not freeze in the first
+place.
+
+### The worker was never shown the specification
+
+The largest single cause. A worker saw the task, its step, retrieved skills and
+its own past failures -- never the criterion it was graded against. So the
+criterion demanded a numeric artifact called `accuracy`, the plan step said
+"extract the first claim", and the worker produced correct data under keys
+nothing was looking for. Three attempts, three failures, no way to converge.
+
+Solving against a hidden spec makes success accidental.
+
+**Does this weaken ADR-009?** No, and the distinction is worth stating because
+it looks like a compromise. The criterion is authored, adversarially attacked
+and content-addressed BEFORE any worker exists; a worker cannot alter it, and
+something else does the grading. The guarantee is that **the target cannot
+move**, not that the target is secret. A test suite you are allowed to read is
+still a test suite.
+
+It does raise gaming -- an agent that knows the checks can write to them. That
+is what the pre-freeze attack and the `criterion_gaming` detector are for, and
+both are catching real cases in live runs.
+
+### Consensus of two is not consensus
+
+`ceil(2 * 0.5) = 1`, so at the smoke profile's two proposers every check EITHER
+proposer thought of entered the merged criterion. That is a union, not a
+consensus: 13 checks where three proposers produce 3-5. The profile meant to be
+the easy one was the hardest thing the system could grade against. Three
+proposers everywhere now, and a test asserts no profile can degenerate this way
+again.
+
+### The library was poisoning itself
+
+With nodes finally passing, distillation fired for the first time -- and stored
+the longest successful OUTPUT as the skill's instruction:
+
+    {"accuracy": 94.3, "baseline": 82.1}
+
+offered to every future run as advice. The specific answer to one task,
+presented as a general method, so a later run on different numbers would be
+handed the wrong ones and told they worked. The system was reliably generating
+exactly what its `library_poisoning` detector exists to reject.
+
+A skill has to describe HOW. What generalises from repeated successes is the
+SHAPE they share -- which keys, of which types -- and the step that produced
+them. Distillation now records that, and the values that must not carry over
+are the ones it drops. Skills now read like
+`"Find the first numeric value using a regular expression"`.
+
+### Result
+
+| | before | after |
+|---|---|---|
+| single run | 0/16 nodes | **8/8 nodes**, repeatably |
+| eval, task-level | 0% both arms | **20% both arms**, CI[0.00, 0.60] |
+| skills distilled | 0 | 4, describing approaches |
+
+Still "no measured improvement" between arms, and that is correct: the library
+starts empty, so the treatment arm has nothing to retrieve. The apparatus
+reports the non-result rather than the first-pass difference, which is what it
+is for.
+
+### Decision: profiles sized to the budget, agent count owned by the operator
+
+`standard` promised 500 agents and ~600 calls against a measured budget of
+~1,146 requests/day -- half a day of total capacity for one run, and a number
+that appeared nowhere anyone could act on. Now 24 agents and ~90 calls, so a
+dozen fit a day.
+
+The operator can still ask for 1000, and this is the part that changed
+character. `--agents 1000` used to silently give 192: `HARD_POOL` clamped each
+node's pool to 64 and nothing said so, which made the control a suggestion. The
+concern behind that clamp was real -- 1000 simultaneous provider connections is
+a thundering herd -- but the fix for too much work AT ONCE is to bound
+concurrency, not to quietly run fewer agents. The population is now exactly
+what was asked for; `MAX_IN_FLIGHT` governs how fast it moves.
+
+And `preflight` prices the run before it starts, against what is actually left
+today:
+
+```
+preflight: this run needs ~1005 calls and 588 remain today;
+           it will exhaust the budget and stop partway
+```
+
+**Alternatives considered.** *Refuse a run that does not fit.* Rejected: a run
+that exhausts the budget and stops partway is sometimes exactly what someone
+wants at the end of a day. What is not acceptable is finding out afterwards.
+
+*Estimate against the concurrency bound.* Tried, and it made 500 and 1000
+agents quote the same price -- the opposite of informative. The estimate counts
+population, because every agent asked for runs and may cost a repair.
+
+**A mistake caught by using it.** The first `remaining_today` counted Mistral's
+per-minute rate extrapolated to 24 hours, so it reported 86,988 requests
+remaining against a real plannable budget of ~1,146 -- and every run, at any
+size, answered "fits". A preflight that always says yes is not a preflight. It
+now excludes rate extrapolations for the same reason the capacity plan does.
+
+### Gate evidence
+
+```
+swarm run (live)              8/8 nodes, $0.00, repeatable across tasks
+swarmd eval (live)            20% both arms, CI[0.00,0.60], no measured
+                              improvement -- produced across 6 resumed chunks
+swarmd providers budget       1,146/day plannable, token-bound on groq
+preflight at 1000 agents      ~1005 calls vs 588 remaining: does not fit
+ruff / mypy / pytest          clean, clean, 866 passed
+tsc --noEmit / next build     clean, built
+```
+
+---
+
 ## Next up
 
 - [x] Kernel, pipeline, harnesses, gates, HITL state machine, router
@@ -1612,8 +1756,13 @@ tsc --noEmit / next build     clean, built
       reality, NVIDIA added as a grant-backed tier, Cerebras removed (402)
 - [x] Budgets tracked across minute/hour/5h session/day/week/month, summed from
       a durable per-credential journal, surfaced in CLI, API and dashboard
-- [ ] Make real runs SOLVE: the criterion/worker output contract mismatch
-      (fenced code vs JSON output) is the open half of G-4
+- [x] Real runs SOLVE: 8/8 nodes repeatably, 20% at task level in the eval
+- [x] Profiles sized to the measured budget; any agent count honoured exactly,
+      with a preflight that prices it before the run starts
+- [x] Distillation records an approach rather than the answer it produced
+- [ ] Volume: n=5 gives CI[0.00,0.60]. 50-200 tasks before 20% is a property
+- [ ] The learning claim: needs a non-empty library, which needs a higher
+      success rate first
 - [ ] The learning curve: 50-200 tasks with the control arm, once runs pass
 - [ ] The learning curve: 50-200 tasks with the control arm, then and only then
       generate BENCHMARKS.md and make an improvement claim
