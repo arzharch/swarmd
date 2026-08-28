@@ -70,7 +70,14 @@ class Profile:
 
 
 PROFILES = {
-    "smoke": Profile("smoke", 8, 2, 1, 60, "CI: proves the loop runs, ~2 min"),
+    # THREE proposers, not two, and the reason is arithmetic rather than
+    # thoroughness. The merge keeps a check when `ceil(valid * 0.5)` proposers
+    # asked for it: at three that is 2 of 3, a majority; at TWO it is 1 of 2,
+    # which is a union. Every check either proposer thought of survived, so
+    # smoke runs were graded against the strictest criterion the system can
+    # produce -- 13 checks where standard produced 5 -- and the profile meant
+    # to be the easy one was the hardest.
+    "smoke": Profile("smoke", 8, 3, 1, 60, "CI: proves the loop runs, ~2 min"),
     "standard": Profile("standard", 500, 3, 2, 600, "the ordinary run, 12-18 min"),
     "deep": Profile("deep", 500, 3, 3, 1800, "enough curve points, ~40 min"),
     "eval": Profile("eval", 500, 3, 2, 600, "one task within a sweep"),

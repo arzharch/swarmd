@@ -627,3 +627,24 @@ async def test_checkpoints_are_json_serialisable():
     )
     assert outcome.checkpoint is not None
     json.dumps(outcome.checkpoint.to_dict())
+
+
+def test_no_profile_degenerates_consensus_into_a_union():
+    """Two proposers is not a quorum, it is a union.
+
+    The merge keeps a check when ceil(valid * min_agreement) proposers asked
+    for it. At three that is 2 of 3. At two it is 1 of 2 -- so every check
+    either proposer thought of survives, and the criterion becomes the union of
+    two opinions rather than what they agreed on. Smoke ran that way and was
+    graded against 13 checks where standard produced 5.
+    """
+    import math
+
+    from swarmd.swarm.run import PROFILES
+
+    for name, profile in PROFILES.items():
+        threshold = max(1, math.ceil(profile.proposers * 0.5))
+        assert threshold >= 2, (
+            f"profile {name!r} has {profile.proposers} proposers, so consensus "
+            f"needs only {threshold} vote and degenerates into a union"
+        )
