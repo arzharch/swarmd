@@ -197,7 +197,7 @@ export function TopBar({
         onChange={(e) => onAgents(e.target.value)}
         placeholder="agents"
         aria-label="Agent count"
-        title="How many agents to run. Empty uses the profile's figure. Above 16 per plan node the cost ceiling, not a cap, is what stops the run — batched generation and the semantic cache are not implemented yet."
+        title="How many agents to run. Empty uses the profile's figure. Generation is batched, so a pool costs one call per node regardless of size; repairs are still one call each, which is what the advisory cap of 32 per node is for. Above it, the cost ceiling is what stops the run."
       />
 
       <select

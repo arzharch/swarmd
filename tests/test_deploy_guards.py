@@ -216,6 +216,125 @@ def test_no_egress_rule_can_reach_the_cloud_metadata_endpoint():
     assert offenders == [], offenders
 
 
+# --- the image is the deployment artifact ----------------------------------
+#
+# Every check below corresponds to a defect that was live in `master` and was
+# found by building the image and running the manifests against a real cluster.
+# None of them could be found by reading: the image had never been built
+# successfully, so nothing downstream of the build had ever executed.
+
+
+DOCKERFILE = REPO / "deploy" / "Dockerfile"
+
+
+def _dockerfile() -> str:
+    return DOCKERFILE.read_text(encoding="utf-8")
+
+
+def test_the_dockerfile_copies_every_file_the_build_backend_reads():
+    """`uv sync` fails on a missing readme, and the error names a path, not a cause.
+
+    pyproject.toml declares `readme = "README.md"`, so the build backend opens
+    it while packaging. The Dockerfile copied src/ and examples/ and not the
+    readme, so the build died with "failed to open file /app/README.md" -- and
+    the image had therefore never been built at all.
+    """
+    import tomllib
+
+    project = tomllib.loads(
+        (REPO / "pyproject.toml").read_text(encoding="utf-8")
+    )["project"]
+    readme = project.get("readme")
+    if not readme:
+        pytest.skip("no readme declared")
+
+    dockerfile = _dockerfile()
+    assert f"COPY {readme}" in dockerfile, (
+        f"pyproject declares readme={readme!r}; the Dockerfile must COPY it or "
+        f"the build backend cannot package the project"
+    )
+
+
+def test_the_image_installs_the_extras_the_manifest_depends_on():
+    """The container started, printed 'serve needs the serve extra', and exited.
+
+    The manifest runs `swarmd serve` against Postgres, so `serve` and
+    `postgres` are part of the deployment contract however optional their name
+    makes them sound.
+    """
+    dockerfile = _dockerfile()
+    for extra in ("serve", "postgres"):
+        assert f"--extra {extra}" in dockerfile, (
+            f"the deployment needs the {extra!r} extra; without it the "
+            f"container exits at startup"
+        )
+
+
+def test_the_image_default_command_binds_a_reachable_address():
+    """Loopback inside a container is reachable from nothing outside it.
+
+    `docker run -p 8000:8000` against the old default connected to a server
+    that was up and listening where the published port could not reach it. The
+    CLI's 127.0.0.1 default is right for a laptop and wrong here.
+    """
+    dockerfile = _dockerfile()
+    cmd = [line for line in dockerfile.splitlines() if line.startswith("CMD")]
+    assert cmd, "no CMD in the Dockerfile"
+    assert "0.0.0.0" in cmd[-1], (
+        f"the image default command must bind 0.0.0.0, not loopback: {cmd[-1]}"
+    )
+
+
+def test_anything_bound_off_host_is_given_an_operator_token():
+    """The deployment CrashLoopBackOffed on every apply until this held.
+
+    The app refuses to bind 0.0.0.0 with no SWARMD_API_TOKEN (ADR-013) -- which
+    is correct, since the token is the only thing between the run API and
+    anyone who can reach the port. The base Secret ships an empty placeholder,
+    so the guard fired on every dev deploy and the pods never started.
+
+    Checked per overlay: prod gets a real token from an ExternalSecret, dev
+    patches in an obviously-fake local one, and neither may regress to empty.
+    """
+    import subprocess
+
+    for overlay in ("dev", "prod"):
+        rendered = subprocess.run(
+            ["kubectl", "kustomize", f"deploy/k8s/overlays/{overlay}"],
+            capture_output=True, text=True, cwd=REPO, check=False,
+        )
+        if rendered.returncode != 0:
+            pytest.skip(f"kubectl unavailable: {rendered.stderr[:80]}")
+
+        docs = [d for d in yaml.safe_load_all(rendered.stdout) if d]
+        binds_off_host = any(
+            "0.0.0.0" in str(value)
+            for doc in docs
+            for value in _walk(doc, "args")
+        )
+        if not binds_off_host:
+            continue
+
+        # Either a literal token with a value, or an external source for one.
+        literal = [
+            v
+            for doc in docs
+            for sd in _walk(doc, "stringData")
+            for k, v in (sd or {}).items()
+            if k == "SWARMD_API_TOKEN"
+        ]
+        external = [
+            k
+            for doc in docs
+            for k in _walk(doc, "secretKey")
+            if k == "SWARMD_API_TOKEN"
+        ]
+        assert any(str(v).strip() for v in literal) or external, (
+            f"{overlay} binds 0.0.0.0 but supplies no SWARMD_API_TOKEN; the "
+            f"control plane will refuse to start and CrashLoopBackOff"
+        )
+
+
 # --- alert/runbook coupling ------------------------------------------------
 
 

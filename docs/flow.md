@@ -1354,13 +1354,16 @@ POST /api/runs x2 (identical)     run 1: 8 calls, 4 cache entries
       generate BENCHMARKS.md and make an improvement claim
 - [x] Product posture: operator token, edge allowlist, rate limits, JSON logs
       with redaction, SECURITY.md, ADR-013
-- [ ] Narrow the egress NetworkPolicy to provider CIDRs (widest control shipped)
+- [x] Narrow the egress NetworkPolicy to provider CIDRs -- done in
+      deploy/k8s/base/rbac-and-config.yaml, with the failure mode it introduces
+      written next to it: a provider changing ranges looks like an outage
 - [ ] Exercise rollback against a real cluster
 - [x] Debt cleared: no unmarked mock on any user-facing path. make_router
       raises instead of downgrading, FallbackRouter no longer recommends a
       mock tail, and 'mock' now aliases the tainted simulated provider
 - [x] Traceability view + the ledger commands RUNBOOK.md names
-- [ ] Wire skill approval through the HITL queue rather than the library alone
+- [x] Skill approval through the HITL queue: SkillGate is the only path in
+      distillation, sessions, the CLI and the approve endpoint
 - [x] Supervisor inside the swarm loop: proposes from the failure taxonomy,
       the consolidator gates, ineffective patches are reverted
 - [x] ADRs 007, 008 and 010 written -- they were cited 32 times and did not exist

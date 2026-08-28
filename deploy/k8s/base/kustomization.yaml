@@ -8,9 +8,16 @@ kind: Kustomization
 
 namespace: swarmd
 
-commonLabels:
-  app.kubernetes.io/part-of: swarmd
-  app.kubernetes.io/managed-by: kustomize
+# `labels` rather than the deprecated `commonLabels`. Not cosmetic: the old
+# field also writes into selectors, and a selector is immutable on an existing
+# Deployment -- so changing a common label under `commonLabels` turns the next
+# apply into a hard failure. `includeSelectors: false` keeps these as metadata
+# only, which is what "part-of" and "managed-by" are for.
+labels:
+  - includeSelectors: false
+    pairs:
+      app.kubernetes.io/part-of: swarmd
+      app.kubernetes.io/managed-by: kustomize
 
 resources:
   - namespace.yaml

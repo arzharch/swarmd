@@ -127,16 +127,33 @@ jobs:
         # everywhere, metadata endpoint blocked, every alert has a runbook
         # entry, no sample data in the dashboard.
         run: uv run pytest tests/test_deploy_guards.py -q
-      - name: kustomize builds
+      - name: manifests build AND validate against real API schemas
+        # "kustomize builds" only proves the YAML merged. It says nothing about
+        # whether an API server would accept the result -- a misspelled field, a
+        # wrong type, a probe with no port all build fine and fail on apply.
+        # kubeconform checks against the published OpenAPI schemas, and the CRD
+        # catalog covers ExternalSecrets and the Prometheus operator types,
+        # which are otherwise skipped in silence.
         run: |
           for overlay in dev prod; do
-            kubectl kustomize "deploy/k8s/overlays/$overlay" > /dev/null
-            echo "$overlay overlay builds"
+            kubectl kustomize "deploy/k8s/overlays/$overlay" > "/tmp/$overlay.yaml"
+            docker run --rm -i ghcr.io/yannh/kubeconform:latest \
+              -strict -summary \
+              -schema-location default \
+              -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
+              < "/tmp/$overlay.yaml"
           done
       - name: alert rules parse
+        # --entrypoint is load-bearing. The image's entrypoint is
+        # /bin/prometheus, so `docker run prom/prometheus promtool check ...`
+        # hands "promtool" to prometheus as an argument and exits with
+        # "unexpected promtool". This step could never have passed; nobody
+        # noticed because the workflow watched the wrong branch and had never
+        # once fired.
         run: |
-          docker run --rm -v "$PWD/observability:/o" \
-            prom/prometheus:v3.0.1 promtool check rules /o/alerts.yml
+          docker run --rm --entrypoint promtool \
+            -v "$PWD/observability:/o" \
+            prom/prometheus:v3.0.1 check rules /o/alerts.yml
 
   frontend:
     name: frontend

@@ -15,6 +15,23 @@ replicas:
   - name: swarmd-frontend
     count: 1
 
+# THE DEPLOYMENT DID NOT START WITHOUT THIS, and it took applying the manifests
+# to a real cluster to find out. The control plane is launched with
+# `--host 0.0.0.0`, and the app refuses to bind off-host with no operator token
+# (ADR-013) -- correctly, since the token is the only thing between the run API
+# and anyone who can reach the port. The base Secret ships
+# `SWARMD_API_TOKEN: ""` as a placeholder, so every dev apply produced a
+# CrashLoopBackOff whose logs said exactly why and which nobody had read.
+#
+# Prod is unaffected: its ExternalSecret pulls a real token from Secrets
+# Manager. Only dev, which uses the placeholder, was broken.
+#
+# The value is deliberately a fixed, obviously-fake string rather than
+# something that looks like a credential. Dev clusters are local and reachable
+# only from the developer's machine, so the token's job here is to satisfy the
+# guard, not to protect anything -- and a value that ANNOUNCES that is safer
+# than a realistic-looking one someone might paste into a shared environment.
+# Prod never uses this path; it reads a real token from Secrets Manager.
 configMapGenerator:
   - name: swarmd-config
     behavior: merge
@@ -36,6 +53,13 @@ patches:
       - op: replace
         path: /spec/maxReplicas
         value: 2
+  - target:
+      kind: Secret
+      name: swarmd-provider-keys
+    patch: |
+      - op: replace
+        path: /stringData/SWARMD_API_TOKEN
+        value: dev-local-only-not-a-real-credential
   - target:
       kind: PodDisruptionBudget
     patch: |
