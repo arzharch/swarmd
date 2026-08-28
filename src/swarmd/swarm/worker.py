@@ -147,7 +147,24 @@ class GenericWorker:
         that does not say what failed is just a re-roll, and re-rolling is how
         a bounded repair budget gets spent without converging.
         """
+        ctx_criterion = getattr(self.context, "criterion", None)
         parts = [f"TASK: {task}", f"STEP: {node.name}", f"REQUIRED: {node.instruction}"]
+
+        # THE SPECIFICATION. Withholding it was the largest single cause of
+        # live runs failing: the criterion asked for a numeric artifact called
+        # `accuracy`, the step said "extract the first claim", and the worker
+        # had no way to connect the two. It produced correct data under keys
+        # nothing was looking for, three attempts running.
+        #
+        # Showing it does not let an agent move the target -- the criterion is
+        # frozen and content-addressed before any worker exists, and something
+        # else does the grading. See `Criterion.as_requirements`.
+        requirements = ctx_criterion.as_requirements() if ctx_criterion else ""
+        if requirements:
+            parts.append(
+                "YOUR OUTPUT IS GRADED AGAINST THESE EXACT CHECKS. Satisfy "
+                "every one:\n" + requirements
+            )
         if skills:
             parts.append(
                 "APPROACHES THAT WORKED BEFORE (use if applicable):\n"
@@ -404,7 +421,24 @@ class GenericWorker:
                 stdout=result.stdout,
                 stderr=result.stderr,
             )
-        return Candidate(output=_unfence(text))
+        # No code ran. If the reply IS a JSON object, it is the artifact set:
+        # `{"accuracy": 94.3}` answered directly and `artifacts.json` written
+        # by a script are the same claim, and a criterion asking for the key
+        # `accuracy` means the same thing in both cases.
+        #
+        # Without this, agents that answered correctly and directly failed
+        # every `artifact_exists` check -- observed live, producing exactly
+        # `{"accuracy": 94.3, "baseline": 82.1}` from the source text and being
+        # graded as though they had produced nothing.
+        answer = _unfence(text)
+        direct: dict[str, Any] = {}
+        try:
+            parsed = json.loads(answer)
+            if isinstance(parsed, dict):
+                direct = parsed
+        except (json.JSONDecodeError, TypeError):
+            pass
+        return Candidate(output=answer, artifacts=direct)
 
     def _observe(self, action: Action) -> bool:
         """Report an action to the red-team. Returns True if contained."""

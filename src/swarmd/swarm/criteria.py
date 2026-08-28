@@ -373,6 +373,76 @@ class Criterion:
                 outcomes.append(CheckOutcome(check.kind, False, f"malformed: {exc}"))
         return CriterionResult(all(o.passed for o in outcomes), tuple(outcomes))
 
+    def as_requirements(self) -> str:
+        """The frozen criterion, written for the agent that has to satisfy it.
+
+        WHY A WORKER IS SHOWN THIS. It was not, and that was the single largest
+        cause of live runs failing: the criterion demanded top-level artifact
+        keys `accuracy` and `baseline`, the plan node said "extract the first
+        claim", and the worker -- which saw the task, the step and its own past
+        failures but never the specification -- produced `{"claims": [...]}`
+        and failed forever. Solving against a hidden spec makes success
+        accidental.
+
+        This does NOT weaken ADR-009. The criterion is authored, attacked and
+        content-addressed BEFORE any of this, and a worker cannot alter it: it
+        is frozen, the hash is a run output, and grading happens elsewhere. The
+        guarantee is that the target cannot move, not that the target is
+        secret. A test suite you are allowed to read is still a test suite.
+
+        What it does raise is gaming: an agent that knows the checks can write
+        output shaped to pass them while meaning nothing. That is precisely
+        what the adversarial pass before freezing and the red-team's
+        `criterion_gaming` detector exist for -- and both are already catching
+        it in live runs.
+        """
+        lines = []
+        for check in self.checks:
+            params = check.params
+            if check.kind == "json_parses":
+                keys = params.get("required_keys") or []
+                lines.append(
+                    "- the output must be a JSON object"
+                    + (f" containing keys: {', '.join(map(str, keys))}" if keys else "")
+                )
+            elif check.kind == "artifact_exists":
+                lines.append(
+                    f"- artifacts.json must contain the top-level key "
+                    f"{params.get('key')!r}"
+                )
+            elif check.kind == "numeric_range":
+                lines.append(
+                    f"- artifacts.json key {params.get('key')!r} must be a NUMBER"
+                    f" between {params.get('min', '-inf')} and "
+                    f"{params.get('max', 'inf')} (a number, not a sentence"
+                    f" containing one)"
+                )
+            elif check.kind == "contains_all":
+                subs = params.get("substrings") or []
+                lines.append(
+                    f"- the output must contain: {', '.join(map(str, subs))}"
+                )
+            elif check.kind == "regex_match":
+                lines.append(f"- the output must match regex {params.get('pattern')!r}")
+            elif check.kind == "exit_code":
+                lines.append(
+                    f"- the program must exit {params.get('expected', 0)}"
+                )
+            elif check.kind == "stdout_contains":
+                lines.append(f"- stdout must contain {params.get('substring')!r}")
+            elif check.kind == "min_distinct_words":
+                lines.append(
+                    f"- at least {params.get('min_distinct')} distinct words "
+                    f"(padding and repetition fail)"
+                )
+            elif check.kind == "output_nonempty":
+                lines.append(
+                    f"- at least {params.get('min_chars', 1)} characters of output"
+                )
+            else:
+                lines.append(f"- {check.kind}: {params}")
+        return "\n".join(lines)
+
     def content_hash(self) -> str:
         """Stable identity. Same checks -> same hash, whatever their order.
 

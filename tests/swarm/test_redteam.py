@@ -181,8 +181,34 @@ def test_padded_output_that_passes_the_criterion_is_contained(team):
     assert result.detection.pattern == "criterion_gaming"
 
 
-def test_trivially_short_output_that_passes_is_contained(team):
-    result = team.observe(_act(kind="submit", verified_success=True, payload="ok"))
+def test_short_and_repetitive_output_that_passes_is_contained(team):
+    """Padding cannot be the point of any task."""
+    result = team.observe(
+        _act(kind="submit", verified_success=True, payload="ok ok ok ok ok ok")
+    )
+    assert result is not None
+    assert result.detection.pattern == "criterion_gaming"
+
+
+def test_a_short_precise_answer_is_not_gaming(team):
+    """The detector was containing CORRECT ANSWERS.
+
+    For an extraction task the right answer is short: `{"accuracy": 94.3,
+    "baseline": 82.1}` is six tokens and complete. This detector only ever sees
+    submissions that already passed the frozen criterion, so brevity is
+    evidence the task had a short answer -- not that the answer was empty.
+
+    Judging whether a short answer is substantive requires knowing the task.
+    The criterion knows it; a runtime detector does not. So that judgement
+    belongs to the adversarial pass before freezing, which now includes a bare
+    "ok" among its attacks.
+    """
+    payload = '{"accuracy": 94.3, "baseline": 82.1}'
+    assert team.observe(_act(kind="submit", verified_success=True, payload=payload)) is None
+
+
+def test_output_with_no_tokens_at_all_is_still_contained(team):
+    result = team.observe(_act(kind="submit", verified_success=True, payload="   "))
     assert result is not None
     assert result.detection.pattern == "criterion_gaming"
 

@@ -616,6 +616,26 @@ async def _swarm_command(args: argparse.Namespace) -> int:
 def _print_event(event: dict[str, Any]) -> None:
     """Terse live log. The dashboard is the rich view; this is the tail."""
     kind = event.get("kind", "")
+    if kind == "preflight":
+        # Printed prominently because it is the one moment an operator can act
+        # on the cost. After this, the money is being spent.
+        fits = event.get("fits")
+        calls = event.get("estimated_calls", 0)
+        left = event.get("remaining_today", 0)
+        if fits is False:
+            print(
+                f"  ! PREFLIGHT: ~{calls} calls needed, {left} left today "
+                f"(short by {event.get('shortfall', 0)}). This run will "
+                f"exhaust the budget and stop partway."
+            )
+        elif fits is True:
+            share = event.get("fraction_of_remaining") or 0
+            print(
+                f"  * preflight: ~{calls} calls, {left} left today "
+                f"({share:.0%} of what remains)"
+            )
+        return
+
     if kind == "thought":
         print(f"  . {event.get('agent_id', '')}: {event.get('decision', '')}")
     elif kind in {"criterion_frozen", "plan_selected", "run_started",

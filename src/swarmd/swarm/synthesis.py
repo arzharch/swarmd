@@ -59,6 +59,13 @@ def degenerate_candidates(task: str) -> list[tuple[str, Candidate]]:
         # lexically overlaps the task, and contains no work whatsoever.
         ("echo_task", Candidate(output=task * 3)),
         ("refusal", Candidate(output="I cannot help with that request.")),
+        # A bare acknowledgement. Added when the red-team stopped treating
+        # BREVITY as evidence of gaming: judging whether a short answer is
+        # empty belongs to the criterion, which knows the task, and not to a
+        # runtime detector, which does not. So the criterion has to be the
+        # thing that rejects it -- a criterion a one-word "ok" satisfies must
+        # not freeze.
+        ("trivial_token", Candidate(output="ok", artifacts={}, exit_code=0)),
         (
             "empty_json",
             Candidate(output="{}", artifacts={}, exit_code=0),

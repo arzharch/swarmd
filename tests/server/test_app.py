@@ -397,10 +397,17 @@ def test_the_ledger_is_exposed_for_traceability(client):
 
 
 def test_ledger_rows_can_be_filtered_by_kind(client):
+    """Filtered on a kind every run emits.
+
+    This used to filter on `gate`, which is written only when a node FAILS its
+    criterion. It passed because nodes were failing; once they started passing
+    it broke, and the breakage said nothing about filtering. A test whose
+    fixture depends on the system being broken stops working when it is fixed.
+    """
     run_id = _completed_run(client)
-    body = client.get(f"/api/runs/{run_id}/ledger?kind=gate").json()
+    body = client.get(f"/api/runs/{run_id}/ledger?kind=criterion_frozen").json()
     assert body["rows"]
-    assert {r["kind"] for r in body["rows"]} == {"gate"}
+    assert {r["kind"] for r in body["rows"]} == {"criterion_frozen"}
 
 
 def test_the_ledger_carries_its_reconciliation_status(client):
