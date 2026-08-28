@@ -1732,6 +1732,100 @@ tsc --noEmit / next build     clean, built
 
 ---
 
+## 2026-08-29 - The ablation was not an ablation
+
+The request was to get self-learning working and have QA sign off. What
+happened instead is the most useful negative result this project has produced.
+
+### The A/B test compared a thing to itself
+
+`swarmd eval` built each run as `SwarmRun(pool, use_skills=use_skills, ...)`
+and never passed `skills=`. In `SwarmRun.__init__`:
+
+    self.skills = skills if use_skills else None
+
+With `skills` defaulting to `None`, that is `None` in BOTH arms. The treatment
+and control arms were the same code path, differing only in a boolean nobody
+read.
+
+So every "no measured improvement" this project ever reported was a null
+result generator. Not a measurement that came back flat -- an experiment that
+could not come back any other way, at any sample size. It survived because the
+verdict it produced was the one an honest system is supposed to produce, and
+nobody asked whether it could have produced another.
+
+Worth stating as a general lesson: **a null result from an experiment you have
+not verified can distinguish its arms is not evidence of absence.** It is
+evidence of nothing at all, and it looks exactly like integrity.
+
+### With a real library, learning made things worse
+
+Fixed the wiring, distilled 11 skills from a training session, ran the sweep:
+
+| | treatment | control |
+|---|---|---|
+| solved | 0 / 5 | 2 / 5 |
+| node pass rate | 56.7% | 65.6% |
+| pass@1 | 0% | 40% |
+
+The harness reported "no measured improvement, delta -0.400" -- declining to
+call it a regression at n=5 because the intervals overlap. Correct, and the
+first time that verdict has been about anything real.
+
+**Diagnosis.** Distillation was writing `"For steps like 'extract_dates': ..."`
+-- and plan node names are generated fresh every run. Retrieval was injecting
+confident instructions about a step the reading plan does not have. A worker
+told how to do `extract_dates` while executing `tokenize` is worse off than one
+told nothing.
+
+The retrieval threshold's own docstring predicted this exactly: "a wrong skill
+actively misleads a worker, while no skill just leaves it to reason from the
+task." The machinery was right; the data going into it was mine, from a fix
+made hours earlier.
+
+**Fix:** skills describe the kind of work and the shape it produced, with no
+node name. Rebuilt library reads `"When a step calls for this: Return a list of
+all date strings found in the paragraph. Produce a JSON object with these
+fields: ..."`.
+
+**Not re-measured.** The day's budget went to the two sweeps that did run:
+
+```
+groq         101,522 / 100,000 tokens   BLOCKED
+openrouter        51 / 50 requests      BLOCKED
+nvidia-nim         0 / 1,000 credits    GRANT EXHAUSTED
+google           496 / 1,000 requests   429 under load
+```
+
+The finite grant reaching zero on day one is the behaviour the budget module
+was written to make visible, and the reason it sorts behind replenishing tiers.
+
+### Decision: metrics that describe a population
+
+Added because task-level success hides what a swarm is doing.
+
+**pass@k.** A population that solves a task on its third attempt has solved it;
+reporting only per-attempt success describes a single agent and understates a
+population by exactly the amount the population is for. Returns None rather
+than pass@fewer when there are not enough attempts -- a metric that quietly
+changes meaning is worse than a missing one.
+
+**Node pass rate.** 7 of 8 nodes and 0 of 8 both report "not solved" at task
+level. For a system whose unit of work is the node, that is the difference
+between nearly working and not working, and it moves long before the task rate
+does. It is what showed the treatment arm was worse in a way the task counts
+alone (0 vs 2, n=5) could not have distinguished from noise.
+
+### Gate evidence
+
+```
+ruff / mypy / pytest        clean, clean, 878 passed
+eval (live, real ablation)  T 0/5 vs C 2/5, node 56.7% vs 65.6%, pass@1 0%/40%
+budget                      all providers exhausted; grant at 0/1000
+```
+
+---
+
 ## Next up
 
 - [x] Kernel, pipeline, harnesses, gates, HITL state machine, router
@@ -1761,8 +1855,10 @@ tsc --noEmit / next build     clean, built
       with a preflight that prices it before the run starts
 - [x] Distillation records an approach rather than the answer it produced
 - [ ] Volume: n=5 gives CI[0.00,0.60]. 50-200 tasks before 20% is a property
-- [ ] The learning claim: needs a non-empty library, which needs a higher
-      success rate first
+- [x] The ablation actually compares two different things (it did not before)
+- [x] pass@k and node pass rate reported and traceable
+- [ ] Re-measure learning with the node-anchor fix: blocked on daily quota
+- [ ] Volume: n=5 gives CI[0.00,0.60]. 50-200 tasks before 20% is a property
 - [ ] The learning curve: 50-200 tasks with the control arm, once runs pass
 - [ ] The learning curve: 50-200 tasks with the control arm, then and only then
       generate BENCHMARKS.md and make an improvement claim
