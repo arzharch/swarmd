@@ -56,9 +56,19 @@ from swarmd.task import Checkpoint
 logger = logging.getLogger(__name__)
 
 
-# Run profiles. Derived from docs/CAPACITY.md rather than chosen: the pooled
-# free-tier ceiling is ~45 requests/minute, so a profile is really a statement
-# about how many model calls fit in a target wall-clock.
+# Run profiles, sized against the budget this deployment MEASURED rather than
+# the one its capacity plan hoped for.
+#
+# The old table promised 500 agents on `standard`, targeting 600 calls. The
+# measured plannable budget is ~1,146 requests/day (docs/CAPACITY.md section 7,
+# after discovering that Groq's binding limit is 100,000 tokens/day, not 1,000
+# requests). One `standard` run was therefore HALF A DAY of total capacity, and
+# the number 500 appeared nowhere except in a table nobody could act on.
+#
+# Sized so the ordinary profile can be run repeatedly in a working day, which
+# is what makes a profile useful. `--agents` overrides any of it: an operator
+# who wants 500, or 1000, gets 500 or 1000, and gets told what it will cost
+# before it starts (see `SwarmRun.preflight`).
 @dataclass(frozen=True, slots=True)
 class Profile:
     name: str
@@ -70,23 +80,56 @@ class Profile:
 
 
 PROFILES = {
-    # THREE proposers, not two, and the reason is arithmetic rather than
+    # THREE proposers everywhere, and the reason is arithmetic rather than
     # thoroughness. The merge keeps a check when `ceil(valid * 0.5)` proposers
     # asked for it: at three that is 2 of 3, a majority; at TWO it is 1 of 2,
     # which is a union. Every check either proposer thought of survived, so
     # smoke runs were graded against the strictest criterion the system can
     # produce -- 13 checks where standard produced 5 -- and the profile meant
     # to be the easy one was the hardest.
-    "smoke": Profile("smoke", 8, 3, 1, 60, "CI: proves the loop runs, ~2 min"),
-    "standard": Profile("standard", 500, 3, 2, 600, "the ordinary run, 12-18 min"),
-    "deep": Profile("deep", 500, 3, 3, 1800, "enough curve points, ~40 min"),
-    "eval": Profile("eval", 500, 3, 2, 600, "one task within a sweep"),
+    #
+    # max_repairs is 2, not 1. The repair round is the mechanism that fixes the
+    # single most common live failure -- a model writing "achieving 94.3%
+    # accuracy" where a numeric_range check wants 94.3 -- and giving it one
+    # attempt meant the mechanism barely ran. Repairs are the cheapest quality
+    # lever available: one extra call against a candidate that already exists.
+    "smoke": Profile(
+        "smoke", 8, 3, 2, 25,
+        "CI and quick checks: ~25 calls, under a minute",
+    ),
+    # The everyday run. ~90 calls means roughly a dozen a day inside the
+    # measured budget, with room left for an eval sweep.
+    "standard": Profile(
+        "standard", 24, 3, 2, 90,
+        "the ordinary run: ~90 calls, 2-4 min, a dozen a day fit the budget",
+    ),
+    # For a task worth spending on. Roughly a quarter of a day's capacity, so
+    # it is a decision rather than a habit.
+    "deep": Profile(
+        "deep", 64, 3, 3, 280,
+        "wide population and more repairs: ~280 calls, a quarter of a day",
+    ),
+    # One task inside a sweep. Deliberately the smallest: an eval multiplies
+    # this by tasks x arms x repeats, so a profile that is merely "small" here
+    # becomes a day's budget there.
+    "eval": Profile(
+        "eval", 8, 3, 2, 25,
+        "one task within a sweep: kept small because the sweep multiplies it",
+    ),
 }
 
 
-# Pool bounds. See SwarmRun._pool_size for why each number is what it is.
+# ADVISORY_POOL caps the pool a PROFILE implies, so a profile cannot silently
+# become enormous. An explicit `--agents` is honoured in full instead.
 ADVISORY_POOL = 32
-HARD_POOL = 64
+
+# MAX_IN_FLIGHT bounds how many agents run at once, whatever the population.
+# This is a concurrency bound, not a population bound, and the distinction is
+# the point: 1000 agents is a legitimate request, 1000 simultaneous provider
+# connections is a thundering herd that turns a rate limit into an outage.
+# 64 because the pooled free tier is ~45 requests/minute -- more in flight than
+# that cannot be served, it can only queue.
+MAX_IN_FLIGHT = 64
 
 
 @dataclass
@@ -231,6 +274,9 @@ class SwarmRun:
         # Why 2: one success can be luck, and a skill distilled from luck is a
         # superstition every future run inherits.
         self.min_evidence = 2
+        # The pool owns the budget tracker; the run borrows it to answer
+        # "does this fit" before spending anything.
+        self.budget = getattr(provider, "budget", None)
         self.redteam = RedTeam(kill=self._contain)
         # Deliberate misbehaviour, injected into this run. The red-team is NOT
         # told which agents are seeded: it either notices or the gate fails.
@@ -347,6 +393,7 @@ class SwarmRun:
         started = time.monotonic()
         result = RunResult(run_id=self.run_id, task=task)
         self._emit("run_started", task=task, profile=self.profile.name)
+        self.preflight()
 
         try:
             result.criterion = await self._synthesize_criterion(task)
@@ -409,6 +456,57 @@ class SwarmRun:
         self._emit("plan_selected", **selection.plan.to_dict())
         return selection.plan
 
+    def estimated_calls(self, nodes: int = 3) -> int:
+        """Roughly how many provider requests this run will make.
+
+        Deliberately an estimate and deliberately stated: the exact figure
+        depends on a plan that does not exist yet and on how many agents need
+        repairs. Wrong by a factor of two is still the difference between "this
+        fits" and "this is half your day".
+
+        Composition, per node:
+          1 batched generation, whatever the pool width (swarm/batch.py)
+          up to max_repairs individual calls per agent that fails
+
+        Plus criterion and plan synthesis, which are per-run, not per-node.
+        """
+        # The POPULATION, not the concurrency bound. Every agent asked for
+        # runs and therefore may cost a repair call; MAX_IN_FLIGHT only decides
+        # how many wait. Estimating against the bound made 500 and 1000 agents
+        # quote the same price, which is the opposite of informative.
+        pool = max(2, self.agents // max(1, nodes))
+        if not self.agents_explicit:
+            pool = min(ADVISORY_POOL, pool)
+        synthesis = self.profile.proposers * 2          # criterion + plan
+        generation = nodes                              # one batch per node
+        # Assume half the pool needs a repair round. Optimistic assumptions
+        # here produce a preflight that says yes and a run that stops early.
+        repairs = nodes * (pool // 2) * self.profile.max_repairs
+        return synthesis + generation + repairs
+
+    def preflight(self, nodes: int = 3) -> dict[str, Any]:
+        """What this run will cost against what is left today.
+
+        Emitted before any work starts. An operator who asks for 1000 agents
+        should be told what that means BEFORE spending it, not discover it from
+        a run that stops halfway with a budget error.
+        """
+        estimate = self.estimated_calls(nodes)
+        verdict = self.budget.affordable(estimate) if self.budget else {}
+        payload = {
+            "agents": self.agents,
+            "profile": self.profile.name,
+            **verdict,
+        }
+        self._emit("preflight", **payload)
+        if verdict and not verdict.get("fits", True):
+            logger.warning(
+                "preflight: this run needs ~%d calls and %d remain today; it "
+                "will exhaust the budget and stop partway",
+                estimate, verdict.get("remaining_today", 0),
+            )
+        return payload
+
     def _pool_size(self, plan: Plan) -> int:
         """Agents per plan node.
 
@@ -442,19 +540,34 @@ class SwarmRun:
         budget = max(2, self.agents // nodes)
         if not self.agents_explicit:
             return min(ADVISORY_POOL, budget)
+
+        # AN EXPLICIT COUNT IS HONOURED EXACTLY. Asking for 1000 agents used to
+        # give 192 -- HARD_POOL silently clamped each node's pool to 64 -- and
+        # nothing said so, which made the control a suggestion.
+        #
+        # The concern behind that clamp was real: a level of 1000 concurrent
+        # workers opens 1000 simultaneous provider connections and turns a rate
+        # limit into a thundering herd. But the fix for too much work AT ONCE
+        # is to bound concurrency, not to quietly run fewer agents. The
+        # population is what the operator asked for; MAX_IN_FLIGHT is how fast
+        # it is allowed to move (see `_execute`).
         if budget > ADVISORY_POOL:
             self._emit(
                 "pool_above_advisory",
                 requested=budget,
                 advisory=ADVISORY_POOL,
-                granted=min(HARD_POOL, budget),
+                granted=budget,
+                in_flight_cap=MAX_IN_FLIGHT,
                 reason=(
-                    "batched generation and the semantic cache are not "
-                    "implemented, so every agent is a real model call; the cost "
-                    "ceiling, not this cap, is what will stop the run"
+                    "granted in full. Generation is batched, so a wide pool "
+                    "costs one call per node; REPAIRS are one call each, so "
+                    f"cost grows with population. At most {MAX_IN_FLIGHT} "
+                    "agents run concurrently. The daily budget and the cost "
+                    "ceiling are what will stop the run, not a cap on how many "
+                    "agents you asked for."
                 ),
             )
-        return min(HARD_POOL, budget)
+        return budget
 
     async def _batch_generate(
         self, task: str, node: PlanNode, context: WorkerContext, k: int
@@ -683,9 +796,23 @@ class SwarmRun:
                     task, plan.node(name), context, pool
                 )
 
+            # Concurrency bound. Every agent the operator asked for runs;
+            # at most MAX_IN_FLIGHT of them are in the air at once, so a wide
+            # population queues instead of stampeding the provider pool.
+            gate = asyncio.Semaphore(MAX_IN_FLIGHT)
+
+            # `gate` bound as a default argument: it is recreated per level,
+            # and a closure over the loop variable would let a later level's
+            # semaphore govern an earlier level's tasks.
+            async def bounded(
+                name: str, draft: str, gate: asyncio.Semaphore = gate
+            ) -> WorkerResult:
+                async with gate:
+                    return await run_agent(name, draft)
+
             level_results = await asyncio.gather(
                 *(
-                    run_agent(name, batches[name].for_agent(index))
+                    bounded(name, batches[name].for_agent(index))
                     for name in level
                     for index in range(pool)
                 ),

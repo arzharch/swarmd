@@ -384,30 +384,32 @@ async def test_pool_size_is_floored_so_distillation_always_has_evidence():
     assert run._pool_size(plan) >= 2
 
 
-async def test_pool_size_is_capped_so_a_run_does_not_always_abort():
+async def test_a_profile_pool_stays_within_the_advisory_cap():
     """Batching removed the per-agent generation call; repairs are still one
-    call each, so the worst case stays linear and the cap stays finite."""
+    call each, so a PROFILE stays bounded even though an operator is not."""
     from swarmd.swarm.planner import PlanNode, validate
     from swarmd.swarm.run import ADVISORY_POOL
 
     run = SwarmRun(ScriptedProvider(), profile="standard")
     plan = validate([PlanNode(name="only", instruction="produce x.json")])
-    assert run._pool_size(plan) == ADVISORY_POOL
+    assert run._pool_size(plan) <= ADVISORY_POOL
 
 
 async def test_an_explicit_agent_count_overrides_the_advisory_cap():
     """A cap the operator cannot override is a lie about who is in control.
 
-    The cost ceiling is the real protection: the run aborts on budget with an
-    itemised report rather than silently costing more than it was allowed.
+    There is no upper clamp any more: an explicit count is honoured exactly,
+    and concurrency is bounded separately by MAX_IN_FLIGHT. The daily budget
+    and the cost ceiling are the real protections, and the preflight says what
+    a run will cost before it starts.
     """
     from swarmd.swarm.planner import PlanNode, validate
-    from swarmd.swarm.run import ADVISORY_POOL, HARD_POOL
+    from swarmd.swarm.run import ADVISORY_POOL
 
     plan = validate([PlanNode(name="only", instruction="produce x.json")])
     run = SwarmRun(ScriptedProvider(), profile="standard", agents=200)
     assert run._pool_size(plan) > ADVISORY_POOL
-    assert run._pool_size(plan) <= HARD_POOL
+    assert run._pool_size(plan) == 200
 
 
 async def test_exceeding_the_advisory_cap_emits_a_warning_not_a_silent_grant():
@@ -648,3 +650,93 @@ def test_no_profile_degenerates_consensus_into_a_union():
             f"profile {name!r} has {profile.proposers} proposers, so consensus "
             f"needs only {threshold} vote and degenerates into a union"
         )
+
+
+# --- choosing how many agents to run ---------------------------------------
+
+
+def test_an_explicit_agent_count_is_honoured_exactly():
+    """Asking for 1000 used to give 192.
+
+    HARD_POOL clamped each node's pool to 64 and nothing said so, which made
+    the control a suggestion. The concern behind the clamp was concurrency, and
+    concurrency is now bounded separately -- the population is what was asked
+    for, MAX_IN_FLIGHT is how fast it moves.
+    """
+    from swarmd.swarm.planner import PlanNode, validate
+    from swarmd.swarm.run import MAX_IN_FLIGHT
+
+    plan = validate([PlanNode(name="only", instruction="produce x.json")])
+    run = SwarmRun(ScriptedProvider(), profile="standard", agents=1000)
+    assert run._pool_size(plan) == 1000
+    assert run._pool_size(plan) > MAX_IN_FLIGHT
+
+
+def test_a_profile_alone_stays_within_the_advisory_cap():
+    """A profile must not silently become enormous; only an operator can."""
+    from swarmd.swarm.planner import PlanNode, validate
+    from swarmd.swarm.run import ADVISORY_POOL
+
+    plan = validate([PlanNode(name="only", instruction="produce x.json")])
+    run = SwarmRun(ScriptedProvider(), profile="deep")
+    assert run._pool_size(plan) <= ADVISORY_POOL
+
+
+def test_the_cost_estimate_scales_with_population_not_concurrency():
+    """500 and 1000 agents quoting the same price is the opposite of
+    informative, and that is what estimating against the in-flight bound did."""
+    small = SwarmRun(ScriptedProvider(), profile="standard", agents=500)
+    large = SwarmRun(ScriptedProvider(), profile="standard", agents=1000)
+    assert large.estimated_calls() > small.estimated_calls() * 1.5
+
+
+def test_profiles_fit_the_measured_daily_budget():
+    """The mismatch that made `standard` unrunnable.
+
+    It promised 500 agents and ~600 calls against a measured plannable budget
+    of ~1,146 requests/day -- half a day of total capacity for one run, and the
+    number appeared nowhere anyone could act on.
+    """
+
+    # A day's plannable budget, from docs/CAPACITY.md section 7.
+    daily = 1_146
+    for name in ("smoke", "standard", "eval"):
+        run = SwarmRun(ScriptedProvider(), profile=name)
+        assert run.estimated_calls() < daily * 0.2, (
+            f"{name} costs more than a fifth of a day; it cannot be routine"
+        )
+
+
+async def test_preflight_reports_a_run_that_will_not_fit():
+    """An operator asking for 1000 agents should learn the cost BEFORE paying
+    it, not from a run that stops halfway."""
+    from swarmd.router.budget import BudgetSpec, BudgetTracker, Limit, UsageJournal
+
+    class Pool(ScriptedProvider):
+        pass
+
+    provider = Pool()
+    provider.budget = BudgetTracker(
+        journal=UsageJournal("nonexistent-for-this-test.jsonl"),
+        budgets={"p": BudgetSpec(provider="p", kind="quota",
+                                 limits=(Limit("day", requests=100),))},
+    )
+    run = SwarmRun(provider, profile="standard", agents=1000)
+    report = run.preflight()
+
+    assert report["fits"] is False
+    assert report["shortfall"] > 0
+    assert report["estimated_calls"] > report["remaining_today"]
+
+
+async def test_preflight_reports_a_run_that_fits():
+    from swarmd.router.budget import BudgetSpec, BudgetTracker, Limit, UsageJournal
+
+    provider = ScriptedProvider()
+    provider.budget = BudgetTracker(
+        journal=UsageJournal("nonexistent-for-this-test.jsonl"),
+        budgets={"p": BudgetSpec(provider="p", kind="quota",
+                                 limits=(Limit("day", requests=10_000),))},
+    )
+    run = SwarmRun(provider, profile="smoke")
+    assert run.preflight()["fits"] is True

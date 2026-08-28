@@ -651,6 +651,59 @@ class BudgetTracker:
         value, basis = self.daily_capacity(provider)
         return value if basis != "unknown" else None
 
+    def remaining_today(self, *, now: float | None = None) -> int:
+        """Requests still available across every provider before tomorrow.
+
+        Summed over providers because the pool routes across them: a run is not
+        blocked by one provider being spent, only by all of them being spent.
+        Grants are included, because a grant is real capacity today -- it is
+        the MONTH that cannot be planned on one.
+        """
+        total = 0
+        for name, spec in self.budgets.items():
+            if self.blocked(name, now=now):
+                continue
+            capacity, basis = self.daily_capacity(name)
+            if basis == "rate_only":
+                # EXCLUDED, for the same reason `capacity_plan` excludes it: a
+                # per-minute rate multiplied out to 24 hours assumes perfect
+                # saturation for a full day. Counting it here made the
+                # preflight report 86,988 requests remaining against a real
+                # plannable budget of ~1,146 -- so every run, at any size,
+                # answered "fits". A preflight that always says yes is not a
+                # preflight.
+                continue
+            used = self.window_state(name, "day", now=now).used_requests
+            if spec.kind == "grant":
+                grant = self.grant_state(name, now=now)
+                remaining = grant["remaining"] if grant else 0
+                total += min(capacity, remaining)
+            else:
+                total += max(0, capacity - used)
+        return total
+
+    def affordable(
+        self, estimated_calls: int, *, now: float | None = None
+    ) -> dict[str, Any]:
+        """Whether a run of this size fits in what is left today.
+
+        Returns the numbers rather than a verdict, because the decision is the
+        operator's. A run that does not fit is not forbidden -- it will exhaust
+        the budget and stop partway, which is sometimes exactly what someone
+        wants at the end of a day. What is not acceptable is finding out
+        afterwards.
+        """
+        remaining = self.remaining_today(now=now)
+        return {
+            "estimated_calls": estimated_calls,
+            "remaining_today": remaining,
+            "fits": estimated_calls <= remaining,
+            "shortfall": max(0, estimated_calls - remaining),
+            "fraction_of_remaining": (
+                round(estimated_calls / remaining, 3) if remaining else None
+            ),
+        }
+
     def capacity_plan(self, *, now: float | None = None) -> dict[str, Any]:
         """Whether the configured providers can carry a day, a week, a month.
 
