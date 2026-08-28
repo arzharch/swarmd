@@ -774,6 +774,11 @@ def test_a_distilled_skill_records_an_approach_not_an_answer():
     assert "82.1" not in instruction
     assert "accuracy (float)" in instruction
     assert "pull the numbers out" in instruction
+    # No node name: plan node names are regenerated every run, so advice
+    # anchored to one describes a step the reader does not have.
+    assert "extract" not in instruction.split("Produce")[0].replace(
+        "pull the numbers out", ""
+    )
 
 
 def test_distillation_without_artifacts_describes_the_step_only():

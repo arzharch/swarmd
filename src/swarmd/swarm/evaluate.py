@@ -215,7 +215,7 @@ def summarise(outcomes: list[TaskOutcome], label: str) -> ArmSummary:
         containments=sum(o.containments for o in outcomes),
         pass_at_k={
             k: value
-            for k in (1, 3, 5)
+            for k in (1, 2, 3, 5)
             if (value := pass_at_k(outcomes, k)) is not None
         },
         node_pass_rate=(

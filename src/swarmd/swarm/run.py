@@ -861,14 +861,22 @@ class SwarmRun:
                 shapes.setdefault(key, type(value).__name__)
 
         what = plan_node.instruction if plan_node else node
+        # NO NODE NAME. Plan node names are generated fresh for every run, so
+        # advice that opens "for steps like 'extract_dates'" describes a step
+        # that does not exist in the plan reading it. Measured: a library of
+        # such skills made the treatment arm WORSE than control -- 0/5 against
+        # 2/5, node pass rate 56.7% against 65.6% -- because retrieval was
+        # injecting confident instructions about steps nobody had.
+        #
+        # What can recur is the KIND of work and the shape it produced.
         if not shapes:
-            # Nothing structured to generalise from. Describe the step and stop
+            # Nothing structured to generalise from. Describe the work and stop
             # rather than inventing a method nobody demonstrated.
-            return f"For steps like {node!r}: {what}"
+            return f"When a step calls for this: {what}"
 
         fields = ", ".join(f"{k} ({v})" for k, v in sorted(shapes.items()))
         return (
-            f"For steps like {node!r}: {what} "
+            f"When a step calls for this: {what} "
             f"Produce a JSON object with these fields: {fields}. "
             f"Values must come from the task at hand -- this records the shape "
             f"that satisfied the criterion {len(outcomes)} times, not the "
