@@ -90,63 +90,65 @@ The CLI is the same operations without a browser, not a separate product.
 
 ## 5. The remaining gap
 
-### G-4 · The baseline exists, and it is zero
-**Blocks:** a QA sign-off, and nothing else.
+### G-4 · The system solves tasks. 20%, from a standing start of 0%.
+**Blocks:** nothing structural. This is now a quality number to improve, with a
+baseline to improve it against.
 
-**First real eval against live providers**, 10 runs, both arms, commit
-`5c08d7d`, recorded in [BENCHMARKS.md](BENCHMARKS.md):
+**Eval on live providers**, 10 runs, both arms, in
+[BENCHMARKS.md](BENCHMARKS.md):
 
 | | treatment | control |
 |---|---|---|
-| solved | **0 / 5** | **0 / 5** |
-| success rate | 0.0% CI[0.00, 0.00] | 0.0% |
-| first-pass | 0.0% | 0.0% |
-| mean tokens | 10,626 | 13,730 |
-| containments | 0 | 2 |
+| solved | 1 / 5 | 1 / 5 |
+| success rate | 20.0% CI[0.00, 0.60] | 20.0% |
+| first-pass | 20.0% | 0.0% |
+| cost per solved | $0.000000 | $0.000000 |
 
-**Verdict: no measured improvement.** Which is the harness working -- it
-refuses to report a delta it cannot support -- and also the plainest possible
-statement of where the product is.
+**Verdict: no measured improvement** — correct at n=5, and the harness saying so
+rather than reporting the first-pass difference as a win is the behaviour it
+exists for.
 
-A task counts as solved only when EVERY node in its plan passes. Individual
-nodes do pass (measured 1/6 and 1/8 on repeated single runs), so the pipeline
-produces correct work; no run has yet produced correct work at every step.
-That gap is the product.
+Single tasks now solve completely and repeatably: **6/6 nodes** on two
+different tasks, at $0.00.
 
-**What is proven by these runs**, and was not before today:
+**Four defects were rejecting correct work.** All were found by running against
+real models and reading what agents actually produced:
 
-- The whole loop executes against real models: criterion synthesis, plan
-  synthesis, batched generation, sandbox execution, chaos, red-team, ledger.
-- The red-team catches real misbehaviour, unseeded. Two containments in the
-  control arm for `unsafe_tool_call` -- models writing `requests.get` into
-  generated code -- and earlier, `criterion_gaming` for output that satisfied a
-  criterion with 17 tokens. These were not fixtures.
-- Cost is $0.00. Every provider used is free-tier.
-- The eval resumes: this baseline was produced across two interrupted chunks,
-  6 runs then 4, with no run measured twice.
+1. **Workers were never shown the criterion.** They saw the task, the step and
+   their own past failures -- never the specification they were graded on. The
+   criterion demanded an artifact key `accuracy`; the plan step said "extract
+   the first claim"; the worker produced correct data under keys nothing was
+   looking for, three attempts running. Solving against a hidden spec makes
+   success accidental. `Criterion.as_requirements()` now renders the frozen
+   checks into the prompt.
 
-**Four defects were fixed to get here**, all invisible against the simulated
-provider because it replies with bare JSON -- the one output shape where the
-model's reply and the step's answer are the same string:
+   This does not weaken ADR-009: the criterion is authored, attacked and
+   content-addressed before any worker exists, and grading happens elsewhere.
+   The guarantee is that the target cannot move, not that it is secret.
 
-1. Criteria froze with unsatisfiable checks (`artifact_exists` with no `key`).
-2. The schema hint showed `"params": {}`, which models copied; replacing it
-   with concrete examples made them copy *those* instead.
-3. The graded output was the model's reply, not what running it produced.
-4. Empty completions from a reasoning model were read as bad proposals rather
-   than as failures, so synthesis refused to run.
+2. **A direct JSON answer was not treated as an artifact set.** Agents replying
+   `{"accuracy": 94.3, "baseline": 82.1}` -- correct, complete -- failed every
+   `artifact_exists` check, because artifacts only came from sandbox execution.
+   Answering directly and writing `artifacts.json` are the same claim.
 
-**What would move the number**, in the order I would try it:
+3. **The red-team was containing correct answers.** `criterion_gaming` flagged
+   any passing submission under 20 tokens. For an extraction task the right
+   answer is six tokens. The detector only ever sees submissions that already
+   passed the frozen criterion, so brevity is evidence the task had a short
+   answer, not that the answer was empty. Now it requires short **and**
+   repetitive; judging whether a short answer is substantive needs the task,
+   which the criterion knows and a runtime detector does not. A bare `"ok"` was
+   added to the adversarial attack set so that judgement stays where it belongs.
 
-- The criterion is stricter than the worker prompt is specific. Nodes fail on
-  `numeric_range` because a model wrote "achieving 94.3% accuracy" where the
-  check wants `94.3`. That is a prompt contract to tighten, not a model to
-  replace.
-- `max_repairs` is 1 on the smoke profile. The repair loop is the mechanism
-  that fixes exactly this class of failure and it gets one attempt.
-- The skill library has nothing in it. The treatment arm cannot beat the
-  control until distillation has produced something to retrieve, and
-  distillation needs two verified successes on a node.
+4. **Two proposers made consensus a union.** `ceil(2 × 0.5) = 1`, so every
+   check either proposer thought of survived: 13 checks where three proposers
+   produce 3-5. Three everywhere now.
+
+**What would move 20% further**, in order: the skill library is still empty, so
+the treatment arm has nothing to retrieve and cannot beat control until
+distillation has fired; `repeats=1` makes the interval [0.00, 0.60], so the
+number needs volume before it means much; and the remaining failures are
+concentrated in the harder wrangling tasks rather than spread evenly.
 
 ---
 
@@ -168,29 +170,29 @@ per-credential usage journal, the frozen criterion hash, the plan hash, the
 integrity hash, the red-team audit trail, and a per-agent reasoning tape. There
 is no counter anywhere that could disagree with the evidence.
 
-**QA: NO, and now there is a number rather than an impression.**
+**QA: a conditional yes on function, still no on evidence.**
 
 The product's core claim is that generic agents solve tasks nobody scoped for
-them. Measured: **0 of 5 tasks solved, in both arms.** Nodes pass; runs do not.
+them. That now happens: 20% of tasks end to end, 6/6 nodes on repeated single
+runs, at $0.00. The claim is demonstrated rather than asserted, which it was
+not this morning.
 
-The baseline that was missing now exists, which changes the character of the
-gap -- it is no longer unmeasured, it is measured and bad. What sign-off still
-needs:
+What I still will not sign:
 
-- a task success rate above zero, against a bar agreed before measuring;
-- enough volume for the learning curve to mean anything (50-200 tasks). At 10
-  runs the confidence intervals are [0.00, 0.00] because nothing succeeded, not
-  because the estimate is tight;
-- a load test at the `standard` profile, which has never run against real
-  providers -- every live run so far has been `smoke`, and `standard` is 500
-  agents against a daily budget of ~1,146 requests, which on its face does not
-  fit.
+- **Volume.** n=5 gives CI[0.00, 0.60]. That interval admits almost any true
+  value, so 20% is a measurement, not yet a property.
+- **The learning claim.** The skill library is empty, so the treatment arm has
+  nothing to retrieve. Until distillation fires and a curve exists with its
+  control, no improvement may be claimed -- and the harness enforces this by
+  refusing.
+- **Scale.** Every live run has been `smoke`. `standard` and `deep` are now
+  sized to the measured budget and have never been run against real providers.
 
-That last point deserves its own line: **the `standard` profile cannot run on
-the current free-tier budget.** 500 agents at ~600 calls is half a day's total
-capacity for one run. Either the profile is aspirational or the capacity plan
-needs paid overflow enabled, and right now the documentation implies the first
-while the code would attempt the second.
+The profiles were resized as part of this: `standard` was 500 agents and ~600
+calls against a measured budget of ~1,146 requests/day -- half a day of total
+capacity for one run. It is now 24 agents and ~90 calls, so a dozen fit a day.
+An operator can still ask for 500 or 1000; the count is honoured exactly, and
+`preflight` prices the run against the remaining budget before it starts.
 
 ### Smaller, and not blocking
 - No on-call rotation (single maintainer — stated, not solvable).
