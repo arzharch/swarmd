@@ -90,49 +90,85 @@ The CLI is the same operations without a browser, not a separate product.
 
 ## 5. The remaining gap
 
-### G-4 · Live runs execute, and do not yet SOLVE
-**Blocks:** acceptance criteria 2 and 5; every empirical number in the project.
+### G-4 · Live runs solve, at a low rate
+**Blocks:** a QA sign-off. Not a blocker for anything structural.
 
-Keys are configured and four providers are live. The infrastructure works
-end to end against real models: criterion synthesis, plan synthesis, batched
-generation, chaos, red-team and the ledger all run, a `smoke` run finishes in
-26-52 seconds, and it costs $0.00 because every provider used is free-tier.
+Real providers, real runs, measured over three consecutive runs on the same
+task: **1/6, 1/8, 0/6 nodes passed**, 13-15 calls, 16-33 seconds, $0.00. Call
+that a ~10% node pass rate.
 
-**What does not work yet: nodes do not pass.** Real runs report 0/N. Two causes
-were found and fixed, and a third is open.
+The pipeline is no longer the problem. Four defects stood between "infra runs"
+and "tasks get solved", all of them invisible against the simulated provider
+because it replies with bare JSON -- the one output shape where the model's
+reply and the step's answer are the same string:
 
-*Fixed — the criterion froze with unsatisfiable checks.* Models emitted checks
-missing their required parameters (`artifact_exists` with no `key`). Those fail
-every candidate forever, so the run graded 0/16 and blamed the workers. Checks
-are now validated at parse time and such a proposal is rejected. This was
-invisible against the simulated provider, whose proposals always had complete
-parameters.
+1. **Criteria froze with unsatisfiable checks.** Models emitted
+   `artifact_exists` with no `key`. Those fail every candidate forever, so the
+   run scored 0/16 and blamed the workers. Now rejected at parse time.
+2. **The schema hint taught the failure.** It showed `"params": {}`, so models
+   copied it. Replacing that with concrete examples made them copy *those* --
+   every criterion demanded a `claims.json` and a `VERIFIED` marker regardless
+   of task. Now angle-bracket placeholders with an explicit instruction to
+   derive values from the task.
+3. **The graded output was the reply, not the answer.** Models reply with
+   fenced ```python; the sandbox ran it correctly and then `json_parses` read
+   the Python and said "not JSON". `Candidate.output` is now what the step
+   produced, with `source` keeping the reply for traceability.
+4. **An empty completion was treated as an opinion.** `openai/gpt-oss-20b` is a
+   reasoning model: on a long prompt it spent all 700 output tokens thinking
+   and returned `content=""`. Criterion synthesis reported "no proposer
+   produced a parseable criterion" and refused to run. Empty completions are
+   now provider errors, so the pool fails over.
 
-*Fixed — the schema hint taught the failure.* The proposal example literally
-showed `"params": {}`, so models copied it. Replacing it with concrete examples
-made them copy *those* instead: every criterion demanded a file called
-`claims.json` and a stdout marker reading `VERIFIED`, whatever the task was.
-The examples are now angle-bracket placeholders with an explicit instruction to
-derive values from the task.
+**What is left is quality, not plumbing.** The remaining failures are the
+criterion legitimately demanding a number where the model wrote a sentence
+("achieving 94.3% accuracy" instead of `94.3`). That is what the repair loop
+and the skill library exist to fix, and it is measured by the eval harness --
+which has never been run against real providers, so there is no baseline to
+improve on.
 
-*Open — the criterion is over-strict for what workers produce.* Real models
-answer with fenced ```python blocks; the sandbox runs them and puts results in
-artifacts, but `candidate.output` stays the fenced source, so a `json_parses`
-check over the output fails by construction. Either the criterion should check
-artifacts for code-producing nodes, or workers should emit the artifact
-directly. This is a design question, not a bug, and it is the next thing to
-resolve.
+Also visible and not yet addressed: at `smoke`'s two proposers the consensus
+threshold is `ceil(2 * 0.5) = 1`, so the merged criterion is a UNION of both
+proposals -- maximally strict. Three proposers require two votes and produce a
+saner criterion. The profile, not the merge, is what makes smoke runs hard.
 
-Also still unmeasured:
+---
 
-- **Cache hit rate on real workloads.** Exact keying means genuinely novel
-  tasks hit near zero. The 100% measured on a repeated run is the ceiling.
-- **Whether K variants from one call are genuinely distinct.**
-- **The learning curve.** None exists. Until one does with its control arm,
-  nothing here claims the system improves.
+## 5a. Sign-off status
 
-**Honest summary:** the plumbing is proven against real providers; the task
-success rate is currently zero and the reason is understood.
+Asked directly whether this is ready, as an architect and as QA:
+
+**Architecture: yes.** The structure is production-grade and the decisions are
+documented with their alternatives. Nothing here needs redesigning to ship.
+
+**Operations: yes.** Image builds and runs, manifests validate against real
+Kubernetes schemas, rollback exercised on a live cluster, auth verified in the
+deployed posture, budgets tracked per credential across six windows and
+surviving restarts.
+
+**Traceability: yes, and this is the strongest part.** Any number in a report
+can be decomposed to the rows that produced it: an append-only cost ledger, a
+per-credential usage journal, the frozen criterion hash, the plan hash, the
+integrity hash, the red-team audit trail, and a per-agent reasoning tape. There
+is no counter anywhere that could disagree with the evidence.
+
+**QA: NO. I cannot sign this off, and the reason is one number.**
+
+The product's core claim is that generic agents solve tasks nobody scoped for
+them. Measured against real providers that currently happens about 10% of the
+time per node. A sign-off would need:
+
+- an eval baseline against real providers, with both arms and confidence
+  intervals -- the harness exists and has never been run on live traffic, so
+  there is no number to regress against and no way to tell an improvement from
+  noise;
+- a node pass rate that clears a stated bar, agreed before it is measured
+  rather than after;
+- a load test at the `standard` profile, which has never run against real
+  providers -- every live run so far has been `smoke`.
+
+None of those is a missing feature. They are measurements that take volume and
+provider quota, and until they exist "ready" is an opinion.
 
 ### Smaller, and not blocking
 - No on-call rotation (single maintainer — stated, not solvable).
