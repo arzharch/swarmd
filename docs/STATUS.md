@@ -90,24 +90,49 @@ The CLI is the same operations without a browser, not a separate product.
 
 ## 5. The remaining gap
 
-### G-4 · No live-provider validation
+### G-4 · Live runs execute, and do not yet SOLVE
 **Blocks:** acceptance criteria 2 and 5; every empirical number in the project.
 
-Everything has run against the simulated provider. Three things are
-consequently unmeasured, and each has a specific way it could be wrong:
+Keys are configured and four providers are live. The infrastructure works
+end to end against real models: criterion synthesis, plan synthesis, batched
+generation, chaos, red-team and the ledger all run, a `smoke` run finishes in
+26-52 seconds, and it costs $0.00 because every provider used is free-tier.
+
+**What does not work yet: nodes do not pass.** Real runs report 0/N. Two causes
+were found and fixed, and a third is open.
+
+*Fixed — the criterion froze with unsatisfiable checks.* Models emitted checks
+missing their required parameters (`artifact_exists` with no `key`). Those fail
+every candidate forever, so the run graded 0/16 and blamed the workers. Checks
+are now validated at parse time and such a proposal is rejected. This was
+invisible against the simulated provider, whose proposals always had complete
+parameters.
+
+*Fixed — the schema hint taught the failure.* The proposal example literally
+showed `"params": {}`, so models copied it. Replacing it with concrete examples
+made them copy *those* instead: every criterion demanded a file called
+`claims.json` and a stdout marker reading `VERIFIED`, whatever the task was.
+The examples are now angle-bracket placeholders with an explicit instruction to
+derive values from the task.
+
+*Open — the criterion is over-strict for what workers produce.* Real models
+answer with fenced ```python blocks; the sandbox runs them and puts results in
+artifacts, but `candidate.output` stays the fenced source, so a `json_parses`
+check over the output fails by construction. Either the criterion should check
+artifacts for code-producing nodes, or workers should emit the artifact
+directly. This is a design question, not a bug, and it is the next thing to
+resolve.
+
+Also still unmeasured:
 
 - **Cache hit rate on real workloads.** Exact keying means genuinely novel
-  tasks hit near zero. The 100% measured on a repeated run is the ceiling, not
-  the expectation.
-- **Whether K variants from one call are genuinely distinct.** The simulated
-  provider returns eight different candidates because it was written to. A real
-  model asked for eight distinct approaches may return three good ones and five
-  rewordings, which costs diversity without recovering the call count.
+  tasks hit near zero. The 100% measured on a repeated run is the ceiling.
+- **Whether K variants from one call are genuinely distinct.**
 - **The learning curve.** None exists. Until one does with its control arm,
   nothing here claims the system improves.
 
-**Fix:** add `GROQ_API_KEY` and `GOOGLE_API_KEY`, then a `standard` run and a
-`deep` session. Blocked on credentials only.
+**Honest summary:** the plumbing is proven against real providers; the task
+success rate is currently zero and the reason is understood.
 
 ### Smaller, and not blocking
 - No on-call rotation (single maintainer — stated, not solvable).
@@ -116,6 +141,11 @@ consequently unmeasured, and each has a specific way it could be wrong:
 - The kernel `Runtime` and the swarm executor share the `Checkpoint` contract
   but not the loop. A deliberate duplication with a real cost; unifying them is
   the next structural refactor, not a correctness gap.
+- Cerebras is no longer usable: its key returns 402, so the free tier now needs
+  a card. Removed from the registry, the budget table and the free-price list.
+- `SWARMD_API_TOKEN` is empty. Only needed to bind off-host — loopback runs
+  fine without it, and the container refuses to start bound to 0.0.0.0 without
+  one, which is the intended behaviour rather than a gap.
 
 ---
 

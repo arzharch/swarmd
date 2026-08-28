@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { Card } from "@/components/panels";
 import type {
+  BudgetResponse,
   ConfigResponse,
   EvalReport,
   JobSummary,
@@ -807,3 +808,119 @@ export function ReviewPanel() {
     </Card>
   );
 }
+
+/* ------------------------------------------------------------------ budget */
+
+export function BudgetPanel() {
+  const [data, setData] = useState<BudgetResponse | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const load = useCallback(() => {
+    fetch("/api/providers/budget")
+      .then((r) => (r.ok ? r.json() : Promise.reject(new Error(String(r.status)))))
+      .then(setData)
+      .catch((e) => setError(String(e)));
+  }, []);
+
+  useEffect(() => {
+    load();
+    // Windows as short as a minute go stale while you look at them, and a
+    // budget page showing a stale number is worse than one showing none: it
+    // is the number an operator decides to start a run on.
+    const timer = setInterval(load, 15_000);
+    return () => clearInterval(timer);
+  }, [load]);
+
+  if (error) {
+    return (
+      <Card title="Provider budgets">
+        <p className="empty">Could not read budgets. {error}</p>
+      </Card>
+    );
+  }
+  if (!data) {
+    return (
+      <Card title="Provider budgets">
+        <p className="empty">Loading…</p>
+      </Card>
+    );
+  }
+
+  const { plan } = data;
+
+  return (
+    <Card title="Provider budgets" meta={`${data.providers.length} providers`}>
+      <dl className="kv">
+        <dt>plannable / day</dt>
+        <dd>{plan.sustainable_daily_requests.toLocaleString()} requests</dd>
+        <dt>for a week</dt>
+        <dd>{plan.week_requests.toLocaleString()}</dd>
+        <dt>for a month</dt>
+        <dd>{plan.month_requests.toLocaleString()}</dd>
+        <dt>one-off grants</dt>
+        <dd>{plan.grant_backed_daily_requests.toLocaleString()} / day</dd>
+      </dl>
+      <p className="hint">
+        Only published <strong>daily</strong> allowances are counted as
+        plannable. Grants stop when spent; a per-minute rate multiplied out to
+        a day assumes 24 hours of perfect saturation and is not a plan.
+      </p>
+
+      {data.providers.map((provider) => (
+        <div key={provider.provider} style={{ marginTop: 14 }}>
+          <div className="budget-provider">
+            {provider.provider}
+            <span className="pill neutral" style={{ marginLeft: 8 }}>
+              {provider.kind}
+            </span>
+            {provider.blocked ? (
+              <span className="pill failed" style={{ marginLeft: 6 }}>
+                {provider.blocked}
+              </span>
+            ) : null}
+          </div>
+
+          {provider.grant ? (
+            <div style={{ marginBottom: 6 }}>
+              <div className={`meter ${provider.grant.fraction_used > 0.8 ? "bad" : ""}`}>
+                <span style={{ width: `${provider.grant.fraction_used * 100}%` }} />
+              </div>
+              <span className="hint">
+                grant {provider.grant.remaining.toLocaleString()} of{" "}
+                {provider.grant.total.toLocaleString()} left
+                {provider.grant.expires_days
+                  ? `, expires in ${provider.grant.expires_days}d`
+                  : null}
+              </span>
+            </div>
+          ) : null}
+
+          {provider.windows.map((w) => (
+            <div key={w.window} style={{ marginBottom: 4 }}>
+              <div
+                className={`meter ${
+                  w.fraction_used > 0.9 ? "bad" : w.fraction_used > 0.7 ? "warn" : ""
+                }`}
+              >
+                <span style={{ width: `${Math.min(1, w.fraction_used) * 100}%` }} />
+              </div>
+              <span className="hint">
+                {w.window} · {w.used_requests.toLocaleString()}
+                {w.limit_requests ? ` / ${w.limit_requests.toLocaleString()}` : ""} ·
+                resets in {formatDuration(w.resets_in_s)}
+              </span>
+            </div>
+          ))}
+        </div>
+      ))}
+    </Card>
+  );
+}
+
+function formatDuration(seconds: number): string {
+  if (seconds >= 86400) return `${(seconds / 86400).toFixed(1)}d`;
+  if (seconds >= 3600) return `${(seconds / 3600).toFixed(1)}h`;
+  if (seconds >= 60) return `${Math.round(seconds / 60)}m`;
+  return `${Math.round(seconds)}s`;
+}
+

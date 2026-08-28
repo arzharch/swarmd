@@ -264,6 +264,25 @@ def register(
         status = pool.status() if hasattr(pool, "status") else []
         return JSONResponse({"available": True, "providers": status})
 
+    @app.get("/api/providers/budget")
+    async def provider_budget() -> JSONResponse:
+        """What is left in each window, and whether a week or a month fits.
+
+        Read from the usage journal rather than from the pool, so it answers
+        for the MACHINE rather than for this process: quota a run consumed this
+        morning is gone whether or not that run is still alive, and a control
+        plane that forgot it on restart would cheerfully overspend.
+        """
+        from swarmd.router.budget import BudgetTracker
+
+        tracker = BudgetTracker()
+        return JSONResponse(
+            {
+                "providers": tracker.report_all(),
+                "plan": tracker.capacity_plan(),
+            }
+        )
+
     @app.post("/api/providers/probe")
     async def probe_providers() -> JSONResponse:
         """Ask each provider what it will actually serve.

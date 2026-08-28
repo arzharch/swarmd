@@ -281,6 +281,19 @@ a { color: var(--blue); text-decoration: none; }
   color: var(--text-faint);
 }
 
+/* Provider names are IDENTIFIERS -- `groq`, `nvidia-nim`, `google-aistudio`
+   are what you type in config and what the API returns. Uppercasing them
+   makes the label stop matching the thing it names, and at 11px the uppercase
+   Q in GROQ is nearly indistinguishable from an O. Mono, lowercase, as
+   written. */
+.budget-provider {
+  padding: 0 0 4px;
+  font-family: var(--mono);
+  font-size: var(--font-size-12);
+  font-weight: 600;
+  color: var(--text-muted);
+}
+
 .rail-item {
   display: flex;
   align-items: center;

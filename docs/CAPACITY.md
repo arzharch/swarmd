@@ -230,7 +230,80 @@ is worse than no result.
 
 ---
 
-## 7. Assumptions, stated so they can be falsified
+## 7. What the keys actually buy (measured 2026-08-28)
+
+Every row below was produced by calling the provider, not by reading its
+documentation. That distinction earned its place: the provider table this
+project shipped with was assembled from docs, and **every entry in it was
+wrong**.
+
+| Provider | Working model | Latency | Throughput | Daily allowance | Kind |
+|---|---|---|---|---|---|
+| groq | `openai/gpt-oss-20b` | 0.81s | 384 tok/s | 1,000 req | quota |
+| google-aistudio | `gemini-3.5-flash-lite` | 1.25s | 29 tok/s | 1,000 req | quota |
+| nvidia-nim | `nvidia/nemotron-3-super-120b-a12b` | 2.33s | 100 tok/s | ~33 req | **grant** |
+| openrouter | `minimax/minimax-m3:free` | 2.30s | 20 tok/s | 50 req | quota |
+| mistral-free | `open-mistral-nemo` | 0.62s | 54 tok/s | no daily cap | rate |
+| cerebras | — | — | — | **none** | 402 |
+
+**Groq is the workhorse.** Roughly 4x the throughput of anything else here and
+the joint-largest daily allowance, so it is ordered first.
+
+**Cerebras is gone.** Its key returns `402 Payment required` on every model.
+The free tier now needs a card on file, so it is not in the registry, not in
+the budget table, and no longer priced as free in the ledger — a provider that
+bills while priced at $0 would under-report real spend.
+
+**NVIDIA is a grant, not a tier**, and this is the distinction the whole month
+plan turns on. Roughly 1,000 credits, consumed at a variable rate per model,
+**expiring 30 days after issue**. It never refills. Spread over its life that is
+~33 requests/day; used as a workhorse it is gone inside a week and the month
+has no burst capacity left. It therefore sorts *behind* the replenishing free
+tiers despite also costing nothing.
+
+Its catalogue also lies: `/v1/models` lists 83 entries and this account can
+call four. The rest return `404 Not found for account`.
+
+### What this sustains
+
+```
+plannable     2,050 requests/day   from published DAILY allowances
+  week       14,350 requests
+  month      61,500 requests
+one-off          33 requests/day   from finite grants -- these stop when spent
+unverified   86,400 requests/day   upper bound from a per-minute rate with no
+                                   published daily cap. Assumes 24 hours of
+                                   perfect saturation. Not a plan.
+```
+
+Only the first figure is planned against. Folding the other two in would give a
+headline of ~88,000/day that is 98% extrapolation, which is exactly the kind of
+number this document exists not to print.
+
+At the `smoke` profile's ~16 calls per run, 2,050/day is roughly **128 runs a
+day, 900 a week**. A `standard` run at ~600 calls is 3 a day.
+
+### Windows, and why five hours is one of them
+
+`swarmd providers budget` (and `GET /api/providers/budget`, and the Harness
+view) report six windows: minute, hour, **5-hour session**, day, week, month.
+
+The session window exists because it is the unit work is actually planned in.
+"Can I run this afternoon" is not answerable from a per-minute rate, and it is
+the question an operator asks before starting something that takes an hour.
+
+Usage is summed from an append-only journal at `.swarmd/usage.jsonl`, not held
+in a counter — the same reasoning as ADR-007. It is keyed per credential,
+because that is the unit providers meter, and it survives restarts, because a
+monthly budget held in a process is a process wearing a month's name.
+
+Google's daily quota resets at **midnight Pacific** rather than on a rolling 24
+hours, including the daylight-saving shift. Treating it as rolling under-uses
+it all morning and over-commits against it at night.
+
+---
+
+## 8. Assumptions, stated so they can be falsified
 
 1. **60% cache hit rate.** Now the weakest number in this document, and worth
    stating precisely. Exact keying means the hit rate on a run of *genuinely

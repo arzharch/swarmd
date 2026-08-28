@@ -269,3 +269,48 @@ export interface SkillsResponse {
   pending: Array<Record<string, unknown>>;
   approved: Array<Record<string, unknown>>;
 }
+
+export interface BudgetWindow {
+  window: string;
+  used_requests: number;
+  limit_requests: number | null;
+  remaining_requests: number | null;
+  fraction_used: number;
+  resets_in_s: number;
+  exhausted: boolean;
+}
+
+export interface BudgetGrant {
+  total: number;
+  used: number;
+  remaining: number;
+  fraction_used: number;
+  expires_days: number | null;
+  exhausted: boolean;
+}
+
+export interface ProviderBudget {
+  provider: string;
+  /** "rate" replenishes, "quota" resets on a schedule, "grant" never comes
+   *  back. What running out MEANS differs by kind, so the badge shows it. */
+  kind: string;
+  source: string;
+  checked: string;
+  note: string;
+  windows: BudgetWindow[];
+  grant: BudgetGrant | null;
+  blocked: string;
+}
+
+export interface BudgetPlan {
+  sustainable_daily_requests: number;
+  grant_backed_daily_requests: number;
+  rate_extrapolated_upper_bound: number;
+  week_requests: number;
+  month_requests: number;
+}
+
+export interface BudgetResponse {
+  providers: ProviderBudget[];
+  plan: BudgetPlan;
+}
