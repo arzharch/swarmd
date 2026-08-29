@@ -321,6 +321,90 @@ class SwarmRun:
         if hasattr(self.provider, "account"):
             self.provider.account = self.account
 
+    # -- resume -------------------------------------------------------------
+
+    @classmethod
+    def resume(
+        cls, run_id: str, provider: Any, *, store: RunStore | None = None, **kw: Any
+    ) -> SwarmRun:
+        """Rebuild a run from disk. Raises if there is nothing to rebuild.
+
+        The point is what this does NOT do: it does not re-synthesize the
+        criterion, does not re-plan, and does not re-generate the batches. Those
+        are the provider calls a restart would otherwise buy a second time, and
+        the reason the store exists.
+
+        The stored criterion is reused verbatim rather than re-derived. A resume
+        that synthesized a fresh one would grade the second half of a run
+        against a target the first half never saw, and the run's integrity hash
+        would describe two different experiments averaged together.
+        """
+        store = store or RunStore()
+        state = store.load(run_id)
+        if state is None:
+            raise FileNotFoundError(
+                f"no stored run {run_id!r} under {store.root}. "
+                f"`swarmd runs list` shows what can be resumed."
+            )
+        run = cls(
+            provider,
+            profile=state.profile,
+            run_id=state.run_id,
+            agents=state.agents or None,
+            store=store,
+            state=state,
+            **kw,
+        )
+        # Balances first: the economy decides who may still spend, and a
+        # population handed fresh allowances on resume would get a second
+        # budget for work it has already been paid for.
+        for agent_id, balance in state.balances.items():
+            run.economy.restore(agent_id, balance)
+        for agent_id in state.contained:
+            run.redteam.contained_agents.add(agent_id)
+        return run
+
+    def restored_criterion(self) -> FrozenCriterion | None:
+        """The frozen criterion from disk, or None for a fresh run."""
+        if not self.state.criterion:
+            return None
+        from swarmd.swarm.criteria import Criterion
+        from swarmd.swarm.synthesis import AttackReport
+
+        criterion = Criterion.from_dict(self.state.criterion)
+        if criterion.content_hash() != self.state.criterion_hash:
+            # The document and the criterion it claims to be disagree. Refusing
+            # is the only safe move: grading against a criterion whose hash is
+            # not the one the run reported makes every number in the report
+            # describe something else.
+            raise ValueError(
+                f"stored criterion hash {self.state.criterion_hash} does not "
+                f"match its contents ({criterion.content_hash()}); refusing to "
+                f"resume against a criterion that has changed underneath the run"
+            )
+        return FrozenCriterion(
+            criterion=criterion,
+            hash=self.state.criterion_hash,
+            attempts=0,
+            agreement=1.0,
+            attack_report=AttackReport(True, ()),
+        )
+
+    def restored_plan(self) -> Plan | None:
+        if not self.state.plan:
+            return None
+        from swarmd.swarm.planner import PlanNode, validate
+
+        nodes = [
+            PlanNode(
+                name=str(n["name"]),
+                instruction=str(n.get("instruction", "")),
+                depends_on=tuple(n.get("depends_on") or ()),
+            )
+            for n in self.state.plan.get("nodes", [])
+        ]
+        return validate(nodes) if nodes else None
+
     # -- durability ---------------------------------------------------------
 
     def persist(self) -> None:
@@ -459,8 +543,31 @@ class SwarmRun:
         self.preflight()
 
         try:
-            result.criterion = await self._synthesize_criterion(task)
-            result.plan = await self._synthesize_plan(task)
+            # Restored artefacts short-circuit synthesis. Each of these cost
+            # proposer calls the first time; a resume that recomputed them
+            # would spend the ration it was waiting for.
+            self.state.task = self.state.task or task
+            restored_criterion = self.restored_criterion()
+            if restored_criterion is not None:
+                result.criterion = restored_criterion
+                self._emit(
+                    "criterion_restored",
+                    hash=restored_criterion.hash,
+                    checks=len(restored_criterion.criterion.checks),
+                )
+            else:
+                result.criterion = await self._synthesize_criterion(task)
+
+            restored_plan = self.restored_plan()
+            if restored_plan is not None:
+                result.plan = restored_plan
+                self._emit(
+                    "plan_restored",
+                    hash=restored_plan.content_hash(),
+                    nodes=len(restored_plan.nodes),
+                )
+            else:
+                result.plan = await self._synthesize_plan(task)
             result.results = await self._execute(task, result.plan, result.criterion)
             result.proposed_skills = await self._distill(task, result)
             result.status = "completed"
@@ -861,9 +968,32 @@ class SwarmRun:
             # fire. The learning loop was structurally dead.
             pool = self._pool_size(plan)
 
+            # Nodes already finished in an earlier process are not re-run.
+            # Their results were persisted the moment they passed, so redoing
+            # them would spend the ration twice for an answer already held.
+            done = self.state.finished_nodes
+            level = [name for name in level if name not in done]
+            if not level:
+                continue
+
             # One batched call per node, then the pool grades its variants.
             batches: dict[str, Batch] = {}
             for name in level:
+                stored = self.state.drafts.get(name)
+                if stored:
+                    # Bought before the restart. Reused rather than re-bought:
+                    # this is the single most expensive artefact a crash can
+                    # lose, one provider call per node.
+                    batches[name] = Batch(
+                        variants=tuple(stored),
+                        requested=pool,
+                        calls=0,
+                        cost_credits=0.0,
+                    )
+                    self._emit(
+                        "batch_restored", node=name, variants=len(stored)
+                    )
+                    continue
                 batches[name] = await self._batch_generate(
                     task, plan.node(name), context, pool
                 )

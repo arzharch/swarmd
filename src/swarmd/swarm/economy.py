@@ -122,6 +122,24 @@ class Economy:
 
     # -- population ---------------------------------------------------------
 
+    def restore(self, agent_id: str, balance: float) -> Account:
+        """Rebuild an account that existed before this process did.
+
+        NOT `spawn`. Spawning mints the next id and hands out a fresh starting
+        balance, which is exactly wrong on a resume: it would give a population
+        that has already spent its allowance a second one, and the ids would
+        collide with the agents whose checkpoints are being restored alongside.
+
+        The id counter is advanced past every restored id so that agents
+        spawned later in the resumed run cannot be handed a name that is
+        already in use.
+        """
+        account = Account(agent_id=agent_id, balance=balance)
+        self._accounts[agent_id] = account
+        if agent_id.startswith("a") and agent_id[1:].isdigit():
+            self._next_id = max(self._next_id, int(agent_id[1:]))
+        return account
+
     def spawn(
         self,
         *,
