@@ -878,6 +878,25 @@ class ProviderPool(Provider):
 
     # -- introspection ------------------------------------------------------
 
+    def credential_map(self) -> dict[str, list[str]]:
+        """provider -> the credentials actually loaded for it.
+
+        The forecast needs this because three Google keys are three separate
+        daily allowances, not one. Counting a pool of N keys as a single
+        credential understates capacity by a factor of N and makes a run that
+        fits comfortably project days of pauses.
+        """
+        out: dict[str, list[str]] = {}
+        for slot in self._slots:
+            out.setdefault(slot.spec.name, []).append(slot.credential_id)
+        return out
+
+    def forecast(self, estimated_calls: int) -> dict[str, Any]:
+        """When this many calls will actually be spent, session by session."""
+        return self.ration.forecast(
+            estimated_calls, credentials=self.credential_map()
+        )
+
     def pace_status(self) -> dict[str, Any]:
         """Whether the pool is paused, why, and when it comes back.
 

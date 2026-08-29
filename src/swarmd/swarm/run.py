@@ -672,13 +672,47 @@ class SwarmRun:
         """
         estimate = self.estimated_calls(nodes)
         verdict = self.budget.affordable(estimate) if self.budget else {}
-        payload = {
+        payload: dict[str, Any] = {
             "agents": self.agents,
             "profile": self.profile.name,
             **verdict,
         }
+
+        # The timeline, not just the yes/no. Once a run pauses instead of
+        # failing, "does not fit today" stopped being the useful answer:
+        # "finishes at 18:40 after one pause" and "spans three days" are both
+        # "does not fit", and only the operator can say which is acceptable.
+        forecast = getattr(self.provider, "forecast", None)
+        if callable(forecast):
+            try:
+                payload["forecast"] = forecast(estimate)
+            except Exception as exc:  # noqa: BLE001 - a projection must never
+                # cost the run. Being unable to predict the timeline is not a
+                # reason to refuse to start.
+                logger.warning("preflight forecast unavailable: %s", exc)
+
         self._emit("preflight", **payload)
-        if verdict and not verdict.get("fits", True):
+
+        plan = payload.get("forecast") or {}
+        if plan.get("verdict") in {"fits_today_with_pauses", "spans_days"}:
+            logger.warning(
+                "preflight: ~%d calls needs %d sessions with %d pause(s); "
+                "first pause in %.1fh, projected finish in %.1fh. The run will "
+                "wait rather than fail -- pass --no-wait to stop instead.",
+                estimate,
+                plan.get("sessions_needed", 1),
+                plan.get("expected_pauses", 0),
+                max(0.0, (plan.get("first_pause_at") or 0) - time.time()) / 3600,
+                max(0.0, (plan.get("projected_finish") or 0) - time.time()) / 3600,
+            )
+        elif plan.get("verdict") == "exceeds_horizon":
+            logger.warning(
+                "preflight: ~%d calls does not finish within the forecast "
+                "horizon at the current allowance. Reduce --agents or add a "
+                "credential; the run will otherwise pause repeatedly for days.",
+                estimate,
+            )
+        elif verdict and not verdict.get("fits", True):
             logger.warning(
                 "preflight: this run needs ~%d calls and %d remain today; it "
                 "will exhaust the budget and stop partway",
