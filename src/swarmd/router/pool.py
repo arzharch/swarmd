@@ -32,7 +32,13 @@ from typing import Any
 
 from swarmd.ledger import CostAccount
 from swarmd.observability import metrics
-from swarmd.router.budget import BudgetTracker
+from swarmd.router.budget import (
+    LONG_WINDOW_S,
+    BudgetTracker,
+    RateHeaders,
+    parse_duration,
+    parse_rate_headers,
+)
 from swarmd.router.pacer import Pacer, PauseCause
 from swarmd.router.providers import (
     LLMRequest,
@@ -220,12 +226,33 @@ def credentials_for(spec: ProviderSpec) -> list[tuple[str, str]]:
 
 
 class RateLimited(RuntimeError):
-    """A provider said 429. Carries what it told us about when to come back."""
+    """A provider said 429. Carries what it told us about when to come back.
 
-    def __init__(self, provider: str, retry_after_s: float | None) -> None:
+    ANATOMY: daily
+      True when the wait is longer than `LONG_WINDOW_S`, which for every
+      provider in this pool means a day rather than a minute. The two need
+      different responses and conflating them is expensive in both directions:
+      backing a provider off for four hours over a one-minute bucket throws
+      away most of a day's capacity, and retrying a spent day every two seconds
+      earns a rejection per retry, several of which the provider charges to the
+      day that is already spent.
+    """
+
+    def __init__(
+        self,
+        provider: str,
+        retry_after_s: float | None,
+        *,
+        headers: RateHeaders | None = None,
+    ) -> None:
         super().__init__(f"{provider} rate limited (retry_after={retry_after_s})")
         self.provider = provider
         self.retry_after_s = retry_after_s
+        self.headers = headers or RateHeaders()
+
+    @property
+    def daily(self) -> bool:
+        return (self.retry_after_s or 0.0) >= LONG_WINDOW_S
 
 
 class NoCapacity(RuntimeError):
@@ -283,8 +310,12 @@ class OpenAICompatProvider(Provider):
         except httpx.HTTPError as exc:
             raise ProviderError(f"{self.name}/{model}: transport: {exc}") from exc
 
+        # Parsed on EVERY response, not just the rejected ones. A success that
+        # says "zero tokens left, refills in two hours" is the same fact as a
+        # 429, obtained one request earlier and without the rejection.
+        headers = parse_rate_headers(resp.headers)
         if resp.status_code == 429:
-            raise RateLimited(self.name, _retry_after(resp))
+            raise RateLimited(self.name, _retry_after(resp), headers=headers)
         if resp.status_code >= 400:
             raise ProviderError(
                 f"{self.name}/{model}: HTTP {resp.status_code}: {resp.text[:200]}"
@@ -325,6 +356,7 @@ class OpenAICompatProvider(Provider):
             latency_s=time.monotonic() - start,
             tokens_in=usage.get("prompt_tokens", 0),
             tokens_out=usage.get("completion_tokens", 0),
+            rate_headers=headers,
         )
 
     async def aclose(self) -> None:
@@ -342,19 +374,45 @@ def _messages(request: LLMRequest) -> list[dict[str, str]]:
 def _retry_after(resp: Any) -> float | None:
     """Read the provider's own statement of when to come back.
 
-    Providers disagree on the header (`retry-after` in seconds, or an
-    `x-ratelimit-reset-*` variant). Anything unparseable returns None, and the
-    caller falls back to exponential backoff rather than guessing.
+    Providers disagree on both the header and its format: `retry-after` is a
+    bare integer, Groq answers `x-ratelimit-reset-tokens` with "2m59.56s", and
+    OpenRouter with "7.66". `parse_duration` handles all three -- the previous
+    `float(raw.rstrip("s"))` turned "2m59.56s" into "2m59.56" and threw, so the
+    one provider that states its reset most precisely was the one whose word we
+    discarded, falling back to a guessed backoff instead.
+
+    When no explicit retry is given, the reset for an EXHAUSTED dimension is
+    used before any other: a dimension with headroom left says nothing about
+    when the one that ran out comes back. Anything unparseable returns None and
+    the caller falls back to exponential backoff rather than guessing.
     """
     for header in ("retry-after", "x-ratelimit-reset-requests", "x-ratelimit-reset-tokens"):
         raw = resp.headers.get(header)
         if not raw:
             continue
         try:
-            return max(0.0, float(str(raw).rstrip("s")))
+            value = parse_duration(str(raw))
+            if value is not None:
+                return max(0.0, value)
         except ValueError:
-            continue
-    return None
+            pass
+    headers = parse_rate_headers(resp.headers)
+    empty = [
+        reset
+        for remaining, reset in (
+            (headers.remaining_requests, headers.reset_requests_s),
+            (headers.remaining_tokens, headers.reset_tokens_s),
+        )
+        if reset is not None and remaining == 0
+    ]
+    if empty:
+        return max(0.0, max(empty))
+    known = [
+        reset
+        for reset in (headers.reset_requests_s, headers.reset_tokens_s)
+        if reset is not None
+    ]
+    return max(0.0, max(known)) if known else None
 
 
 # --- empirical limit state -------------------------------------------------
@@ -748,14 +806,43 @@ class ProviderPool(Provider):
                         metrics.record_rate_limited(
                             provider=slot.spec.name, model=model
                         )
-                        # The provider just told us our estimate was too high.
-                        # Tighten the bucket so the correction outlives this
-                        # backoff window instead of being relearned every time.
-                        await self.quota.configure(
-                            slot.quota_key,
-                            rate_per_min=max(1.0, slot.spec.hint_rpm * 0.5),
-                            burst=1,
-                        )
+                        if exc.daily:
+                            # A wait measured in hours is the account saying the
+                            # DAY is spent, not the minute. Journalled so it
+                            # outlives this process and is believed over the
+                            # declared table until the instant the provider
+                            # itself named (ADR-008). Halving the per-minute
+                            # bucket instead, as the single branch below used
+                            # to, answers a spent day by retrying it slightly
+                            # more slowly -- and every retry earns another
+                            # rejection charged to the day already gone.
+                            until = time.time() + (
+                                exc.retry_after_s or LONG_WINDOW_S
+                            )
+                            self.budget.observe_day_limit(
+                                slot.spec.name,
+                                credential=slot.credential_id,
+                                model=model,
+                                until=until,
+                                source=f"429 retry_after={exc.retry_after_s}",
+                            )
+                            self.pacer.limit_corrected(
+                                provider=slot.spec.name,
+                                credential=slot.credential_id,
+                                declared=self._declared_day(slot.spec.name),
+                                until=until,
+                                source="429",
+                            )
+                        else:
+                            # A minute-window rejection: our rate estimate was
+                            # too high. Tighten the bucket so the correction
+                            # outlives this backoff window instead of being
+                            # relearned every time.
+                            await self.quota.configure(
+                                slot.quota_key,
+                                rate_per_min=max(1.0, slot.spec.hint_rpm * 0.5),
+                                burst=1,
+                            )
                         errors.append(f"{slot.spec.name}: 429")
                         break  # whole provider is throttled, not just this model
                     except ProviderError as exc:
@@ -787,6 +874,17 @@ class ProviderPool(Provider):
                         requests=1,
                         tokens=resp.tokens_in + resp.tokens_out,
                     )
+                    if isinstance(resp.rate_headers, RateHeaders):
+                        # The cheapest limit is the one the provider
+                        # volunteered on a response already paid for. Believing
+                        # it here is what lets the pool stop BEFORE the 429
+                        # rather than one rejection after it.
+                        self.budget.observe_headers(
+                            resp.rate_headers,
+                            provider=slot.spec.name,
+                            credential=slot.credential_id,
+                            model=resp.model,
+                        )
                     cost = 0.0
                     if self.account is not None:
                         cost = self.account.charge_call(
@@ -877,6 +975,18 @@ class ProviderPool(Provider):
             await asyncio.sleep(sleep_for)
 
     # -- introspection ------------------------------------------------------
+
+    def _declared_day(self, provider: str) -> Any:
+        """What the table claims, so a correction can name what it corrected.
+
+        A "limit corrected" event that does not say what the old figure was
+        leaves nobody able to go and fix the table it came from.
+        """
+        spec = self.budget.budgets.get(provider)
+        daily = spec.limit_for("day") if spec else None
+        if daily is None:
+            return None
+        return {"requests": daily.requests, "tokens": daily.tokens}
 
     def credential_map(self) -> dict[str, list[str]]:
         """provider -> the credentials actually loaded for it.

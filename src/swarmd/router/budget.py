@@ -235,6 +235,140 @@ def day_reset_at(spec: BudgetSpec, now_ts: float) -> float:
     return now_ts + DAY
 
 
+# --- what the provider tells us on the way past ----------------------------
+#
+# A reset further out than this is a LONG window -- a day, or the remainder of
+# one -- rather than the per-minute bucket. An hour because no provider here
+# publishes a window between a minute and a day, so anything past an hour is
+# unambiguously the long one, and mistaking a minute for a day would park a run
+# for hours over a bucket that refills in seconds.
+LONG_WINDOW_S = HOUR
+
+_DURATION_UNITS = {"h": 3600.0, "m": 60.0, "s": 1.0, "ms": 0.001}
+
+
+def parse_duration(raw: str) -> float | None:
+    """Seconds from a rate-limit header, in every shape providers send one.
+
+    Groq answers `x-ratelimit-reset-tokens` with "2m59.56s", OpenRouter with a
+    bare "7.66", and `retry-after` is documented as an integer. One parser
+    rather than three because the alternative is three call sites each handling
+    two of the three shapes and silently returning None for the third -- and a
+    None here is a limit we do not learn.
+    """
+    text = str(raw).strip().lower()
+    if not text:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        pass
+    total = 0.0
+    number = ""
+    unit = ""
+    matched = False
+    for char in text + "\0":
+        if char.isdigit() or char == ".":
+            if unit:
+                total += _flush(number, unit)
+                matched = True
+                number, unit = "", ""
+            number += char
+        elif char.isalpha():
+            unit += char
+        else:
+            break
+    if number and unit:
+        total += _flush(number, unit)
+        matched = True
+    return total if matched else None
+
+
+def _flush(number: str, unit: str) -> float:
+    scale = _DURATION_UNITS.get(unit)
+    if scale is None:
+        raise ValueError(f"unknown duration unit {unit!r}")
+    return float(number) * scale
+
+
+@dataclass(frozen=True, slots=True)
+class RateHeaders:
+    """What one response said about the allowance behind it.
+
+    Every field is optional because every field is optional in practice:
+    providers implement different subsets of the same de-facto header set, and
+    a parser that required all six would learn nothing from any of them.
+    """
+
+    limit_requests: int | None = None
+    remaining_requests: int | None = None
+    reset_requests_s: float | None = None
+    limit_tokens: int | None = None
+    remaining_tokens: int | None = None
+    reset_tokens_s: float | None = None
+
+    def __bool__(self) -> bool:
+        return any(
+            value is not None
+            for value in (
+                self.limit_requests, self.remaining_requests, self.reset_requests_s,
+                self.limit_tokens, self.remaining_tokens, self.reset_tokens_s,
+            )
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "limit_requests": self.limit_requests,
+            "remaining_requests": self.remaining_requests,
+            "reset_requests_s": self.reset_requests_s,
+            "limit_tokens": self.limit_tokens,
+            "remaining_tokens": self.remaining_tokens,
+            "reset_tokens_s": self.reset_tokens_s,
+        }
+
+
+def parse_rate_headers(headers: Any) -> RateHeaders:
+    """Read the `x-ratelimit-*` family off any response, 429 or not.
+
+    Deliberately total: an unparseable or absent header becomes None rather
+    than an exception. These are hints on a hot path, and a provider that ships
+    a malformed header must not be able to fail every call that carries it.
+    """
+
+    def get(name: str) -> str:
+        try:
+            return str(headers.get(name) or "")
+        except Exception:  # noqa: BLE001 - a header mapping we do not know
+            return ""
+
+    def integer(name: str) -> int | None:
+        raw = get(name)
+        if not raw:
+            return None
+        try:
+            return int(float(raw))
+        except ValueError:
+            return None
+
+    def seconds(name: str) -> float | None:
+        raw = get(name)
+        if not raw:
+            return None
+        try:
+            return parse_duration(raw)
+        except ValueError:
+            return None
+
+    return RateHeaders(
+        limit_requests=integer("x-ratelimit-limit-requests"),
+        remaining_requests=integer("x-ratelimit-remaining-requests"),
+        reset_requests_s=seconds("x-ratelimit-reset-requests"),
+        limit_tokens=integer("x-ratelimit-limit-tokens"),
+        remaining_tokens=integer("x-ratelimit-remaining-tokens"),
+        reset_tokens_s=seconds("x-ratelimit-reset-tokens"),
+    )
+
+
 # Declared budgets, researched 2026-08-28 and marked with where each came from.
 #
 # Cerebras is deliberately absent: its key returns 402 "Payment required to
@@ -785,13 +919,70 @@ class BudgetTracker:
             default=0.0,
         )
 
+    def observe_headers(
+        self,
+        headers: RateHeaders,
+        *,
+        provider: str,
+        credential: str,
+        model: str = "",
+        now: float | None = None,
+    ) -> float:
+        """Believe a SUCCESSFUL response that says the allowance is gone.
+
+        The cheapest limit to respect is the one the provider volunteers on the
+        way past. Every call we make comes back carrying how much is left and
+        when it refills, and until now the pool threw all of it away and waited
+        for a 429 to learn the same fact -- one rejected request later, with a
+        backoff attached.
+
+        Only the EMPTY case is acted on, and only when the refill is far enough
+        away to be a long window (`LONG_WINDOW_S`). A near reset is the minute
+        bucket, which `quota.py` already paces and which needs no journal row;
+        a distant one is a day, and a day that the provider says is spent is
+        exactly the fact `blocked` and the ration must not talk past.
+
+        Returns the exhaustion instant it recorded, or 0.0 for the ordinary case
+        where there is still headroom.
+        """
+        now = now if now is not None else time.time()
+        worst = 0.0
+        for remaining, reset_s in (
+            (headers.remaining_requests, headers.reset_requests_s),
+            (headers.remaining_tokens, headers.reset_tokens_s),
+        ):
+            if remaining is None or remaining > 0:
+                continue
+            if reset_s is None or reset_s < LONG_WINDOW_S:
+                continue
+            worst = max(worst, now + reset_s)
+        if worst:
+            self.observe_day_limit(
+                provider,
+                credential=credential,
+                until=worst,
+                model=model,
+                source="response headers",
+            )
+        return worst
+
     def blocked(self, provider: str, *, now: float | None = None) -> str:
         """Why this provider cannot take a call right now, or "".
 
         Returns the FIRST binding window rather than a list: an operator acting
         on this needs the one that is stopping them, and a run of five reasons
         buries it.
+
+        THE PROVIDER'S OWN WORD COMES FIRST. A declared window is a hypothesis;
+        an `exhausted` row is the account itself, and it outranks every figure
+        in the table (ADR-008). Without this check `observe_day_limit` wrote a
+        row nothing read: the ration honoured it, this did not, so the pool's
+        budget gate kept offering a provider that had already said no.
         """
+        now = now if now is not None else time.time()
+        until = self.day_exhausted_until(provider, now=now)
+        if until:
+            return f"provider reports day spent for {int(until - now)}s"
         grant = self.grant_state(provider, now=now)
         if grant and grant["exhausted"]:
             return "grant exhausted"

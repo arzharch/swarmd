@@ -49,7 +49,19 @@ class LLMRequest:
 
 @dataclass(frozen=True, slots=True)
 class LLMResponse:
-    """A single completion result with provenance attached."""
+    """A single completion result with provenance attached.
+
+    ANATOMY: rate_headers
+      The `x-ratelimit-*` family the provider attached to THIS response, parsed
+      (`budget.parse_rate_headers`). Carried on the success path, not just the
+      429 path, because that is the whole value of it: a response that says
+      "zero tokens left for two hours" lets the pool stop before the rejection
+      instead of learning the same fact from one.
+
+      Typed loosely to keep `providers.py` free of a `budget` import -- the
+      dependency runs the other way, and a backend with no notion of budgets
+      still has to be constructible.
+    """
 
     text: str
     provider: str
@@ -57,6 +69,7 @@ class LLMResponse:
     latency_s: float
     tokens_in: int = 0
     tokens_out: int = 0
+    rate_headers: Any = None
 
 
 class ProviderError(RuntimeError):
