@@ -762,11 +762,17 @@ class SwarmRun:
           the operator gets instead of a veto is a warning event naming the
           reason, so an expensive run is a decision rather than a surprise.
 
-        ANATOMY: HARD_POOL (64)
+        ANATOMY: MAX_IN_FLIGHT (64)
           Not about cost -- the ceiling handles cost. This bounds concurrent
-          in-flight work per node so one level cannot open hundreds of
-          simultaneous provider connections and turn a rate-limit into a
-          thundering herd.
+          in-flight work so one level cannot open hundreds of simultaneous
+          provider connections and turn a rate limit into a thundering herd.
+          It replaced a HARD_POOL that clamped the POPULATION to 64, which
+          answered "too much work at once" by quietly running fewer agents.
+
+        ANATOMY: MIN_POOL (5)
+          The other end of the same question. Five agents a node is the floor
+          a run keeps in flight by default; an explicit smaller count is
+          honoured down to two, below which distillation cannot work at all.
         """
         nodes = max(1, len(plan.nodes))
         budget = max(MIN_POOL, self.agents // nodes)

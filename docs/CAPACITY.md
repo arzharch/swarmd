@@ -111,7 +111,9 @@ nothing for it. Batching and chaos recovery are the same operation seen from two
 sides — work someone else already did — so there is no batching window, no
 coalescing broker, and no timeout to tune.
 
-**K = pool size, bounded.** `ADVISORY_POOL` is 32 and `HARD_POOL` is 64.
+**K = pool size, bounded.** `ADVISORY_POOL` is 32 (the widest pool a *profile*
+may imply), `MIN_POOL` is 5 (the floor a node keeps in flight) and
+`MAX_IN_FLIGHT` is 64 (how many agents run at once, whatever the population).
 Generation is now O(1) per node, but **repairs are still one call each**, so the
 worst case remains linear in pool size at `max_repairs` per agent. That is what
 the bound is for; it is not a cost bound, since the ceiling handles cost.
@@ -193,21 +195,33 @@ whole of the tiering policy.
 
 ## 4. Run profiles
 
-| Profile | Calls | Wall clock @45 RPM | Agents | Purpose |
-|---|---|---|---|---|
-| `smoke` | ~60 | ~2 min | 20 | CI on every PR; proves the loop runs end to end |
-| `standard` | ~600 | **12–18 min** | 500 | The live watchable run — full loop, chaos, red-team |
-| `deep` | ~1,800 | ~40 min | 500 | Enough curve points for a learning claim to mean anything |
-| `eval` | ~12,000 | ~4.5 hr | 500 | 100 tasks x 2 arms x 5 repeats; a batch job, not interactive |
+The figures below are `PROFILES` in `swarm/run.py`; they were resized once the
+budget was measured rather than assumed, and the earlier 500-agent versions of
+`standard` and `deep` are gone. `standard` at ~600 calls was half of total
+daily capacity for a single run.
 
-**The standard run and the eval are different products.** One is something
-you watch. The eval is something you run overnight and read in the morning. Trying
-to make one thing serve both is what produces a demo nobody waits through and an
-eval too small to be evidence.
+| Profile | Calls | Agents | Purpose |
+|---|---|---|---|
+| `smoke` | ~30 | 15 | CI on every PR; proves the loop runs end to end |
+| `standard` | ~90 | 24 | The live watchable run — full loop, chaos, red-team |
+| `deep` | ~280 | 64 | For a task worth spending on; ~an eighth of a day |
+| `eval` | ~30 per task | 15 | One task inside a sweep, which multiplies it |
 
-At 15,900 requests/day, one full `eval` sweep consumes ~75% of the daily budget:
-**one sweep per day, maximum.** Adding Cerebras and OpenRouter roughly doubles
-that headroom.
+**Population and concurrency are separate numbers.** The agent count is the
+population; `MAX_IN_FLIGHT` (64) bounds how many run at once, and `MIN_POOL`
+(5) is the floor a node keeps in flight by default. An explicit `--agents` is
+honoured in full — asking for 1000 gives 1000 — because a cap that cannot be
+overridden is a lie about who is in control. What stops an oversized run is the
+cost ceiling and the ration, both of which say so before it starts.
+
+**The standard run and the eval are different products.** One is something you
+watch. The eval is something you run overnight and read in the morning. Trying
+to make one thing serve both produces a demo nobody waits through and an eval
+too small to be evidence.
+
+At 2,200 plannable requests/day, a 20-task × 2-arm × 3-repeat sweep at ~30
+calls each is ~3,600 calls — more than a day. Sweeps are therefore paced across
+sittings (section 8) rather than sized to fit one.
 
 ---
 
@@ -330,7 +344,7 @@ Only the first figure is planned against. Folding the other two in would give a
 headline of ~88,000/day that is 98% extrapolation, which is exactly the kind of
 number this document exists not to print.
 
-At the `smoke` profile's ~25 calls per run, 2,200/day is roughly **88 runs a
+At the `smoke` profile's ~30 calls per run, 2,200/day is roughly **73 runs a
 day**. A `standard` run at ~90 calls is about 24 a day.
 
 ### Windows, and why five hours is one of them
