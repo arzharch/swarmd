@@ -35,3 +35,6 @@ frontend/next-env.d.ts
 # are summed from. Machine-local by nature -- committing it would mean one
 # developer's spent quota became everyone's.
 .swarmd/
+
+# TypeScript incremental build cache; a build artifact, not source.
+frontend/tsconfig.tsbuildinfo
