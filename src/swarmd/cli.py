@@ -657,6 +657,23 @@ async def _providers_command(args: argparse.Namespace) -> int:
 
     live = sum(1 for r in rows if r["ok"])
     print(f"\n{live}/{len(rows)} providers live")
+
+    # Which of the live providers can serve a repeated prompt prefix from
+    # their own cache. Printed here rather than left implicit because a run
+    # reporting `prefix_cache=0` has two very different explanations, and this
+    # is the line that tells them apart: a provider labelled "explicit" or
+    # "none" was never going to report a cached token, so a zero from it is
+    # expected; a zero from an "auto" provider means the shared prefix is not
+    # being hit and the prompt layout is worth looking at.
+    auto = sorted(r["provider"] for r in rows if r["ok"] and r["prefix_cache"] == "auto")
+    other = sorted(
+        f"{r['provider']}({r['prefix_cache']})"
+        for r in rows
+        if r["ok"] and r["prefix_cache"] != "auto"
+    )
+    print(f"automatic prefix cache: {', '.join(auto) if auto else 'none live'}")
+    if other:
+        print(f"no automatic prefix cache: {', '.join(other)}")
     return 0 if live else 1
 
 
@@ -665,6 +682,7 @@ async def _swarm_command(args: argparse.Namespace) -> int:
     from swarmd.chaos import ChaosHook
     from swarmd.harnesses.sandbox import SandboxHarness
     from swarmd.router.pool import ProviderPool
+    from swarmd.swarm.memo import MemoStore
     from swarmd.swarm.run import SwarmRun
     from swarmd.swarm.skills import SkillLibrary
 
@@ -694,6 +712,13 @@ async def _swarm_command(args: argparse.Namespace) -> int:
             ledger_path=args.ledger,
             on_event=_print_event,
             no_wait=args.no_wait,
+            # The run memo: if this exact task (whitespace- and case-normalised)
+            # was run to completion before, its criterion and plan come off disk
+            # and both synthesis stages are skipped -- 6 proposer calls on the
+            # default profiles, and the whole of the serial head that gates
+            # every worker from starting. Never for `eval`, which measures the
+            # variance a memo removes; `SwarmRun` refuses that combination.
+            memo=None if args.profile == "eval" else MemoStore(),
         )
     except (UnknownRogue, ValueError) as exc:
         print(f"error: {exc}")
@@ -747,6 +772,19 @@ def _print_run(
     marker = "  [SIMULATED]" if cost.get("simulated") else ""
     print(f"cost=${cost['total_usd']:.6f} of ${cost['ceiling_usd']} ceiling  "
           f"calls={cost['llm_calls']}  cache_hits={cost['cache_hits']}{marker}")
+    # The provider's own prefix-cache figure, printed with its provenance
+    # rather than as a bare number: on a provider that omits the field a 0
+    # means "nobody measured", and an operator reading it as "nothing was
+    # cached" would draw the opposite conclusion about the prompt layout.
+    prefix = cost.get("prefix_cache") or {}
+    if prefix.get("reported"):
+        print(f"prefix_cache={prefix['cached_tokens']}/{prefix['prompt_tokens']} "
+              f"prompt tokens served from the provider's cache "
+              f"({prefix['ratio']:.1%}, per "
+              f"{', '.join(prefix['reported_by'])})")
+    else:
+        print("prefix_cache=0  (not reported by any provider on this run; "
+              "0 means unmeasured, not uncached)")
     econ = report["economy"]
     print(f"agents={econ['population']} alive={econ['alive']} "
           f"bankrupt={econ['bankruptcies']} contained={econ['contained']}")

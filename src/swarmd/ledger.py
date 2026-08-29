@@ -38,14 +38,41 @@ from typing import Any, Protocol
 
 @dataclass(frozen=True, slots=True)
 class ModelPrice:
-    """USD per million tokens."""
+    """USD per million tokens.
+
+    ANATOMY: cached_input_per_m
+      What a prompt token the provider served from its own cache costs, when
+      the price row states one. `None` -- the default -- means the whole
+      prompt bills at `input_per_m`, cached portion included.
+
+      NOT "unknown, so probably cheaper". A discount nobody published is a
+      discount this ledger will not apply: under-billing is precisely how a
+      `ceiling_usd` stops triggering, and a run that quietly outspends its
+      ceiling is the one failure the cost controls exist to prevent. Cached
+      tokens stay an observability field until a model's row here says
+      otherwise.
+    """
 
     input_per_m: float
     output_per_m: float
+    cached_input_per_m: float | None = None
 
-    def cost(self, tokens_in: int, tokens_out: int) -> float:
+    def cost(self, tokens_in: int, tokens_out: int, cached_tokens: int = 0) -> float:
+        cached_rate = self.cached_input_per_m
+        if cached_rate is None:
+            # No published cached rate: every prompt token bills at the full
+            # input rate, whatever the provider says it cached.
+            cached = 0
+            cached_rate = 0.0
+        else:
+            # Clamped to the prompt itself. A provider reporting more cached
+            # tokens than it charged prompt tokens for would otherwise produce
+            # a negative full-rate remainder and a cost below zero.
+            cached = min(max(0, cached_tokens), max(0, tokens_in))
         return (
-            tokens_in * self.input_per_m + tokens_out * self.output_per_m
+            (tokens_in - cached) * self.input_per_m
+            + cached * cached_rate
+            + tokens_out * self.output_per_m
         ) / 1_000_000
 
 
@@ -121,6 +148,11 @@ class LedgerRow:
     model: str = ""
     tokens_in: int = 0
     tokens_out: int = 0
+    # The share of `tokens_in` the PROVIDER said it served from its own prompt
+    # cache. Reported, never derived: 0 on a row whose provider does not
+    # publish the field means "not stated", which is why the row also carries
+    # `detail["cached_tokens_reported"]` when it was.
+    cached_tokens: int = 0
     cost_usd: float = 0.0
     would_have_cost: float = 0.0  # cache hits: what this call would have cost
     # Taint flag. True when the response came from the simulated provider
@@ -344,14 +376,28 @@ class CostAccount:
         model: str,
         tokens_in: int,
         tokens_out: int,
+        cached_tokens: int = 0,
+        cached_tokens_reported: bool = False,
         agent_id: str = "",
         stage: str = "",
         simulated: bool = False,
         detail: dict[str, Any] | None = None,
     ) -> float:
-        """Record a model call and enforce the ceiling."""
+        """Record a model call and enforce the ceiling.
+
+        `cached_tokens` changes the CHARGE only for a model whose price row
+        publishes a cached input rate; for every other model it is recorded
+        and billed at the full input rate. See `ModelPrice.cached_input_per_m`
+        for why the default is "no discount" rather than "probably cheaper".
+        """
         price = price_for(provider, model)
-        cost = price.cost(tokens_in, tokens_out)
+        cost = price.cost(tokens_in, tokens_out, cached_tokens)
+        row_detail = dict(detail or {})
+        if cached_tokens_reported:
+            # Recorded only when true, so a report can tell "this provider
+            # says nothing cached" from "this provider says nothing at all"
+            # without inventing a tri-state on every row.
+            row_detail["cached_tokens_reported"] = True
         self.ledger.append(
             self._row(
                 "llm_call",
@@ -361,9 +407,10 @@ class CostAccount:
                 model=model,
                 tokens_in=tokens_in,
                 tokens_out=tokens_out,
+                cached_tokens=cached_tokens,
                 cost_usd=cost,
                 simulated=simulated,
-                detail=detail or {},
+                detail=row_detail,
             )
         )
         total = self.total_cost()
@@ -424,6 +471,56 @@ class CostAccount:
             )
         )
 
+    def charge_memo_hit(
+        self,
+        *,
+        stage: str,
+        calls_avoided: int,
+        provenance_run_id: str,
+        would_have_cost: float = 0.0,
+        detail: dict[str, Any] | None = None,
+    ) -> None:
+        """Record proposer calls a run memo made unnecessary, at zero cost.
+
+        Modelled on `charge_cache_hit` and for the same reason: what the memo
+        saved has to be a QUERY over rows, not a counter somebody increments.
+        A counter can drift from the facts and nothing notices.
+
+        WHY THE SAVING IS COUNTED IN CALLS, NOT DOLLARS. The avoided call never
+        happened, so it never named a provider or a model, and pricing it would
+        mean inventing a route it was never given. On a pooled free tier the
+        scarce resource is REQUESTS anyway (docs/CAPACITY.md: the binding limit
+        was 100,000 tokens/day, not the request count everyone had been
+        planning against), so `calls_avoided` is the honest number and
+        `would_have_cost` stays 0.0 unless a caller can price it truthfully.
+        Reporting an invented dollar saving would be exactly the dishonesty
+        this ledger exists to prevent.
+        """
+        self.ledger.append(
+            self._row(
+                "memo_hit",
+                stage=stage,
+                cost_usd=0.0,
+                would_have_cost=would_have_cost,
+                detail={
+                    **(detail or {}),
+                    "calls_avoided": int(calls_avoided),
+                    "provenance_run_id": provenance_run_id,
+                },
+            )
+        )
+
+    def memo_savings(self) -> dict[str, Any]:
+        """What the run memo avoided, summed from rows rather than counted."""
+        rows = [r for r in self.ledger.rows() if r.kind == "memo_hit"]
+        return {
+            "hits": len(rows),
+            "calls_avoided": sum(
+                int(r.detail.get("calls_avoided", 0)) for r in rows
+            ),
+            "usd": round(sum(r.would_have_cost for r in rows), 8),
+        }
+
     def record(self, kind: str, **kw: Any) -> None:
         """Record a non-billable fact: gate outcome, containment, success."""
         self.ledger.append(self._row(kind, **kw))
@@ -437,6 +534,9 @@ class CostAccount:
         by_stage: dict[str, float] = defaultdict(float)
         by_model: dict[str, float] = defaultdict(float)
         calls = cache_hits = tokens_in = tokens_out = 0
+        cached_tokens = 0
+        cached_reported = False
+        cached_providers: set[str] = set()
 
         for r in rows:
             if r.kind == "llm_call":
@@ -446,6 +546,10 @@ class CostAccount:
                 by_model[r.model] += r.cost_usd
                 tokens_in += r.tokens_in
                 tokens_out += r.tokens_out
+                cached_tokens += r.cached_tokens
+                if r.detail.get("cached_tokens_reported"):
+                    cached_reported = True
+                    cached_providers.add(r.provider)
             elif r.kind == "cache_hit":
                 cache_hits += 1
 
@@ -464,10 +568,37 @@ class CostAccount:
             "remaining_usd": round(self.remaining(), 8),
             "cache_savings_usd": round(self.cache_savings(), 8),
             "cache_hit_rate": round(cache_hits / attempts, 4) if attempts else 0.0,
+            # Reported separately from the cache, never folded into it. A memo
+            # hit avoids a call that was never issued and has no tokens; adding
+            # it to `cache_hit_rate` would inflate a rate whose denominator is
+            # calls actually attempted.
+            "memo": self.memo_savings(),
             "llm_calls": calls,
             "cache_hits": cache_hits,
             "tokens_in": tokens_in,
             "tokens_out": tokens_out,
+            # Prompt tokens the PROVIDER served from its own prefix cache.
+            # Distinct from `cache_hits`, which counts whole responses swarmd
+            # served from `router/cache.py` without calling anyone.
+            "cache_hit_tokens": cached_tokens,
+            "prefix_cache": {
+                "prompt_tokens": tokens_in,
+                "cached_tokens": cached_tokens,
+                "ratio": round(cached_tokens / tokens_in, 4) if tokens_in else 0.0,
+                # The honesty flag. Several OpenAI-compatible providers omit
+                # the field entirely, and a 0 from those means "not measured",
+                # not "nothing cached" -- an important difference when the
+                # figure is being read as evidence that a prompt reordering
+                # worked. Nothing here is ever estimated from prompt shape.
+                "reported": cached_reported,
+                "reported_by": sorted(cached_providers),
+                "note": (
+                    ""
+                    if cached_reported
+                    else "no provider on this run reported cached prompt "
+                         "tokens; 0 means not measured, not nothing cached"
+                ),
+            },
             "by_provider": {k: round(v, 8) for k, v in sorted(by_provider.items())},
             "by_model": {k: round(v, 8) for k, v in sorted(by_model.items())},
             "by_stage": {k: round(v, 8) for k, v in sorted(by_stage.items())},

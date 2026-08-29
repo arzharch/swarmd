@@ -28,6 +28,15 @@ from swarmd.observability import metrics
 from swarmd.swarm.batch import Batch, generate_batch
 from swarmd.swarm.criteria import Candidate
 from swarmd.swarm.economy import Economy
+from swarmd.swarm.generalise import (
+    MIN_GENERALITY,
+    abstract,
+    generality,
+    render_pattern,
+    strip_source_terms,
+    task_signature,
+)
+from swarmd.swarm.memo import MemoStore, TaskMemo, key_for
 from swarmd.swarm.planner import (
     PLAN_SCHEMA_HINT,
     PLANNER_SYSTEM,
@@ -38,7 +47,7 @@ from swarmd.swarm.planner import (
 from swarmd.swarm.redteam import RedTeam
 from swarmd.swarm.rogues import RogueSeeder, parse_patterns
 from swarmd.swarm.runstore import RunState, RunStore
-from swarmd.swarm.skills import SkillLibrary
+from swarmd.swarm.skills import MAX_NAME_CHARS, MIN_DISTINCT_TASKS, SkillLibrary
 from swarmd.swarm.synthesis import (
     PROPOSAL_SCHEMA_HINT,
     PROPOSER_SYSTEM,
@@ -49,8 +58,11 @@ from swarmd.swarm.synthesis import (
 from swarmd.swarm.worker import (
     WORKER_SYSTEM,
     GenericWorker,
+    NodePrefix,
     WorkerContext,
     WorkerResult,
+    build_node_prefix,
+    build_run_system,
 )
 from swarmd.task import Checkpoint
 
@@ -164,6 +176,12 @@ class RunResult:
     error: str = ""
     started_ts: float = field(default_factory=time.time)
     duration_s: float = 0.0
+    # Empty for an organic run; `memo:<provenance run id>` when the criterion
+    # or the plan came off a stored memo instead of being synthesised. Carried
+    # on the RESULT so any aggregate over runs -- pass rate, cost per run,
+    # time-to-first-worker -- can branch on it rather than averaging a
+    # memo-served run into runs that paid for their own synthesis.
+    served_from: str = ""
 
     @property
     def passed(self) -> list[WorkerResult]:
@@ -201,6 +219,7 @@ class RunResult:
             "nodes_total": len(self.results),
             "contained": len(self.contained),
             "integrity_hash": self.integrity_hash(),
+            "served_from": self.served_from,
             "proposed_skills": self.proposed_skills,
             "results": [r.to_dict() for r in self.results],
             "error": self.error,
@@ -231,6 +250,7 @@ class SwarmRun:
         no_wait: bool = False,
         store: RunStore | None = None,
         state: RunState | None = None,
+        memo: MemoStore | None = None,
     ) -> None:
         if profile not in PROFILES:
             raise ValueError(f"unknown profile {profile!r}; known: {sorted(PROFILES)}")
@@ -260,6 +280,18 @@ class SwarmRun:
                 "responses across repeats collapse the bootstrap interval and "
                 "turn a measurement into an artefact of the first sample"
             )
+        # REFUSED FOR EVAL for the same reason the cache is, one line above: an
+        # eval measures variance across repeats, and a memo removes the
+        # criterion and plan synthesis from every repeat after the first. The
+        # arms would then differ in what they had to pay for as well as in what
+        # they were allowed to read, which is a confound, not a saving.
+        if memo is not None and profile == "eval":
+            raise ValueError(
+                "an eval run cannot use the run memo: reusing repeat 1's "
+                "criterion and plan in repeats 2..N removes the synthesis "
+                "variance the eval exists to measure"
+            )
+        self.memo = memo
         # Empty means the stock prompt. A session hands in the supervisor's
         # current version, which is how a patch reaches the fleet.
         self.system_prompt = system_prompt
@@ -424,6 +456,248 @@ class SwarmRun:
         ]
         return validate(nodes) if nodes else None
 
+    # -- the run memo -------------------------------------------------------
+    #
+    # The memo reuses a CRITERION and a PLAN across runs of the same normalised
+    # task. It never reuses an answer: every worker still runs against the real
+    # current task and every candidate is still graded by the frozen criterion.
+    # What it removes is the always-serial, always-paid head of a run -- six
+    # proposer calls on the default profiles -- for a question that has already
+    # been asked, attacked and completed once. See swarm/memo.py.
+
+    def _memo_lookup(self, task: str) -> TaskMemo | None:
+        """The reusable memo for this task, or None with the reason recorded."""
+        if self.memo is None:
+            return None
+        if self.state.criterion or self.state.results:
+            # A RESUME ALWAYS WINS. Half a run has already been graded against
+            # the stored criterion; swapping in a memo's criterion mid-flight
+            # would grade the two halves of one run against different targets
+            # while the report quoted a single hash for both.
+            metrics.record_memo_miss(reason="resume")
+            return None
+
+        entry = self.memo.get(key_for(task))
+        if entry is None:
+            metrics.record_memo_miss(reason="absent")
+            return None
+
+        reason = entry.reusable(now=time.time())
+        label = "unusable"
+        if reason:
+            label = "provenance_unfinished" if entry.status != "completed" else "stale"
+        else:
+            # Second opinion from the run store. `record_outcome` settles the
+            # memo when a run ends normally, but a control plane killed mid-run
+            # marks its documents "interrupted" without touching the memo, and
+            # an interrupted run's criterion never graded a full run.
+            try:
+                stored = self.store.load(entry.run_id) if entry.run_id else None
+            except Exception:  # noqa: BLE001 - an unreadable document is not a veto
+                stored = None
+            if stored is not None and stored.status != "completed":
+                reason = (
+                    f"provenance run document reports {stored.status!r}, "
+                    f"not completed"
+                )
+                label = "provenance_unfinished"
+
+        if reason:
+            metrics.record_memo_miss(reason=label)
+            self._emit(
+                "memo_refused",
+                task_key=entry.task_key,
+                provenance_run_id=entry.run_id,
+                reason=reason,
+            )
+            return None
+        return entry
+
+    def _memo_reject(self, entry: TaskMemo, label: str, reason: str) -> None:
+        """Refuse a memo AND drop it. A refusal that leaves it costs forever.
+
+        Everything routed here failed a check that is a property of the stored
+        document rather than of today -- an unparseable criterion, a hash that
+        does not match, a plan with a cycle, a criterion that garbage now
+        passes. None of those get better by being read again, and keeping the
+        entry would both repeat the refusal on every future run of this task
+        and block that run from writing a memo of its own.
+        """
+        metrics.record_memo_miss(reason=label)
+        self._emit(
+            "memo_refused",
+            task_key=entry.task_key,
+            provenance_run_id=entry.run_id,
+            reason=reason,
+        )
+        if self.memo is not None:
+            self.memo.delete(entry.task_key)
+
+    def _criterion_from_memo(
+        self, entry: TaskMemo, task: str
+    ) -> FrozenCriterion | None:
+        """Rehydrate a stored criterion, or None to fall through to synthesis.
+
+        RE-ATTACKED HERE, against THIS run's task text, even though the key is
+        exact. The attack is pure and costs no provider call, the check list it
+        runs is the code running NOW rather than the code that froze it, and
+        one of the degenerate candidates is built from the task string itself.
+        A criterion that a later `degenerate_candidates` entry can satisfy must
+        not be inherited just because it survived an older attack.
+        """
+        from swarmd.swarm.criteria import CheckError, Criterion
+        from swarmd.swarm.synthesis import attack
+
+        try:
+            criterion = Criterion.from_dict(entry.criterion or {})
+        except (CheckError, TypeError, ValueError) as exc:
+            self._memo_reject(entry, "criterion_invalid", f"unparseable: {exc}")
+            return None
+        if criterion.content_hash() != entry.criterion_hash:
+            self._memo_reject(
+                entry,
+                "criterion_invalid",
+                f"criterion hashes to {criterion.content_hash()}, memo claims "
+                f"{entry.criterion_hash}",
+            )
+            return None
+        broken = criterion.malformed()
+        if broken:
+            self._memo_reject(
+                entry, "criterion_invalid", f"malformed checks: {'; '.join(broken)}"
+            )
+            return None
+        report = attack(criterion, task)
+        if not report.survived:
+            self._memo_reject(entry, "attack_failed", report.summary())
+            return None
+
+        frozen = FrozenCriterion(
+            criterion=criterion,
+            hash=entry.criterion_hash,
+            attempts=0,
+            agreement=1.0,
+            attack_report=report,
+            history=(f"reused from run {entry.run_id}",),
+        )
+        self._memo_credit("criterion", entry, hash=entry.criterion_hash)
+        self._emit(
+            "criterion_memo_hit",
+            hash=frozen.hash,
+            checks=len(criterion.checks),
+            task_key=entry.task_key,
+            provenance_run_id=entry.run_id,
+            calls_avoided=self.profile.proposers,
+            attack=report.summary(),
+        )
+        # Persisted exactly as a synthesised criterion is, so a resume of THIS
+        # run reads its criterion from its own document rather than depending
+        # on the memo still being there.
+        self.state.criterion = criterion.to_dict()
+        self.state.criterion_hash = frozen.hash
+        self.persist()
+        return frozen
+
+    def _plan_from_memo(self, entry: TaskMemo) -> Plan | None:
+        """Rehydrate a stored plan, or None to fall through to synthesis."""
+        from swarmd.swarm.planner import PlanError, validate
+
+        if not entry.plan:
+            metrics.record_memo_miss(reason="no_plan")
+            return None
+        try:
+            nodes = [
+                PlanNode(
+                    name=str(n["name"]),
+                    instruction=str(n.get("instruction", "")),
+                    depends_on=tuple(n.get("depends_on") or ()),
+                )
+                for n in entry.plan.get("nodes", [])
+            ]
+            plan = validate(nodes)
+        except (PlanError, KeyError, TypeError, ValueError) as exc:
+            self._memo_reject(entry, "plan_invalid", f"stored plan will not run: {exc}")
+            return None
+        if plan.content_hash() != entry.plan_hash:
+            self._memo_reject(
+                entry,
+                "plan_invalid",
+                f"plan hashes to {plan.content_hash()}, memo claims "
+                f"{entry.plan_hash}",
+            )
+            return None
+
+        self._memo_credit("plan", entry, hash=entry.plan_hash)
+        self._emit(
+            "plan_memo_hit",
+            hash=plan.content_hash(),
+            nodes=len(plan.nodes),
+            task_key=entry.task_key,
+            provenance_run_id=entry.run_id,
+            calls_avoided=self.profile.proposers,
+        )
+        self.state.plan = plan.to_dict()
+        self.persist()
+        return plan
+
+    def _memo_credit(self, stage: str, entry: TaskMemo, **detail: Any) -> None:
+        """Book the avoided calls as a LEDGER ROW, not a counter.
+
+        Same discipline as a cache hit (ADR-007): what a saving was worth has
+        to be a query over rows. `would_have_cost` stays 0.0 because the
+        avoided proposer calls never named a provider or a model -- see
+        `CostAccount.charge_memo_hit`.
+        """
+        self.account.charge_memo_hit(
+            stage=stage,
+            calls_avoided=self.profile.proposers,
+            provenance_run_id=entry.run_id,
+            detail={"task_key": entry.task_key, **detail},
+        )
+        metrics.record_memo_hit(
+            stage=stage, calls_avoided=self.profile.proposers
+        )
+
+    def _memo_record(
+        self,
+        task: str,
+        *,
+        criterion: dict[str, Any] | None = None,
+        criterion_hash: str = "",
+        plan: dict[str, Any] | None = None,
+        plan_hash: str = "",
+    ) -> None:
+        """Write what this run just paid for, so the next one need not.
+
+        Written the moment it freezes rather than at the end of the run: a run
+        that is interrupted between freezing and finishing has still bought the
+        artefact, and the entry is unusable until `record_outcome` settles it
+        as completed anyway.
+        """
+        if self.memo is None:
+            return
+        self.memo.remember(
+            task=task,
+            run_id=self.run_id,
+            criterion=criterion,
+            criterion_hash=criterion_hash,
+            plan=plan,
+            plan_hash=plan_hash,
+        )
+
+    def _memo_settle(self, task: str, status: str) -> None:
+        """Certify or destroy this run's memo, using the status it reached.
+
+        THE INVALIDATION RULE. Only `completed` -- the run passed its own
+        frozen criterion -- makes a memo reusable. A criterion authored by a
+        run that then failed its gate, aborted on cost, or errored is exactly
+        the criterion not to inherit: at best it is unproven, at worst it is
+        why the run failed. Anything else deletes the entry.
+        """
+        if self.memo is None:
+            return
+        self.memo.record_outcome(task=task, run_id=self.run_id, status=status)
+
     # -- durability ---------------------------------------------------------
 
     def persist(self) -> None:
@@ -566,6 +840,12 @@ class SwarmRun:
             # proposer calls the first time; a resume that recomputed them
             # would spend the ration it was waiting for.
             self.state.task = self.state.task or task
+            # Looked up ONCE, before either stage, so the criterion and the
+            # plan a run reuses come from the SAME provenance run. Two lookups
+            # could straddle a concurrent write and pair one run's definition
+            # of done with another run's decomposition.
+            memo = self._memo_lookup(task)
+
             restored_criterion = self.restored_criterion()
             if restored_criterion is not None:
                 result.criterion = restored_criterion
@@ -575,7 +855,18 @@ class SwarmRun:
                     checks=len(restored_criterion.criterion.checks),
                 )
             else:
-                result.criterion = await self._synthesize_criterion(task)
+                memoised = (
+                    self._criterion_from_memo(memo, task) if memo else None
+                )
+                if memoised is not None:
+                    result.criterion = memoised
+                    result.served_from = f"memo:{memo.run_id}" if memo else ""
+                else:
+                    # The memo was absent or refused; the entry is already gone
+                    # if it was refused, so this run's own synthesis becomes the
+                    # memo for the next one.
+                    memo = None
+                    result.criterion = await self._synthesize_criterion(task)
 
             restored_plan = self.restored_plan()
             if restored_plan is not None:
@@ -586,7 +877,11 @@ class SwarmRun:
                     nodes=len(restored_plan.nodes),
                 )
             else:
-                result.plan = await self._synthesize_plan(task)
+                memoised_plan = self._plan_from_memo(memo) if memo else None
+                if memoised_plan is not None:
+                    result.plan = memoised_plan
+                else:
+                    result.plan = await self._synthesize_plan(task)
             result.results = await self._execute(task, result.plan, result.criterion)
             result.proposed_skills = await self._distill(task, result)
             result.status = "completed"
@@ -619,6 +914,9 @@ class SwarmRun:
         self.state.paused_reason = ""
         self.state.resumes_at = 0.0
         self.persist()
+        # A memo becomes reusable only now, and only if this run passed its own
+        # criterion. Any other status deletes it.
+        self._memo_settle(task, result.status)
         self._emit("run_finished", **{
             k: v for k, v in result.to_dict().items() if k != "results"
         })
@@ -642,6 +940,14 @@ class SwarmRun:
         self.state.criterion = frozen.criterion.to_dict()
         self.state.criterion_hash = frozen.hash
         self.persist()
+        # And recorded against the normalised task, so the NEXT run of the same
+        # question does not buy these N proposer calls again. Unusable until
+        # this run completes -- see `_memo_settle`.
+        self._memo_record(
+            task,
+            criterion=frozen.criterion.to_dict(),
+            criterion_hash=frozen.hash,
+        )
         return frozen
 
     async def _synthesize_plan(self, task: str) -> Plan:
@@ -661,6 +967,17 @@ class SwarmRun:
         self._emit("plan_selected", **selection.plan.to_dict())
         self.state.plan = selection.plan.to_dict()
         self.persist()
+        # The criterion goes in alongside the plan, not because it changed but
+        # because a memo carrying only half of what a run needs is a memo the
+        # next run cannot use -- and the criterion may have come from a memo
+        # entry that this run's plan rejection has since deleted.
+        self._memo_record(
+            task,
+            criterion=self.state.criterion,
+            criterion_hash=self.state.criterion_hash,
+            plan=selection.plan.to_dict(),
+            plan_hash=selection.plan.content_hash(),
+        )
         return selection.plan
 
     def estimated_calls(self, nodes: int = 3) -> int:
@@ -843,7 +1160,12 @@ class SwarmRun:
         return budget
 
     async def _batch_generate(
-        self, task: str, node: PlanNode, context: WorkerContext, k: int
+        self,
+        task: str,
+        node: PlanNode,
+        context: WorkerContext,
+        k: int,
+        prefix: NodePrefix,
     ) -> Batch:
         """One call producing K candidate solutions for this node.
 
@@ -870,16 +1192,15 @@ class SwarmRun:
         """
         from swarmd.swarm.worker import GenericWorker
 
-        # Skills retrieved ONCE for the batch rather than per agent. Every
-        # agent in a pool queries the same library with the same node text, so
-        # per-agent retrieval returned identical results and differed only in
-        # how many times it ran.
-        skills = (
-            context.skills.retrieve(f"{task} {node.instruction}")
-            if context.skills
-            else []
+        # THE SAME PREFIX OBJECT the pool's workers will send, not a freshly
+        # built one. This call carries the longest prompt of the node and is
+        # therefore the one likeliest to miss the provider's prefix cache if
+        # its leading bytes drift from everyone else's -- and skills retrieved
+        # a second time here can genuinely differ, because `record_use` moves
+        # the success rates `retrieve` scores on while the run is in flight.
+        prompt = GenericWorker("batch", context).build_prompt(
+            task, node, list(prefix.skills), ()
         )
-        prompt = GenericWorker("batch", context).build_prompt(task, node, skills, ())
 
         batch = await generate_batch(
             provider=self.provider,
@@ -887,7 +1208,7 @@ class SwarmRun:
             k=k,
             max_tokens=context.max_tokens,
             temperature=context.temperature,
-            system=context.system,
+            system=prefix.system,
             stage=node.name,
         )
         if batch.variants:
@@ -919,6 +1240,7 @@ class SwarmRun:
         """
         import asyncio
 
+        base_system = self.system_prompt or WORKER_SYSTEM
         context = WorkerContext(
             provider=self.provider,
             criterion=criterion.criterion,
@@ -929,8 +1251,25 @@ class SwarmRun:
             sandbox=self.sandbox,
             run_id=self.run_id,
             max_repairs=self.profile.max_repairs,
-            system=self.system_prompt or WORKER_SYSTEM,
+            system=base_system,
+            # Computed HERE and only here: once per run, before any agent
+            # exists. The task and the frozen criterion cannot change after
+            # this point, so every call this run makes can share these bytes.
+            run_system=build_run_system(
+                base=base_system, task=task, criterion=criterion.criterion
+            ),
         )
+
+        # One prefix per node, resolved on first use and reused by the batch
+        # call and by every agent in that node's pool. A dict rather than a
+        # per-agent call because retrieval is not stable under `record_use`:
+        # see `NodePrefix`.
+        prefixes: dict[str, NodePrefix] = {}
+
+        def prefix_for(name: str) -> NodePrefix:
+            if name not in prefixes:
+                prefixes[name] = build_node_prefix(context, task, plan.node(name))
+            return prefixes[name]
 
         # Nodes an earlier process finished are seeded back in, not just
         # skipped. Skipping alone drops them from the report, so a resumed run
@@ -1049,7 +1388,9 @@ class SwarmRun:
                         )
                         continue
 
-                    outcome = await worker.execute(task, node, checkpoint=carried)
+                    outcome = await worker.execute(
+                        task, node, checkpoint=carried, prefix=prefix_for(name)
+                    )
                     carried = outcome.checkpoint
                     break
                 metrics.record_gate(
@@ -1098,7 +1439,7 @@ class SwarmRun:
                     )
                     continue
                 batches[name] = await self._batch_generate(
-                    task, plan.node(name), context, pool
+                    task, plan.node(name), context, pool, prefix_for(name)
                 )
                 # One provider call bought K variants. Persisting them here
                 # means a restart mid-level reuses them instead of paying for
@@ -1148,8 +1489,53 @@ class SwarmRun:
 
         return results
 
+    @staticmethod
+    def _artifact_shapes(outcomes: list[Any]) -> dict[str, str]:
+        """Which keys, of which types, the successes agreed on.
+
+        One function for both the advice and the name it is filed under: if
+        those two were computed separately they could drift, and a skill named
+        for one shape while describing another is unreviewable.
+        Underscore-prefixed keys are internal bookkeeping, not the contract.
+        """
+        shapes: dict[str, str] = {}
+        for outcome in outcomes:
+            for key, value in (outcome.candidate.artifacts or {}).items():
+                if not key.startswith("_"):
+                    shapes.setdefault(key, type(value).__name__)
+        return shapes
+
+    @staticmethod
+    def _step_text(plan_node: PlanNode | None, node: str) -> str:
+        """The step as written. Falls back to the node name only when the plan
+        no longer holds the node -- a resumed run whose plan was regenerated."""
+        return plan_node.instruction if plan_node else node
+
+    def _distil_step(self, plan_node: PlanNode | None, node: str, task: str) -> str:
+        """The step, with everything that belongs to THIS task taken out.
+
+        Two passes, because two different things leak. `abstract` removes
+        literals -- numbers, prices, dates, quoted strings, proper nouns -- by
+        shape alone, without needing to know what the task said.
+        `strip_source_terms` removes the subject-matter nouns the step shares
+        with its own task, which is knowledge only the task can supply: "pens"
+        is structurally indistinguishable from "total" until you notice one of
+        them came from the question.
+
+        What survives is the verb and the grammar: "Compute the total cost of
+        <NUMBER> <TERM> at <MONEY> each". A later run reads a method it can
+        apply, instead of one run's arithmetic presented as one.
+        """
+        return strip_source_terms(
+            abstract(self._step_text(plan_node, node)).template, (task,)
+        )
+
     def _distil_instruction(
-        self, node: str, plan_node: PlanNode | None, outcomes: list[Any]
+        self,
+        node: str,
+        plan_node: PlanNode | None,
+        outcomes: list[Any],
+        task: str = "",
     ) -> str:
         """Turn repeated successes into an APPROACH, not an answer.
 
@@ -1167,16 +1553,20 @@ class SwarmRun:
         A skill has to describe HOW. What generalises from a set of successes
         is the SHAPE they share -- which keys, of which types -- and the step
         that produced them. The values are what must not carry over.
+
+        ANATOMY: task
+          The text the step came from. Without it the step is only abstracted
+          by shape, which catches `3` and `1.25` but not `pens` -- a bare
+          lowercase noun that is subject matter rather than method, and the
+          reason the stored advice still read as being about stationery. Given
+          it, the step is also stripped of the vocabulary it shares with its
+          own task. Defaulted to empty so a caller that genuinely has no source
+          text gets shape-abstraction only, rather than a silent claim that the
+          step was checked against a task nobody supplied.
         """
 
-        shapes: dict[str, str] = {}
-        for outcome in outcomes:
-            for key, value in (outcome.candidate.artifacts or {}).items():
-                if key.startswith("_"):
-                    continue
-                shapes.setdefault(key, type(value).__name__)
-
-        what = plan_node.instruction if plan_node else node
+        shapes = self._artifact_shapes(outcomes)
+        what = self._distil_step(plan_node, node, task)
         # NO NODE NAME. Plan node names are generated fresh for every run, so
         # advice that opens "for steps like 'extract_dates'" describes a step
         # that does not exist in the plan reading it. Measured: a library of
@@ -1191,13 +1581,40 @@ class SwarmRun:
             return f"When a step calls for this: {what}"
 
         fields = ", ".join(f"{k} ({v})" for k, v in sorted(shapes.items()))
+        # No count of the successes. It was a digit in the instruction that had
+        # nothing to do with the task, and the shared-literal check in
+        # `validate_instruction` compares whole literals -- so a task that
+        # happened to mention the same small number would have had a correct
+        # skill refused for a leak that was never there.
         return (
             f"When a step calls for this: {what} "
             f"Produce a JSON object with these fields: {fields}. "
-            f"Values must come from the task at hand -- this records the shape "
-            f"that satisfied the criterion {len(outcomes)} times, not the "
-            f"answer, which will differ."
+            f"Derive every value from the task at hand -- this records the "
+            f"shape that satisfied the criterion, not the answer, which will "
+            f"differ."
         )
+
+    def _distil_name(self, shapes: dict[str, str], kinds: list[str]) -> str:
+        """Name a candidate after the WORK, never after the node.
+
+        Two reasons, and only the second is about naming. Plan node names are
+        regenerated every run, so `calculate_pen_cost approach` describes a
+        step no later plan contains -- measured, that made the treatment arm
+        worse than control (node pass rate 0.567 against 0.656, 0/5 against
+        2/5). And because the skill id hashes name+instruction, a node-derived
+        name means the SAME advice found by two runs is two skills, so the
+        evidence for it can never accumulate in one place and nothing ever
+        clears the two-distinct-tasks bar. Naming by the artifact shape and the
+        check kinds -- what actually recurs across tasks -- is what lets a
+        second task confirm a first one's approach.
+        """
+        if shapes:
+            what = "produce " + ", ".join(sorted(shapes))
+        elif kinds:
+            what = "satisfy " + ", ".join(sorted(set(kinds)))
+        else:
+            what = "unstructured work"
+        return f"approach: {what}"[:MAX_NAME_CHARS]
 
     async def _distill(self, task: str, result: RunResult) -> list[str]:
         """Turn verified successes into candidate skills, pending a human.
@@ -1206,11 +1623,26 @@ class SwarmRun:
         QUEUED; a human approves it. That gate is the difference between a
         library that improves and one that compounds its own mistakes.
 
-        Requires more than one verified success per node before proposing.
-        A skill distilled from a single win is a superstition, and every future
-        run would inherit it — the red-team's library_poisoning detector flags
-        exactly this, so checking here runs the cheap check before the
-        expensive proposal.
+        TWO BARS, MEASURING DIFFERENT THINGS.
+
+          min_evidence (2 agents, same node)  -- is this repeatable, or luck?
+            A single win is a superstition every future run would inherit.
+            Cheap, in-run, and it stays exactly as it was.
+
+          MIN_DISTINCT_TASKS (2 task SHAPES)  -- does this TRANSFER?
+            This is the bar that was missing. Two agents passing the same node
+            of the same run share a task, a criterion and a prompt: they are
+            one observation drawn twice, and no number of redraws turns it into
+            evidence that the approach applies to anything else. Until a second
+            distinct shape has confirmed it, a candidate is RECORDED and left
+            to accrue evidence rather than put to a human -- because "does this
+            transfer" is not yet answerable, and asking a reviewer an
+            unanswerable question is how a library fills with approaches nobody
+            could have evaluated.
+
+        A candidate below the second bar is still returned in `proposed_skills`
+        and still visible in the library as pending. It is unusable either way;
+        what the bar controls is whether a human is asked to look at it.
         """
         if self.skills is None or result.criterion is None:
             return []
@@ -1227,6 +1659,15 @@ class SwarmRun:
         for outcome in result.passed:
             if not outcome.contained:
                 by_node.setdefault(outcome.node, []).append(outcome)
+
+        # What the task is ABOUT, not what it says. Number-swapped
+        # near-duplicates share a signature, so a task generator varying only
+        # the digits cannot manufacture the second piece of evidence -- and
+        # neither can a human re-asking one question with "please" and "for me"
+        # around it, which the abstracted-sentence fingerprint this replaced
+        # counted as a second, independent task. See `generalise.task_signature`.
+        task_key = task_signature(task)
+        kinds = [c.kind for c in result.criterion.criterion.checks]
 
         proposed: list[str] = []
         plan = result.plan
@@ -1245,12 +1686,68 @@ class SwarmRun:
                 )
                 continue
 
-            instruction = self._distil_instruction(node, plan_node, outcomes)
+            step = self._distil_step(plan_node, node, task)
+            instruction = self._distil_instruction(node, plan_node, outcomes, task)
+            # Post-condition, not the primary defence: `_distil_step` already
+            # removed every word the step shared with its task, so a surviving
+            # one means the stripping missed something and the advice is still
+            # about this task. Refuse rather than store it and hope a reviewer
+            # notices.
+            score = generality(step, (task,))
+            if score < MIN_GENERALITY:
+                self._emit(
+                    "skill_rejected_specific",
+                    node=node,
+                    generality=round(score, 3),
+                    floor=MIN_GENERALITY,
+                )
+                continue
+
+            name = self._distil_name(self._artifact_shapes(outcomes), kinds)
+            # The retrieval key is the abstracted step plus what graded it --
+            # the kind of question, never the question. A raw task here is what
+            # let a skill be retrieved because a later task merely resembled
+            # the one it came from.
+            pattern = f"{render_pattern(step)} {' '.join(sorted(set(kinds)))}"
+
             try:
+                # Recorded first, and unconditionally: the evidence has to be
+                # banked before anything decides whether there is enough of it,
+                # and content addressing means a second task proposing the same
+                # advice lands on the same skill rather than a second one.
+                skill = self.skills.propose(
+                    name=name,
+                    task_pattern=pattern,
+                    instruction=instruction,
+                    run_id=self.run_id,
+                    criterion_hash=result.criterion.hash,
+                    evidence_task=task_key,
+                    source_task=task,
+                    # Measured on the step BEFORE stripping. Afterwards it is
+                    # 1.0 by construction, which would record a constant and
+                    # call it a signal. Pre-strip it answers the question a
+                    # reviewer actually has: how much of this step was the task
+                    # restated, before anything was taken out of it?
+                    generality=generality(
+                        abstract(self._step_text(plan_node, node)).template, (task,)
+                    ),
+                )
+                proposed.append(skill.skill_id)
+
+                if not skill.promotable:
+                    self._emit(
+                        "skill_evidence_recorded",
+                        skill_id=skill.skill_id,
+                        name=skill.name,
+                        task_shapes=len(skill.evidence_tasks),
+                        need=MIN_DISTINCT_TASKS,
+                    )
+                    continue
+
                 if gate is not None:
                     skill, request = await gate.submit(
-                        name=f"{node} approach",
-                        task_pattern=task,
+                        name=name,
+                        task_pattern=pattern,
                         instruction=instruction,
                         run_id=self.run_id,
                         criterion_hash=result.criterion.hash,
@@ -1262,22 +1759,17 @@ class SwarmRun:
                         name=skill.name,
                         request_id=request.request_id,
                         evidence=len(outcomes),
+                        task_shapes=len(skill.evidence_tasks),
                     )
                 else:
-                    # No approval store wired: record the candidate so the run
-                    # still reports what it would have proposed, but it stays
-                    # unusable exactly as before.
-                    skill = self.skills.propose(
-                        name=f"{node} approach",
-                        task_pattern=task,
-                        instruction=instruction,
-                        run_id=self.run_id,
-                        criterion_hash=result.criterion.hash,
-                    )
+                    # No approval store wired: the candidate is already in the
+                    # library as pending, exactly as unusable as before.
                     self._emit(
-                        "skill_proposed", skill_id=skill.skill_id, name=skill.name
+                        "skill_proposed",
+                        skill_id=skill.skill_id,
+                        name=skill.name,
+                        task_shapes=len(skill.evidence_tasks),
                     )
-                proposed.append(skill.skill_id)
             except Exception as exc:  # noqa: BLE001 - distillation is optional
                 # A skill already approved in an earlier run, or a store
                 # failure. Neither should fail a run that already succeeded.
@@ -1288,9 +1780,17 @@ class SwarmRun:
 
     def report(self, result: RunResult) -> dict[str, Any]:
         """Everything about this run, sourced from the ledger."""
+        cost = self.account.report()
         return {
             "run": result.to_dict(),
-            "cost": self.account.report(),
+            "cost": cost,
+            # Surfaced at the top level as well as inside `cost` because it is
+            # the only evidence that the prompt layout in swarm/worker.py is
+            # doing anything. Populated from what providers actually reported;
+            # `reported=False` means no provider on this run publishes the
+            # field, NOT that nothing was cached, and nothing here is ever
+            # inferred from prompt shape.
+            "prefix_cache": cost["prefix_cache"],
             "economy": self.economy.report(),
             "leaderboard": self.economy.leaderboard(),
             "redteam": self.redteam.report(),
@@ -1309,6 +1809,15 @@ class SwarmRun:
                 if self.cache is not None and hasattr(self.provider, "hit_rate")
                 else None
             ),
+            # What the run memo did, sourced from ledger rows rather than from
+            # a flag: `enabled` says the feature was wired, `calls_avoided`
+            # says whether it actually did anything, and `served_from` names
+            # the run whose criterion and plan this one inherited.
+            "memo": {
+                "enabled": self.memo is not None,
+                "served_from": result.served_from,
+                **self.account.memo_savings(),
+            },
             "ablation": {"skills_enabled": self.use_skills},
         }
 

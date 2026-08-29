@@ -113,6 +113,47 @@ def _build() -> tuple[Any, dict[str, Any]]:
         "cache_hits": counter(
             "cache_hits_total", "Requests served from the semantic cache", ["stage"]
         ),
+        # The run memo skips a whole SYNTHESIS stage, so it is counted apart
+        # from the response cache: one memo hit removes `profile.proposers`
+        # calls at once, and folding it into cache_hits would make one number
+        # mean two different things.
+        "memo_hits": counter(
+            "memo_hits_total",
+            "Synthesis stages served from a run memo, by stage",
+            ["stage"],
+        ),
+        "memo_calls_avoided": counter(
+            "memo_calls_avoided_total",
+            "Proposer requests a run memo made unnecessary. Requests, not "
+            "dollars, are the scarce resource on a pooled free tier.",
+            ["stage"],
+        ),
+        "memo_misses": counter(
+            "memo_misses_total",
+            "Run-memo lookups that did not serve, by reason. Watch this rather "
+            "than the hit rate: a memo that never fires and a memo that never "
+            "existed look identical from the hit rate alone.",
+            ["reason"],
+        ),
+        # --- idempotency ---------------------------------------------------
+        "runs_submitted": counter(
+            "runs_submitted_total",
+            "Run submissions, by whether the client supplied an "
+            "Idempotency-Key. A high 'absent' share is how a duplicated run "
+            "budget goes unnoticed.",
+            ["idempotency"],
+        ),
+        "idempotent_replays": counter(
+            "idempotent_replays_total",
+            "Submissions answered from a stored idempotency record instead of "
+            "starting a second run",
+            ["endpoint"],
+        ),
+        "idempotency_conflicts": counter(
+            "idempotency_conflicts_total",
+            "Requests refused because a key was reused for a different body",
+            ["endpoint"],
+        ),
         "batched_calls": counter(
             "batched_calls_total",
             "Batched generations issued, by stage. One call, K candidates.",
@@ -179,6 +220,24 @@ def _build() -> tuple[Any, dict[str, Any]]:
         # --- cost, treated as a first-class signal -------------------------
         "cost_usd": counter(
             "cost_usd_total", "Cumulative spend, by provider", ["provider"]
+        ),
+        # Prompt tokens sent, and the share of them the PROVIDER said it
+        # served from its own prefix cache. Two counters and no stored ratio:
+        # the ratio is derived at read time so it cannot drift from the
+        # tokens it summarises, and both figures come from the provider's
+        # usage block rather than from anything swarmd believes about its own
+        # prompts. A provider that omits the field contributes to
+        # `prompt_tokens_total` and not to the cached one, so a flat cached
+        # series reads as "unmeasured here", which is the truth.
+        "prompt_tokens": counter(
+            "prompt_tokens_total",
+            "Prompt tokens sent, by provider and stage",
+            ["provider", "stage"],
+        ),
+        "prompt_tokens_cached": counter(
+            "prompt_tokens_cached_total",
+            "Prompt tokens the provider reported serving from its prefix cache",
+            ["provider", "stage"],
         ),
         "cache_savings_usd": counter(
             "cache_savings_usd_total",
@@ -252,6 +311,26 @@ def record_llm_call(
         metric("cost_usd").labels(provider=provider).inc(cost_usd)
 
 
+def record_prompt_tokens(
+    *, provider: str, stage: str, prompt_tokens: int, cached_tokens: int
+) -> None:
+    """Record what a call's prompt cost and how much of it was cached.
+
+    Negative or absent figures are dropped rather than clamped: a counter is
+    monotonic, and inventing a zero for a provider that reported nothing would
+    make an unmeasured prefix cache indistinguishable from a cold one.
+    """
+    label = stage or "-"
+    if prompt_tokens > 0:
+        metric("prompt_tokens").labels(provider=provider, stage=label).inc(
+            prompt_tokens
+        )
+    if cached_tokens > 0:
+        metric("prompt_tokens_cached").labels(provider=provider, stage=label).inc(
+            cached_tokens
+        )
+
+
 def record_llm_error(*, provider: str, model: str, reason: str) -> None:
     metric("llm_calls").labels(provider=provider, model=model, outcome="error").inc()
     metric("llm_errors").labels(provider=provider, reason=reason).inc()
@@ -286,6 +365,37 @@ def record_cache_hit(*, stage: str, saved_usd: float) -> None:
     metric("cache_hits").labels(stage=stage).inc()
     if saved_usd:
         metric("cache_savings_usd").labels(stage=stage).inc(saved_usd)
+
+
+def record_memo_hit(*, stage: str, calls_avoided: int) -> None:
+    """A synthesis stage served from a run memo, and what it did not cost."""
+    metric("memo_hits").labels(stage=stage).inc()
+    if calls_avoided > 0:
+        metric("memo_calls_avoided").labels(stage=stage).inc(calls_avoided)
+
+
+def record_memo_miss(*, reason: str) -> None:
+    """Why a memo did not serve. The number worth alerting on.
+
+    A hit rate alone cannot distinguish "nobody asked the same question twice"
+    from "every memo is being refused because the criterion no longer
+    validates", and those call for opposite responses.
+    """
+    metric("memo_misses").labels(reason=reason).inc()
+
+
+def record_run_submitted(*, idempotency_key: bool) -> None:
+    metric("runs_submitted").labels(
+        idempotency="present" if idempotency_key else "absent"
+    ).inc()
+
+
+def record_idempotent_replay(*, endpoint: str) -> None:
+    metric("idempotent_replays").labels(endpoint=endpoint).inc()
+
+
+def record_idempotency_conflict(*, endpoint: str) -> None:
+    metric("idempotency_conflicts").labels(endpoint=endpoint).inc()
 
 
 def set_provider_available(*, provider: str, available: bool) -> None:
