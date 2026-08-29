@@ -433,19 +433,57 @@ def _budget_command(args: argparse.Namespace) -> int:
     import json as _json
 
     from swarmd.router.budget import BudgetTracker
+    from swarmd.router.ration import build_ration
 
     tracker = BudgetTracker()
+    ration = build_ration(tracker, os.environ.get("SWARMD_REDIS_URL") or None)
     reports = tracker.report_all()
     plan = tracker.capacity_plan()
+    envelopes = {
+        report["provider"]: ration.envelope(report["provider"])
+        for report in reports
+    }
+    session = ration.session_capacity()
 
     if args.json:
-        print(_json.dumps({"providers": reports, "plan": plan}, indent=2))
+        print(_json.dumps(
+            {
+                "providers": reports,
+                "plan": plan,
+                "envelopes": envelopes,
+                "session_capacity": session,
+            },
+            indent=2,
+        ))
         return 0
 
     for report in reports:
         blocked = report["blocked"]
         head = f"{report['provider']}  [{report['kind']}]"
         print(f"\n{head}{'  BLOCKED: ' + blocked if blocked else ''}")
+
+        # THE SITTING FIRST, because it is the number the gate actually
+        # applies. A report saying "120 of 1,000 used" while every call is
+        # being refused is the report and the router disagreeing in public.
+        envelope = envelopes.get(report["provider"], {})
+        if envelope.get("rationed"):
+            index, total = envelope["session"]
+            rolling = envelope.get("reset_kind") == "rolling"
+            # A rolling window frees capacity continuously, so there is no
+            # instant to count down to. Printing one would be a promise the
+            # provider never made.
+            label = "last 6h" if rolling else f"sitting {index}/{total}"
+            when = (
+                "  frees continuously" if rolling
+                else f"   next slice in "
+                     f"{_duration(envelope['slot_end'] - time.time())}"
+            )
+            for name in ("requests", "tokens"):
+                cap = envelope.get(f"envelope_{name}")
+                if cap is None:
+                    continue
+                used = envelope[f"used_{name}"]
+                print(f"  {label:<12} {used:,}/{cap:,} {name}{when}")
 
         grant = report["grant"]
         if grant:
@@ -483,6 +521,9 @@ def _budget_command(args: argparse.Namespace) -> int:
             print(f"  note: {report['note']}")
 
     print("\n--- can this run for a week? a month? ---")
+    # The sitting first: "how much is left today" is not the question a run is
+    # about to be refused on. This is.
+    print(f"this sitting  {session:,} requests before the next slice opens")
     print(
         f"plannable     {plan['sustainable_daily_requests']:,} requests/day "
         f"from published DAILY allowances"
