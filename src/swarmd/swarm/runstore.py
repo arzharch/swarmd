@@ -232,6 +232,45 @@ class RunStore:
             states.append((path.stat().st_mtime, state))
         return [state for _, state in sorted(states, key=lambda p: -p[0])]
 
+    # Terminal states. A run in one of these will never be resumed, so its
+    # working set is dead weight; a run in any other state might be picked up
+    # hours later and must survive regardless of age.
+    TERMINAL = frozenset(
+        {"completed", "failed_criterion", "aborted", "error", "cancelled"}
+    )
+
+    def prune(self, *, older_than_s: float = 14 * 86400.0, now: float | None = None) -> int:
+        """Drop finished run documents past their useful life. Returns the count.
+
+        Safe to lose, and this is the reason: the LEDGER is the durable record
+        (ADR-007) and this is the working set -- criterion, plan, drafts and
+        results kept so a paused run can be resumed. Once a run is finished
+        there is nothing left to resume and the file is only taking space, and
+        each one carries every batch draft the run generated.
+
+        A run that is paused, running, or in any state this build does not
+        recognise is NEVER pruned, however old. Age is not evidence that a
+        parked run was abandoned -- a ration pause plus a weekend looks exactly
+        like one.
+        """
+        import time as _time
+
+        now = now if now is not None else _time.time()
+        cutoff = now - older_than_s
+        dropped = 0
+        for state in self.list_runs():
+            if state.status not in self.TERMINAL:
+                continue
+            path = self.path_for(state.run_id)
+            try:
+                if path.stat().st_mtime >= cutoff:
+                    continue
+                path.unlink()
+                dropped += 1
+            except OSError as exc:
+                logger.warning("could not prune run state %s: %s", path, exc)
+        return dropped
+
     def delete(self, run_id: str) -> None:
         try:
             self.path_for(run_id).unlink(missing_ok=True)

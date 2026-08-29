@@ -153,6 +153,10 @@ def create_app(
     # on a spent ration outlives any deployment, and the registry above is an
     # in-process index that a restart empties.
     app.state.run_store = RunStore()
+    # Finished run documents age out; paused ones never do. Done at startup
+    # rather than on a timer because the store grows per run, not per second,
+    # and a pod that restarts weekly is exactly when the sweep should happen.
+    app.state.run_store.prune()
     app.state.jobs = JobRegistry(hub=app.state.hub)
     app.state.config = control.HarnessConfig()
     control.register(app, registry=app.state.jobs, config=app.state.config)

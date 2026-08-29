@@ -346,3 +346,48 @@ async def test_a_tampered_criterion_is_refused(tmp_path):
     resumed = SwarmRun.resume(first.run_id, provider, store=store)
     with pytest.raises(ValueError, match="does not match"):
         resumed.restored_criterion()
+
+
+# --- retention ----------------------------------------------------------------
+
+
+def test_finished_runs_age_out(tmp_path):
+    """Each document carries every batch draft the run generated, so a store
+    that only grows is a disk leak proportional to throughput."""
+    import os
+    import time
+
+    store = RunStore(tmp_path)
+    store.save(RunState(run_id="run-old", task=TASK, profile="smoke",
+                        status="completed"))
+    old = store.path_for("run-old")
+    ancient = time.time() - 30 * 86400
+    os.utime(old, (ancient, ancient))
+
+    assert store.prune(older_than_s=14 * 86400) == 1
+    assert not old.exists()
+
+
+def test_a_parked_run_is_never_pruned_however_old(tmp_path):
+    """Age is not evidence of abandonment: a ration pause plus a weekend looks
+    exactly like an abandoned run, and deleting it throws away everything the
+    run already paid for."""
+    import os
+    import time
+
+    store = RunStore(tmp_path)
+    store.save(RunState(run_id="run-parked", task=TASK, profile="smoke",
+                        status="paused"))
+    parked = store.path_for("run-parked")
+    ancient = time.time() - 400 * 86400
+    os.utime(parked, (ancient, ancient))
+
+    assert store.prune(older_than_s=1.0) == 0
+    assert parked.exists()
+
+
+def test_a_recent_finished_run_survives(tmp_path):
+    store = RunStore(tmp_path)
+    store.save(RunState(run_id="run-new", task=TASK, profile="smoke",
+                        status="completed"))
+    assert store.prune(older_than_s=14 * 86400) == 0
