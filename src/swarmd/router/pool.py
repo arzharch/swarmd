@@ -616,6 +616,17 @@ class ProviderPool(Provider):
                 slot.quota_key,
                 rate_per_min=float(slot.spec.hint_rpm),
                 burst=max(1, slot.spec.hint_rpm // 4),
+                # The token dimension is usually the binding one. Groq allows
+                # 30 requests and 8,000 tokens a minute, and this deployment's
+                # calls average a little over 1,000 tokens: pacing requests
+                # alone lets 30 legal requests carry 30,000 tokens into an
+                # 8,000-token minute.
+                tokens_per_min=float(slot.spec.hint_tpm),
+                # No token_burst: it defaults to a whole minute's tokens.
+                # Quartering it the way the request burst is quartered refuses
+                # the first call of an idle minute -- one call is legitimately
+                # a large share of a minute's token allowance -- and then
+                # serialises every later call behind the refill.
             )
         self._quota_ready = True
 
@@ -781,7 +792,18 @@ class ProviderPool(Provider):
                 # Quota gate. Asking permission before sending is what keeps N
                 # pods sharing a credential from collectively exceeding the
                 # account limit -- each pod's own backoff cannot see the others.
-                wait = await self.quota.acquire(slot.quota_key)
+                # Both dimensions, taken together or not at all. Spending a
+                # request permit and then finding the token bucket dry would
+                # drain the request allowance at the token bucket's refill rate
+                # and throttle the pool on a dimension with capacity to spare.
+                #
+                # The token figure is the ration's own estimate, measured from
+                # the usage journal rather than assumed: it moves with prompt
+                # size, which moves with schema hints and retrieved skills.
+                wait = await self.quota.acquire(
+                    slot.quota_key,
+                    tokens=self.ration.estimate_tokens(slot.spec.name),
+                )
                 if wait > 0:
                     quota_waits.append(wait)
                     continue
@@ -842,6 +864,9 @@ class ProviderPool(Provider):
                                 slot.quota_key,
                                 rate_per_min=max(1.0, slot.spec.hint_rpm * 0.5),
                                 burst=1,
+                                tokens_per_min=max(
+                                    1.0, slot.spec.hint_tpm * 0.5
+                                ),
                             )
                         errors.append(f"{slot.spec.name}: 429")
                         break  # whole provider is throttled, not just this model
