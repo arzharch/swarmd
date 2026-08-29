@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import os
 import time
@@ -34,7 +35,7 @@ from typing import Any
 # WebSocket` as a query parameter and the handshake fails with a 1008.
 # This module is only imported by `swarmd serve`, so requiring the optional
 # serve extra here costs nothing elsewhere.
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 
@@ -42,7 +43,16 @@ from swarmd.observability import logs, metrics
 from swarmd.router.cache import SemanticCache
 from swarmd.server import control, middleware
 from swarmd.server.hub import EventHub
+from swarmd.server.idempotency import (
+    KEY_RE,
+    ConflictingKey,
+    IdempotencyStore,
+    KeyInFlight,
+    fingerprint,
+    resolve,
+)
 from swarmd.server.jobs import JobRegistry
+from swarmd.swarm.memo import MemoStore
 from swarmd.swarm.run import PROFILES, RunResult, SwarmRun
 from swarmd.swarm.runstore import IncompatibleRunState, RunStore
 
@@ -207,10 +217,21 @@ def create_app(
     # on a spent ration outlives any deployment, and the registry above is an
     # in-process index that a restart empties.
     app.state.run_store = RunStore()
+    # Idempotency records and run memos live beside the run documents, under
+    # the same root, so one `SWARMD_RUN_STORE` moves all three together and an
+    # operator clearing the working set does not leave keys pointing at runs
+    # that are gone.
+    app.state.idempotency = IdempotencyStore()
+    app.state.memo = MemoStore()
     # Finished run documents age out; paused ones never do. Done at startup
     # rather than on a timer because the store grows per run, not per second,
     # and a pod that restarts weekly is exactly when the sweep should happen.
     app.state.run_store.prune()
+    # Swept in the same breath and for the same reason. The idempotency sweep
+    # is given the run store so a key ages out WITH the run it points at,
+    # rather than outliving it and replaying an id nothing can resolve.
+    app.state.idempotency.prune(run_store=app.state.run_store)
+    app.state.memo.prune()
     app.state.jobs = JobRegistry(hub=app.state.hub)
     app.state.config = control.HarnessConfig()
     control.register(app, registry=app.state.jobs, config=app.state.config)
@@ -264,7 +285,37 @@ def create_app(
     # -- runs ---------------------------------------------------------------
 
     @app.post("/api/runs")
-    async def submit_run(request: RunRequest) -> JSONResponse:
+    async def submit_run(
+        request: RunRequest,
+        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    ) -> JSONResponse:
+        """Start a run. Answers 202 with a run id; work happens in background.
+
+        IDEMPOTENCY CONTRACT. Supply `Idempotency-Key` and this endpoint
+        promises one run per key:
+
+          no header                -> a new run every time (unchanged)
+          same key, same body      -> 200, the ORIGINAL run_id, and the header
+                                      `Idempotent-Replay: true`. No SwarmRun is
+                                      constructed and no provider is touched.
+          same key, different body -> 422 naming the conflict. Nothing starts,
+                                      and the response does NOT disclose the
+                                      run id the key already holds.
+          key outside KEY_RE       -> 400 (8-200 chars of [A-Za-z0-9_.:-]).
+
+        Keys are durable -- files beside the run documents -- so a retry that
+        arrives after a deploy still deduplicates, which is the retry that
+        matters. They expire after `IDEMPOTENCY_TTL_S`, or sooner if the run
+        they point at is swept from the store.
+
+        WHY A CLIENT SHOULD CARE. A duplicated `standard` run is ~90 provider
+        requests against a measured ~1,146/day (docs/CAPACITY.md): a
+        double-clicked button or a retrying CI job spends a chunk of the day's
+        capacity re-answering a question already being answered.
+
+        The limit, stated rather than hidden: the key store is per-pod, so two
+        replicas behind one ingress can still both accept the same key.
+        """
         if request.profile not in PROFILES:
             raise HTTPException(400, f"unknown profile; known: {sorted(PROFILES)}")
 
@@ -277,6 +328,32 @@ def create_app(
             # reads exactly like a red-team gate that passed.
             raise HTTPException(400, str(exc)) from exc
 
+        key = _entry_key(idempotency_key)
+        metrics.record_run_submitted(idempotency_key=key is not None)
+        if key is None:
+            run, task = _build_run(request)
+            return _accept(run, task)
+
+        print_of_body = fingerprint("submit", request.model_dump())
+        async with app.state.idempotency.lock(key):
+            replay = _replay_or_reserve(key, print_of_body, endpoint="submit")
+            if replay is not None:
+                return replay
+            try:
+                run, task = _build_run(request)
+                payload = _launch(run, task)
+            except BaseException:
+                # The reservation is dropped so a retry with the same key is
+                # not stuck on "in flight" for a run that will never exist.
+                app.state.idempotency.release(key)
+                raise
+            app.state.idempotency.complete(
+                key, run_id=run.run_id, status_code=202, body=payload
+            )
+            return JSONResponse(payload, status_code=202)
+
+    def _build_run(request: RunRequest) -> tuple[SwarmRun, str]:
+        """Construct the run. Nothing here starts work or spends quota."""
         from swarmd.chaos import ChaosHook
         from swarmd.harnesses.sandbox import SandboxHarness
         from swarmd.swarm.skills import SkillLibrary
@@ -304,6 +381,12 @@ def create_app(
             on_event=app.state.hub.publish,
             no_wait=request.no_wait,
             store=app.state.run_store,
+            # Never for an eval profile: SwarmRun refuses the combination, and
+            # for the same reason it refuses a cache there -- reusing repeat
+            # 1's criterion in repeats 2..N removes the variance the sweep is
+            # measuring. Passed as None rather than caught, so the refusal
+            # stays a constructor invariant instead of a 500.
+            memo=None if request.profile == "eval" else app.state.memo,
         )
         app.state.registry.record(
             run.run_id,
@@ -317,15 +400,73 @@ def create_app(
                 "started": time.time(),
             },
         )
-        return _accept(run, request.task)
+        return run, request.task
+
+    # -- idempotency helpers -------------------------------------------------
+
+    def _entry_key(supplied: str | None) -> str | None:
+        """Validate the header, or refuse. None means "no key was given"."""
+        if supplied is None:
+            return None
+        key = supplied.strip()
+        if not KEY_RE.match(key):
+            # 400, not 422: the request BODY is fine. What is malformed is a
+            # header, and a client cannot fix that by changing its payload.
+            raise HTTPException(
+                400,
+                "Idempotency-Key must be 8-200 characters of [A-Za-z0-9_.:-]",
+            )
+        return key
+
+    def _replay_or_reserve(
+        key: str, print_of_body: str, *, endpoint: str
+    ) -> JSONResponse | None:
+        """Answer from the stored record, or reserve the key and return None.
+
+        Called while holding the key's lock, so the check and the reservation
+        cannot straddle another request's construction of the same key.
+        """
+        try:
+            record = resolve(
+                app.state.idempotency,
+                entry_key=key,
+                body_fingerprint=print_of_body,
+            )
+        except ConflictingKey as exc:
+            metrics.record_idempotency_conflict(endpoint=endpoint)
+            # 422: the key is well formed and the body is well formed; what is
+            # unprocessable is the pair. The first run's id is deliberately
+            # absent from the message.
+            raise HTTPException(422, str(exc)) from exc
+        except KeyInFlight as exc:
+            # 409 rather than a second run: another request is mid-construction
+            # with this key, and answering with a new run id would be exactly
+            # the duplication the key was sent to prevent.
+            raise HTTPException(409, str(exc)) from exc
+        if record is None:
+            return None
+        metrics.record_idempotent_replay(endpoint=endpoint)
+        # 200, not the original 202: the run was accepted earlier, not now, and
+        # a client that cannot read headers can still tell the two apart.
+        return JSONResponse(
+            record.body, status_code=200, headers={"Idempotent-Replay": "true"}
+        )
 
     def _accept(run: SwarmRun, task: str) -> JSONResponse:
-        """Start a run in the background and answer immediately.
+        """Start a run in the background and answer 202 immediately."""
+        return JSONResponse(_launch(run, task), status_code=202)
+
+    def _launch(run: SwarmRun, task: str) -> dict[str, Any]:
+        """Start a run in the background and build the accepted payload.
 
         Shared by submit and resume so a resumed run reports through exactly
         the same registry fields -- a second copy of this drifted into
         reporting a resumed run as permanently "running", because only one of
         them recorded the terminal status.
+
+        Split from `_accept` so the idempotency path can store the exact body
+        it returned: a replay that REBUILT its response could drift from the
+        original, and then two callers holding one key would see two answers.
         """
 
         async def execute() -> RunResult:
@@ -356,10 +497,11 @@ def create_app(
         # run waits. Progress arrives over the websocket, which is what the
         # websocket is for.
         app.state.registry.tasks[run.run_id] = asyncio.create_task(execute())
-        return JSONResponse(
-            {"run_id": run.run_id, "status": "accepted", "stream": "/api/stream"},
-            status_code=202,
-        )
+        return {
+            "run_id": run.run_id,
+            "status": "accepted",
+            "stream": "/api/stream",
+        }
 
     @app.get("/api/pace")
     async def pace() -> JSONResponse:
@@ -444,14 +586,59 @@ def create_app(
         )
 
     @app.post("/api/runs/{run_id}/resume")
-    async def resume_run(run_id: str) -> JSONResponse:
+    async def resume_run(
+        run_id: str,
+        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    ) -> JSONResponse:
         """Pick a stored run back up, buying nothing it already paid for.
 
         The criterion, plan and batch drafts come off disk. Re-deriving the
         criterion would be worse than wasteful: the second half of the run
         would be graded against a target the first half never saw, while the
         report still quoted one hash for both.
+
+        IDEMPOTENCY CONTRACT, the same one `POST /api/runs` offers:
+
+          no header                 -> unchanged. A second resume of a run this
+                                       pod is already running is 409; of a
+                                       parked run, a fresh 202.
+          same key, same run id     -> 200 with the run id the first call
+                                       accepted, `Idempotent-Replay: true`, and
+                                       no second `SwarmRun.resume`.
+          same key, different run   -> 422. One key names one resume.
+          key outside KEY_RE        -> 400.
+
+        A double-resume never produces two live runs either way: without a key
+        the second call is refused with 409 because two runs sharing an id
+        would interleave their writes into one document and one ledger. With a
+        key, the retry is ANSWERED instead of refused -- which is what a client
+        that lost the first response actually needs.
         """
+        key = _entry_key(idempotency_key)
+        if key is not None:
+            async with app.state.idempotency.lock(key):
+                replay = _replay_or_reserve(
+                    key,
+                    fingerprint("resume", {"run_id": run_id}),
+                    endpoint="resume",
+                )
+                if replay is not None:
+                    return replay
+                try:
+                    response = await _resume(run_id)
+                except BaseException:
+                    app.state.idempotency.release(key)
+                    raise
+                app.state.idempotency.complete(
+                    key,
+                    run_id=run_id,
+                    status_code=response.status_code,
+                    body=json.loads(bytes(response.body)),
+                )
+                return response
+        return await _resume(run_id)
+
+    async def _resume(run_id: str) -> JSONResponse:
         try:
             stored = app.state.run_store.load(run_id)
         except IncompatibleRunState as exc:
@@ -494,6 +681,16 @@ def create_app(
                 sandbox=SandboxHarness(),
                 cache=app.state.cache,
                 on_event=app.state.hub.publish,
+                # A resumed run reads no memo -- it already holds a criterion
+                # -- but it must still be able to SETTLE the memo its own
+                # earlier process wrote, which is keyed by this same run id.
+                # The eval guard is on the stored profile, since that is what
+                # `SwarmRun.resume` will reconstruct with.
+                memo=(
+                    None
+                    if (stored is not None and stored.profile == "eval")
+                    else app.state.memo
+                ),
             )
         except FileNotFoundError as exc:
             raise HTTPException(404, str(exc)) from exc
