@@ -109,6 +109,67 @@ class WorkerResult:
             "artifacts": self.candidate.artifacts,
         }
 
+    # -- durable form -------------------------------------------------------
+    #
+    # Deliberately separate from `to_dict`. That one is the DISPLAY form and
+    # truncates the output to a 280-character preview, which is right for a
+    # report and wrong for a store: a resumed run rebuilt from previews would
+    # report a different `integrity_hash` than the same run uninterrupted,
+    # since the hash reads the full output. The chaos gate compares those
+    # hashes, so a lossy round-trip would turn every resume into a false
+    # integrity failure -- or, worse, hide a real one behind a hash that no
+    # longer describes the same text.
+
+    def to_state(self) -> dict[str, Any]:
+        return {
+            "agent_id": self.agent_id,
+            "node": self.node,
+            "passed": self.passed,
+            "attempts": self.attempts,
+            "credits_spent": self.credits_spent,
+            "contained": self.contained,
+            "failures": list(self.failures),
+            "skill_used": self.skill_used,
+            "candidate": {
+                "output": self.candidate.output,
+                "artifacts": self.candidate.artifacts,
+                "exit_code": self.candidate.exit_code,
+                "stdout": self.candidate.stdout,
+                "stderr": self.candidate.stderr,
+                "source": self.candidate.source,
+            },
+            "checkpoint": self.checkpoint.to_dict() if self.checkpoint else None,
+            "thoughts": self.thoughts,
+        }
+
+    @staticmethod
+    def from_state(data: dict[str, Any]) -> WorkerResult:
+        raw = data.get("candidate") or {}
+        return WorkerResult(
+            agent_id=str(data.get("agent_id", "")),
+            node=str(data.get("node", "")),
+            candidate=Candidate(
+                output=str(raw.get("output", "")),
+                artifacts=dict(raw.get("artifacts") or {}),
+                exit_code=raw.get("exit_code"),
+                stdout=str(raw.get("stdout", "")),
+                stderr=str(raw.get("stderr", "")),
+                source=str(raw.get("source", "")),
+            ),
+            passed=bool(data.get("passed", False)),
+            attempts=int(data.get("attempts", 1)),
+            credits_spent=float(data.get("credits_spent", 0.0)),
+            contained=bool(data.get("contained", False)),
+            failures=tuple(data.get("failures") or ()),
+            skill_used=str(data.get("skill_used", "")),
+            checkpoint=(
+                Checkpoint.from_dict(data["checkpoint"])
+                if data.get("checkpoint")
+                else None
+            ),
+            thoughts=list(data.get("thoughts") or []),
+        )
+
 
 class GenericWorker:
     """One worker. Identical to every other worker in the population."""

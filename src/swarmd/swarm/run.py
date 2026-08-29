@@ -838,7 +838,16 @@ class SwarmRun:
             system=self.system_prompt or WORKER_SYSTEM,
         )
 
-        results: list[WorkerResult] = []
+        # Nodes an earlier process finished are seeded back in, not just
+        # skipped. Skipping alone drops them from the report, so a resumed run
+        # would announce "completed" while returning only the half of the work
+        # done after the restart -- and its integrity hash would cover only
+        # that half.
+        results: list[WorkerResult] = [
+            WorkerResult.from_state(row) for row in self.state.results
+        ]
+        if results:
+            self._emit("results_restored", nodes=len(results))
         for level in plan.levels():
             self._emit("level_started", nodes=level)
             metrics.set_queue_depth(stage="plan", depth=len(level))
@@ -1031,7 +1040,7 @@ class SwarmRun:
                     results.append(item)
                     # Node finished. Recorded so a resume skips it rather than
                     # re-running work that already passed its criterion.
-                    self.state.results.append(item.to_dict())
+                    self.state.results.append(item.to_state())
                     self.state.remember(item.checkpoint)
                 elif isinstance(item, BaseException):
                     # One node failing must not abort the level. The gate will
