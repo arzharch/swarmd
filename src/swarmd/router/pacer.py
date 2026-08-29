@@ -160,6 +160,12 @@ class Pacer:
     on_resume: Any = None
     no_wait: bool = False
     heartbeat_s: float = HEARTBEAT_S
+    # Overshoot past the predicted opening before retrying. A field rather than
+    # the bare constant for the same reason `heartbeat_s` is one: waking exactly
+    # on the estimate races the provider's own clock, and how much slack that
+    # needs is a deployment's decision -- and a test cannot afford five real
+    # seconds per pause.
+    grace_s: float = WAKE_GRACE_S
     checkpoint_path: str = ""
 
     paused: bool = False
@@ -262,7 +268,7 @@ class Pacer:
         try:
             while True:
                 now = time.time()
-                remaining = (self.resumes_at + WAKE_GRACE_S) - now
+                remaining = (self.resumes_at + self.grace_s) - now
                 if remaining <= 0:
                     break
                 if remaining <= self.heartbeat_s:
@@ -356,13 +362,30 @@ class Pacer:
 
     def _publish(self, kind: str, cause: PauseCause | None, **extra: Any) -> None:
         payload = cause.to_dict() if cause else {}
-        self._emit(kind, **payload, human=cause.human() if cause else kind, **extra)
+        payload["human"] = cause.human() if cause else kind
+        # `extra` last, and merged rather than splatted. `**payload, **extra`
+        # raises TypeError on any key both carry -- `resumes_in_s` is in both,
+        # so every heartbeat raised inside the ticker, the ticker's `finally`
+        # woke the run, and a pause that was supposed to last hours ended
+        # immediately and silently. The run then spun through the refusal it
+        # had just been parked on.
+        payload.update(extra)
+        self._emit(kind, **payload)
 
     def _emit(self, kind: str, **payload: Any) -> None:
+        """Hand one event to the run's sink.
+
+        ONE positional dict with `kind` inside it, matching what the run and
+        the hub already consume. The sink was previously called as
+        `emit(kind, **payload)`, which no sink in the codebase accepted; every
+        call raised and was swallowed by the guard below, so pause events
+        reached nothing -- the dashboard, the logs and the run's own stream
+        were all silent for exactly the hours an operator most needs them.
+        """
         if self.emit is None:
             return
         try:
-            self.emit(kind, **payload)
+            self.emit({"kind": kind, **payload})
         except Exception:
             logger.debug("pacer event sink raised; continuing", exc_info=True)
 
