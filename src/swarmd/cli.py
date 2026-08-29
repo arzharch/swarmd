@@ -57,6 +57,13 @@ def _load_dotenv() -> None:
     prefix tolerated, quotes stripped, `#` comments ignored. It is not a shell
     and must not try to be one.
     """
+    if os.environ.get("SWARMD_NO_DOTENV"):
+        # An explicit opt-out, for two real cases. A deployment injects config
+        # through the orchestrator and a stray .env baked into an image should
+        # not shadow it. And a caller that DELETED a variable on purpose means
+        # "unset", which is not the same as "never mentioned" -- without this
+        # the file would quietly put it back.
+        return
     path = Path.cwd() / ".env"
     if not path.exists():
         return

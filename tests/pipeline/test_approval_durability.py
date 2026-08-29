@@ -77,6 +77,10 @@ async def test_the_cli_actually_uses_a_durable_store(db_path, monkeypatch):
     """
     monkeypatch.setenv("SWARMD_APPROVALS_DB", str(db_path))
     monkeypatch.delenv("DATABASE_URL", raising=False)
+    # The CLI loads .env, which carries a DATABASE_URL. Deleting the variable
+    # says "unset"; without this the file would put it back and the subprocess
+    # would look at Postgres instead of the SQLite file under test.
+    monkeypatch.setenv("SWARMD_NO_DOTENV", "1")
 
     mgr = ApprovalManager(build_approval_store())
     req = await mgr.submit({"draft": "from a run"}, stage="review")
