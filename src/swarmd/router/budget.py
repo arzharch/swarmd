@@ -115,6 +115,21 @@ def next_pacific_midnight(now_ts: float) -> float:
     return (tomorrow - offset).timestamp()
 
 
+def next_utc_midnight(now_ts: float) -> float:
+    """When an OpenRouter-style daily quota resets, as a unix timestamp.
+
+    A second function rather than a parameterised one because the two resets
+    are different CLAIMS, each with its own provenance: Google documents
+    midnight Pacific, OpenRouter documents midnight UTC, and a shared helper
+    taking an offset would let a future edit change both by editing one.
+    """
+    now = datetime.fromtimestamp(now_ts, tz=UTC)
+    tomorrow = (now + timedelta(days=1)).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    return tomorrow.timestamp()
+
+
 # --- declared limits -------------------------------------------------------
 
 
@@ -151,6 +166,24 @@ class BudgetSpec:
       Treating it as rolling under-uses it all morning and over-commits at
       night.
 
+    ANATOMY: reset
+      "rolling" | "pacific-midnight" | "utc-midnight". Generalises the older
+      boolean, which could only express Google. It decides where a day BEGINS,
+      and therefore how much of the day a session ration may claim.
+
+      UNKNOWN RESETS ARE TREATED AS ROLLING, and that is the conservative
+      direction rather than the lazy one: if a provider really resets on a wall
+      clock, rolling accounting under-uses it for at most a day; if a rolling
+      window is mistaken for a wall-clock one, the reset that was supposed to
+      refill the bucket never happens and we double-spend it.
+
+    ANATOMY: per_model
+      True when the provider meters each model separately (Groq publishes a
+      per-model TPD). With it set, rations are evaluated per (credential,
+      model) rather than per credential, because summing two independently
+      metered models reports one exhausted budget where there are two half-full
+      ones.
+
     ANATOMY: grant_total / grant_expires_days
       For finite pools. `grant_total` is the whole allowance, not a per-window
       figure, and it never refills.
@@ -160,6 +193,8 @@ class BudgetSpec:
     kind: str = "rate"
     limits: tuple[Limit, ...] = ()
     resets_at_pacific_midnight: bool = False
+    reset: str = ""
+    per_model: bool = False
     grant_total: int | None = None
     grant_expires_days: int | None = None
     source: str = ""
@@ -171,6 +206,33 @@ class BudgetSpec:
             if limit.window == window:
                 return limit
         return None
+
+    @property
+    def reset_kind(self) -> str:
+        """Where the day starts, with the old boolean still honoured.
+
+        The boolean predates the field and is still what several call sites and
+        tests construct specs with. Deriving from it rather than deleting it
+        keeps one statement of the fact instead of two that can disagree.
+        """
+        if self.reset:
+            return self.reset
+        return "pacific-midnight" if self.resets_at_pacific_midnight else "rolling"
+
+
+def day_reset_at(spec: BudgetSpec, now_ts: float) -> float:
+    """When this provider's day next rolls over, as a unix timestamp.
+
+    Rolling providers have no reset instant, so they get one DAY from now: a
+    caller waiting on "the day" of a rolling window is really waiting for the
+    oldest spend to age out, and a full day is the bound on that.
+    """
+    kind = spec.reset_kind
+    if kind == "pacific-midnight":
+        return next_pacific_midnight(now_ts)
+    if kind == "utc-midnight":
+        return next_utc_midnight(now_ts)
+    return now_ts + DAY
 
 
 # Declared budgets, researched 2026-08-28 and marked with where each came from.
@@ -197,23 +259,36 @@ BUDGETS: dict[str, BudgetSpec] = {
         kind="quota",
         limits=(
             # Per MODEL, per the official table. gpt-oss-20b/120b: 8K TPM,
-            # 200K TPD. qwen/qwen3.8-27b: 8K TPM, 2M TPD -- ten times the
-            # daily tokens, which makes it the model to route to when the
-            # others are spent. TPM binds first: at 8K/minute one reasoning-
-            # heavy reply can be most of a minute's budget.
+            # 200K TPD. qwen/qwen3.8-27b: 8K TPM, 2M TPD -- ten times the daily
+            # tokens, which makes it the model to route to when the others are
+            # spent. TPM binds first: at 8K/minute one reasoning-heavy reply
+            # can be most of a minute's budget.
+            #
+            # 8,000 TPM is what the console publishes. This deployment has
+            # observed larger minutes accepted, and that observation is left to
+            # the header-clamp path (ADR-008) rather than written in here:
+            # believing an observation that happens to be generous is how a
+            # table stops being a floor.
             Limit("minute", requests=30, tokens=8_000),
+            # 200,000 tokens per model per day, not 100,000 across the account.
+            # The old single figure was measured on one model and applied to
+            # all of them, which is why a run reported "day budget exhausted"
+            # at 98 requests while two other models were untouched -- see
+            # `per_model` below, which is the half of the fix that matters.
             Limit("day", requests=1_000, tokens=200_000),
         ),
+        reset="rolling",
+        per_model=True,
         source="https://console.groq.com/docs/rate-limits",
         checked="2026-08-29",
         note=(
-            "Official numbers, confirmed by four fetches. The official page "
-            "does NOT state how the daily window resets -- not rolling, not a "
-            "timezone, nothing. Blog claims of midnight UTC are unsourced. "
-            "Treated as ROLLING until a response header proves otherwise: the "
-            "x-ratelimit-reset-* headers are the only ground truth Groq "
-            "provides, and the pacer reads them. Yesterday's 100K/day figure "
-            "in this table was wrong by half."
+            "Per-model, and confirmed by four independent fetches. The "
+            "official page does NOT state how the daily window resets -- not "
+            "rolling, not a timezone, nothing; blog claims of midnight UTC are "
+            "unsourced. Accounted as ROLLING because that is the error which "
+            "under-uses rather than the one that double-spends, and narrowed "
+            "from x-ratelimit-reset-* headers, the only ground truth Groq "
+            "actually provides. Yesterday's 100K/day figure was wrong by half."
         ),
     ),
     "google-aistudio": BudgetSpec(
@@ -230,6 +305,7 @@ BUDGETS: dict[str, BudgetSpec] = {
             Limit("day", requests=1_000),
         ),
         resets_at_pacific_midnight=True,
+        reset="pacific-midnight",
         source="https://ai.google.dev/gemini-api/docs/rate-limits",
         checked="2026-08-29",
         note=(
@@ -244,8 +320,14 @@ BUDGETS: dict[str, BudgetSpec] = {
         kind="quota",
         limits=(
             Limit("minute", requests=20),
+            # 1,000/day, because THIS account is funded. 50/day is the unfunded
+            # figure and was what the table carried while the account it
+            # describes had already been topped up -- a twentyfold
+            # understatement that made the pool treat a workhorse as a
+            # tie-breaker.
             Limit("day", requests=1_000),
         ),
+        reset="utc-midnight",
         source="https://openrouter.ai/docs/api-reference/limits",
         checked="2026-08-29",
         note=(
@@ -253,8 +335,9 @@ BUDGETS: dict[str, BudgetSpec] = {
             "GET /api/v1/key (is_free_tier=false, usage=$0), a metadata call "
             "that spends no tokens. `:free` models remain $0 on a funded "
             "account; the $10 unlocks the request cap and is not consumed by "
-            "free-model calls. The 20/minute cap is official; whether it is a "
-            "rolling or fixed minute is not stated."
+            "free-model calls. The daily reset at midnight UTC is documented "
+            "rather than inferred; whether the 20/minute cap is a rolling or "
+            "fixed minute is not stated."
         ),
     ),
     "mistral-free": BudgetSpec(
@@ -264,15 +347,18 @@ BUDGETS: dict[str, BudgetSpec] = {
             Limit("minute", requests=60, tokens=500_000),
             Limit("month", tokens=1_000_000_000),
         ),
+        reset="rolling",
         source="https://help.mistral.ai/en/articles/225174",
         checked="2026-08-29",
         note=(
-            "1 req/s sustained, 500K TPM, 1B tokens/month. The official docs "
-            "publish limit CATEGORIES, not values -- the numbers are from "
-            "Mistral's help centre and are unverified against the admin "
-            "dashboard. Enabled for this deployment: the operator has "
-            "consented to the Experiment tier's data-training terms in "
-            "exchange for its capacity, which has no daily cap."
+            "1 req/s sustained, 500K TPM, and NO daily cap -- which is why "
+            "kind is rate: there is no day to spread over, so this provider is "
+            "never session-rationed and only its minute bucket and month cap "
+            "apply. The official docs publish limit CATEGORIES, not values; "
+            "the numbers come from Mistral's help centre and are unverified "
+            "against the admin dashboard. Enabled for this deployment: the "
+            "operator has consented to the Experiment tier's data-training "
+            "terms in exchange for capacity that never runs out mid-day."
         ),
     ),
     "nvidia-nim": BudgetSpec(
@@ -287,7 +373,9 @@ BUDGETS: dict[str, BudgetSpec] = {
             "A GRANT, not a tier: ~1,000 credits that never refill and expire "
             "30 days after they are issued, consumed at a variable rate per "
             "model. Spending it first because it is free is how a month's "
-            "burst capacity disappears in week one."
+            "burst capacity disappears in week one. This deployment's grant is "
+            "expected to be spent: it stays declared so the pool can SEE that "
+            "and skip it, which is not the same as pretending it is not there."
         ),
     ),
 }
@@ -298,35 +386,75 @@ BUDGETS: dict[str, BudgetSpec] = {
 
 @dataclass(frozen=True, slots=True)
 class UsageRow:
+    """One movement in the account, not one call.
+
+    ANATOMY: kind
+      "reserve"    a call is about to be sent, charged at an ESTIMATE.
+      "settle"     the difference between the estimate and what happened, so
+                   reserve + settle for one `rid` sums to the truth.
+      "exhausted"  the provider itself said the day is spent, until `until`.
+
+      Rows are split in two because admission and knowledge arrive at different
+      times: we must charge before sending (or N concurrent agents each admit
+      themselves against the same headroom), and we only learn the token count
+      afterwards. Older rows carry no kind and are read as "reserve", so a
+      journal written before this existed still sums to the same figures.
+
+    ANATOMY: attempts
+      Sends, including the ones that 429'd or errored. `requests` counts
+      SUCCESSES. They differ because a provider that charges a rejected request
+      against the daily allowance -- several do -- would otherwise let a retry
+      storm overshoot by exactly the retry count. Defaults to `requests` when
+      absent so old rows are unchanged.
+    """
+
     ts: float
     provider: str
     credential: str
     model: str
     requests: int
     tokens: int
+    kind: str = "reserve"
+    rid: str = ""
+    attempts: int = 0
+    until: float = 0.0
 
     def to_json(self) -> str:
-        return json.dumps(
-            {
-                "ts": round(self.ts, 3),
-                "provider": self.provider,
-                "credential": self.credential,
-                "model": self.model,
-                "requests": self.requests,
-                "tokens": self.tokens,
-            },
-            separators=(",", ":"),
-        )
+        payload: dict[str, Any] = {
+            "ts": round(self.ts, 3),
+            "provider": self.provider,
+            "credential": self.credential,
+            "model": self.model,
+            "requests": self.requests,
+            "tokens": self.tokens,
+        }
+        # Written only when they carry information. A journal line per call is
+        # the hot path of a long-lived file, and four always-present fields that
+        # are usually defaults is a third of the file for nothing.
+        if self.kind != "reserve":
+            payload["kind"] = self.kind
+        if self.rid:
+            payload["rid"] = self.rid
+        if self.attempts != self.requests:
+            payload["attempts"] = self.attempts
+        if self.until:
+            payload["until"] = round(self.until, 3)
+        return json.dumps(payload, separators=(",", ":"))
 
     @staticmethod
     def from_dict(data: dict[str, Any]) -> UsageRow:
+        requests = int(data.get("requests", 0))
         return UsageRow(
             ts=float(data["ts"]),
             provider=str(data.get("provider", "")),
             credential=str(data.get("credential", "")),
             model=str(data.get("model", "")),
-            requests=int(data.get("requests", 0)),
+            requests=requests,
             tokens=int(data.get("tokens", 0)),
+            kind=str(data.get("kind", "reserve")),
+            rid=str(data.get("rid", "")),
+            attempts=int(data.get("attempts", requests)),
+            until=float(data.get("until", 0.0)),
         )
 
 
@@ -353,6 +481,11 @@ class UsageJournal:
         self._lock = threading.Lock()
         self._rows: list[UsageRow] = []
         self._loaded = False
+        # Whether the last append reached the disk. The ration gate reads it and
+        # refuses rather than admitting: in-memory accounting is enough to keep
+        # a report honest, but a ration that forgets a restart's worth of spend
+        # would hand the next process the whole day again.
+        self.last_write_ok = True
 
     # -- reading --------------------------------------------------------
 
@@ -387,6 +520,31 @@ class UsageJournal:
     def rows_since(self, cutoff: float) -> list[UsageRow]:
         return [row for row in self.load() if row.ts >= cutoff]
 
+    def rows_for(
+        self,
+        *,
+        provider: str,
+        credential: str = "",
+        model: str = "",
+        since: float = 0.0,
+    ) -> list[UsageRow]:
+        """Rows for one meter: a provider, optionally one credential and model.
+
+        The filters are optional and additive because different questions are
+        asked at different scopes -- a report is per provider, a ration is per
+        credential, and Groq's ration is per credential AND model.
+        """
+        out = []
+        for row in self.load():
+            if row.ts < since or row.provider != provider:
+                continue
+            if credential and row.credential != credential:
+                continue
+            if model and row.model and row.model != model:
+                continue
+            out.append(row)
+        return out
+
     # -- writing --------------------------------------------------------
 
     def record(
@@ -398,6 +556,10 @@ class UsageJournal:
         requests: int = 1,
         tokens: int = 0,
         ts: float | None = None,
+        kind: str = "reserve",
+        rid: str = "",
+        attempts: int | None = None,
+        until: float = 0.0,
     ) -> UsageRow:
         row = UsageRow(
             ts=ts if ts is not None else time.time(),
@@ -406,6 +568,10 @@ class UsageJournal:
             model=model,
             requests=requests,
             tokens=tokens,
+            kind=kind,
+            rid=rid,
+            attempts=requests if attempts is None else attempts,
+            until=until,
         )
         with self._lock:
             self.load().append(row)
@@ -413,10 +579,12 @@ class UsageJournal:
                 self.path.parent.mkdir(parents=True, exist_ok=True)
                 with self.path.open("a", encoding="utf-8") as handle:
                     handle.write(row.to_json() + "\n")
+                self.last_write_ok = True
             except OSError as exc:
                 # In-memory accounting continues. Losing durability degrades
                 # the month view after a restart; refusing the call would stop
                 # the run over a bookkeeping failure.
+                self.last_write_ok = False
                 logger.warning("usage journal unwritable (%s): %s", self.path, exc)
         return row
 
@@ -523,11 +691,11 @@ class BudgetTracker:
         limit = spec.limit_for(window) if spec else None
         duration = WINDOWS[window]
 
-        if spec and spec.resets_at_pacific_midnight and window == "day":
+        if spec and window == "day" and spec.reset_kind != "rolling":
             # A wall-clock reset, so the window is "since the last midnight",
             # not "the last 24 hours". Treating it as rolling under-uses the
             # quota all morning and over-commits against it at night.
-            reset_at = next_pacific_midnight(now)
+            reset_at = day_reset_at(spec, now)
             start = reset_at - DAY
             resets_in = reset_at - now
         else:
@@ -571,6 +739,51 @@ class BudgetTracker:
             "expires_days": spec.grant_expires_days,
             "exhausted": remaining == 0,
         }
+
+    def observe_day_limit(
+        self,
+        provider: str,
+        *,
+        credential: str,
+        until: float,
+        model: str = "",
+        source: str = "",
+    ) -> UsageRow:
+        """Record that the provider itself said the day is spent.
+
+        ADR-008 in its sharpest form: a 429 whose retry-after is an hour away,
+        or whose body names a per-day metric, is the account telling us the
+        declared figure was wrong. Written as a journal row rather than held in
+        memory so the correction survives a restart and is visible to every
+        replica reading the same journal -- a limit learned once and forgotten
+        on the next deploy is a limit learned every day.
+        """
+        logger.warning(
+            "%s/%s: provider reports its day exhausted until %.0f (%s)",
+            provider, credential, until, source or "429",
+        )
+        return self.journal.record(
+            provider=provider,
+            credential=credential,
+            model=model,
+            requests=0,
+            tokens=0,
+            kind="exhausted",
+            until=until,
+        )
+
+    def day_exhausted_until(
+        self, provider: str, *, credential: str = "", now: float | None = None
+    ) -> float:
+        """The latest provider-declared exhaustion still in force, or 0.0."""
+        now = now if now is not None else time.time()
+        rows = self.journal.rows_for(
+            provider=provider, credential=credential, since=now - DAY
+        )
+        return max(
+            (row.until for row in rows if row.kind == "exhausted" and row.until > now),
+            default=0.0,
+        )
 
     def blocked(self, provider: str, *, now: float | None = None) -> str:
         """Why this provider cannot take a call right now, or "".
@@ -663,10 +876,11 @@ class BudgetTracker:
         if daily and (daily.requests or daily.tokens):
             # BOTH dimensions, because the smaller ceiling is the real one and
             # it is not always the obvious one. Groq publishes 1,000 requests
-            # and 100,000 tokens per day; at ~1,035 tokens per call this
-            # deployment exhausted the token budget after 98 REQUESTS. Reported
-            # as 1,000/day it overstated the provider tenfold, and the run that
-            # discovered it saw "day budget exhausted" next to "98 / 1,000".
+            # and 200,000 tokens per model per day; at ~1,035 tokens per call
+            # the token figure binds first, at ~193 requests. Reported as
+            # 1,000/day it overstated the provider fivefold, and the run that
+            # discovered it saw "day budget exhausted" next to "98 / 1,000"
+            # because the account-wide reading was wrong in the same place.
             by_requests = daily.requests or 10**9
             if daily.tokens:
                 per_call = self.observed_tokens_per_request(provider)
