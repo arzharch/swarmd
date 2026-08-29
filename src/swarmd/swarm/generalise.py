@@ -1,0 +1,682 @@
+"""Turning one task's text into the SHAPE of a task. Pure, deterministic, no I/O.
+
+WHY THIS EXISTS. Distillation kept `plan_node.instruction` verbatim as the
+skill's advice, so the library filled with entries like
+
+    "calculate_pen_cost: Compute the total cost of 3 pens at 1.25 dollars each"
+
+presented to every future run as a general method. It is not a method. It is
+one task's literals wearing a method's grammar, and a later run about pencils
+at 40c is handed the wrong numbers and told they worked. The same text was
+also stored as the skill's `task_pattern`, so retrieval matched a skill because
+the incoming task LOOKED LIKE the one it came from -- memorisation through the
+index, which is the harder half of the bug to see.
+
+THE RULE THIS MODULE ENFORCES: a literal from the task may never survive into
+anything a later run reads. `abstract` replaces literals with typed
+placeholders; `strip_source_terms` removes the subject-matter vocabulary the
+step shares with its own task; `render_pattern` turns what is left into a
+tokenizer-safe retrieval key; `generality` scores how much of a candidate
+instruction is still just its source task restated.
+
+WHY REGEX AND NOT A MODEL. Every function here runs on the distillation path,
+which is already model-adjacent output being fed back into this system's own
+inputs. Asking a model to "generalise this instruction" would put a second
+untrusted author on the only write path into the library, and it would cost a
+provider call per node on a quota-bound system. These rules are legible,
+free, and identical on every run -- so a chaos-integrity hash stays comparable
+and a reviewer can say exactly why a token was replaced.
+
+WHY NOT SIMILARITY. `router/cache.py` documents what happened the last time
+this system compared machine-assembled text by cosine: three genuinely
+different plan nodes measured 0.97 similar, because templated prompts are
+dominated by shared boilerplate. Nothing here scores similarity. Two texts
+either abstract to the same template or they do not.
+"""
+
+from __future__ import annotations
+
+import functools
+import hashlib
+import re
+from dataclasses import dataclass
+
+# Ordered, longest-match-first. Order IS the semantics: `1.25 dollars` must be
+# MONEY rather than NUMBER followed by a word, and `2024-01-05` must be a DATE
+# rather than three numbers, or two texts that say the same thing abstract to
+# different templates and never match.
+SLOTS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("URL", re.compile(r"https?://\S+")),
+    ("PATH", re.compile(r"(?:[A-Za-z]:\\|\./|/)[\w./\\-]{2,}")),
+    ("DATE", re.compile(r"\b\d{4}-\d{2}-\d{2}\b|\b\d{1,2}/\d{1,2}/\d{2,4}\b")),
+    (
+        "MONEY",
+        re.compile(
+            r"(?<![\w.])(?:[$£€]\s?\d[\d,]*(?:\.\d+)?"
+            r"|\d[\d,]*(?:\.\d+)?\s?(?:dollars?|usd|eur|gbp|cents?|c\b|p\b))"
+        ),
+    ),
+    ("PERCENT", re.compile(r"\d+(?:\.\d+)?\s?(?:%|percent)")),
+    ("QUOTED", re.compile(r"\"[^\"\n]{1,80}\"|'[^'\n]{1,80}'")),
+    ("NUMBER", re.compile(r"(?<![\w.])\d[\d,]*(?:\.\d+)?(?![\w.])")),
+    (
+        "TERM",
+        re.compile(r"\b(?:[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2}|[A-Z]{2,})\b"),
+    ),
+)
+
+# A number that IS the method, not an answer, survives. "round to 2 decimal
+# places" is advice; "3 pens" is data. The difference is the word after it, so
+# that is what decides -- not a magnitude heuristic, which would keep 2 and
+# drop 1.25 for no reason a reader could defend.
+KEEP_AFTER = frozenset(
+    {"decimal", "decimals", "places", "significant", "digits", "precision", "dp", "sf"}
+)
+
+# Vocabulary that describes HOW work is done rather than WHAT it was about.
+# Deliberately a fixed, human-authored list rather than a frequency cut-off:
+# a corpus-derived stoplist changes as the task distribution changes, so the
+# same instruction would abstract differently in different weeks and the
+# content-addressed skill id would move underneath the library.
+#
+# The bar for membership: could this word appear in a step for a task about
+# ANY subject? "compute", "round", "field" pass. "pens", "invoice", "kidney"
+# do not -- and those are exactly the tokens that must not survive.
+METHOD_LEXICON = frozenset(
+    {
+        "add", "apply", "append", "average", "calculate", "check", "collect",
+        "column", "columns", "combine", "compare", "compute", "convert",
+        "count", "cost", "csv", "date", "derive", "difference", "divide",
+        "emit", "entry", "entries", "extract", "fetch", "field", "fields",
+        "file", "files", "filter", "format", "gather", "group", "identify",
+        "index", "item", "items", "join", "json", "key", "keys", "line",
+        "lines", "list", "load", "match", "mean", "median", "merge", "multiply",
+        "name", "names", "normalise", "normalize", "number", "numbers",
+        "object", "output", "parse", "percentage", "price", "produce", "quote",
+        "range", "rate", "read", "record", "records", "report", "result",
+        "results", "return", "round", "row", "rows", "save", "schema", "select",
+        "sort", "source", "split", "step", "string", "subtract", "sum",
+        "summarise", "summarize", "summary", "table", "task", "text", "time",
+        "total", "unit", "units", "validate", "value", "values", "verify",
+        "write",
+    }
+)
+
+# Grammar, not subject matter. Never stripped, never counted as content: an
+# instruction reduced to placeholders joined by nothing is unreadable, and
+# "the" appearing in both a step and its task is not evidence of anything.
+#
+# CLOSED CLASSES ONLY. Determiners, prepositions, conjunctions, auxiliaries,
+# pronouns and modals -- the parts of English a speaker cannot add to. That is
+# what makes this list finishable and what distinguishes it from the thing it
+# must never become: a list of filler words ("just", "simply", "quickly") added
+# one at a time as each is caught farming the evidence bar. Open-class fillers
+# are handled STRUCTURALLY by `_analyse`, which asks where a word sits rather
+# than whether anyone has written it down here.
+FUNCTION_WORDS = frozenset(
+    {
+        "a", "all", "an", "and", "any", "are", "as", "at", "be", "been", "but",
+        "by", "each", "every", "for", "from", "has", "have", "in", "into",
+        "is", "it", "its", "not", "of", "on", "one", "or", "per", "that",
+        "the", "their", "then", "there", "these", "this", "to", "was", "were",
+        "when", "which", "with", "you", "your",
+        # pronouns, modals, politeness
+        "can", "could", "do", "does", "he", "her", "him", "i", "kindly", "me",
+        "my", "our", "please", "she", "should", "thank", "thanks", "them",
+        "they", "us", "we", "will", "would",
+        # the rest of the preposition class, so a noun phrase introduced by one
+        # of them is recognised as a noun phrase rather than read as content.
+        "about", "across", "after", "against", "among", "before", "below",
+        "beside", "between", "during", "over", "through", "under", "until",
+        "within", "without",
+    }
+)
+
+# ANATOMY: INTRODUCERS
+#   The subset of the closed class that OPENS a noun phrase -- determiners and
+#   prepositions. Everything `_analyse` calls subject matter has to sit after
+#   one of these (or after a literal placeholder, which introduces a phrase the
+#   same way: "<NUMBER> pens"). That positional test is what replaces asking
+#   whether a word is on a list of fillers.
+#
+#   "each" and "every" are deliberately ABSENT even though they are
+#   determiners. English writes both "each pen" (a determiner) and "at 1.25
+#   each" (a postmodifier), and admitting them would make the trailing word of
+#   "...at 1.25 dollars each now" the head of a phrase -- which is how "now"
+#   becomes a second task shape. Excluded, the cost is a phrase like "each pen"
+#   contributing no subject, which loses a distinction; admitted, the cost is a
+#   filler adverb minting one, which is the defect.
+#
+#   "to" is absent for the same reason in the other direction: it introduces
+#   phrases ("to the ledger") and infinitives ("to compute") indistinguishably.
+INTRODUCERS = frozenset(
+    {
+        "a", "all", "an", "any", "at", "about", "across", "after", "against",
+        "among", "before", "below", "beside", "between", "by", "during",
+        "for", "from", "in", "into", "its", "my", "of", "on", "our", "over",
+        "per", "her", "that", "the", "their", "these", "this", "through",
+        "under", "until", "with", "within", "without", "your",
+    }
+)
+
+# ANATOMY: MIN_GENERALITY
+#   The fraction of an instruction's content vocabulary that must NOT come
+#   from the task it was distilled from. Why 0.6: the observed bug string
+#   scores 0.5 against its own near-duplicate phrasings (only the node name is
+#   novel; "pens" is not), and a genuine cross-task merge scores 1.0 because
+#   everything task-specific has already collapsed to a placeholder. 0.6 sits
+#   between those two measurements rather than between two intuitions.
+MIN_GENERALITY = 0.6
+
+_PLACEHOLDER = re.compile(r"<[A-Z]+>")
+# A placeholder, or a word long enough to be subject matter. Matched together
+# so a substitution can pass placeholders through untouched -- otherwise
+# "<NUMBER>" is seen as the word "NUMBER" and becomes eligible for stripping.
+_PLACEHOLDER_OR_WORD = re.compile(r"<[A-Z]+>|[A-Za-z][A-Za-z_-]{2,}")
+_WORD = re.compile(r"[a-z][a-z0-9_-]*")
+_NEXT_WORD = re.compile(r"\s*([A-Za-z]+)")
+# The literal kinds a stored instruction must never share with its own task.
+# TERM is absent on purpose: a shared proper noun is a leak worth scoring, but
+# a shared NUMBER is a wrong answer waiting to be handed to a later run.
+_LITERAL_KINDS = ("URL", "PATH", "DATE", "MONEY", "PERCENT", "QUOTED", "NUMBER")
+
+
+@dataclass(frozen=True, slots=True)
+class Abstraction:
+    """A task's shape, with its literals removed rather than recorded.
+
+    The literal VALUES are deliberately not a field. They exist only as local
+    variables inside `abstract`, so nothing that persists an `Abstraction` --
+    a skill's `task_pattern`, an evidence key -- can leak a literal by
+    construction. Closing the channel beats remembering to redact it.
+    """
+
+    template: str
+    slots: tuple[str, ...]
+    fingerprint: str
+
+
+def _keeps_literal(text: str, end: int) -> bool:
+    """Does the word after a number make the number part of the method?"""
+    match = _NEXT_WORD.match(text, end)
+    return match is not None and match.group(1).lower() in KEEP_AFTER
+
+
+def _is_method_phrase(phrase: str) -> bool:
+    """A capitalised phrase that is entirely method vocabulary is not a name.
+
+    Sentence case is the reason this exists: "Compute the total" opens with a
+    capital, and slotting it would delete the verb the instruction is about
+    while keeping the noun it is not.
+    """
+    words = phrase.lower().split()
+    return bool(words) and all(word in METHOD_LEXICON for word in words)
+
+
+@functools.lru_cache(maxsize=4096)
+def _scan(text: str) -> tuple[tuple[str, str, int, int], ...]:
+    """The one authoritative reading of where a text's literals are.
+
+    One pass, trying the slot patterns in declared order at each position, so
+    the result never depends on which pattern happened to be applied first --
+    which is what makes two phrasings of the same task produce the same
+    fingerprint on two different machines.
+
+    WHY EVERYTHING GOES THROUGH HERE. `literals` used to re-read the text with
+    its own independent `finditer` per pattern, and an independent read is a
+    read with no context: it cannot see that a NUMBER was skipped because the
+    word after it made it part of the method. So `"round to 2 decimal places"`
+    -- the exact phrasing `KEEP_AFTER` exists to protect -- yielded the literal
+    `2`, and any task that happened to contain a bare `2` had a correct
+    instruction refused for a leak that was never there. In `_distill` that is
+    swallowed by a blanket `except`, so the candidate simply vanished, and the
+    tasks most likely to trip it are the numeric, quantity-heavy ones this
+    module was written for. Two readings of one text is one reading too many.
+
+    Returns `(kind, matched text, start, end)` in order. A tuple because it is
+    cached, and a cached mutable would let one caller edit another's answer.
+    """
+    found: list[tuple[str, str, int, int]] = []
+    pos, end = 0, len(text)
+    while pos < end:
+        for kind, pattern in SLOTS:
+            match = pattern.match(text, pos)
+            if match is None:
+                continue
+            if kind == "NUMBER" and _keeps_literal(text, match.end()):
+                continue
+            if kind == "TERM" and _is_method_phrase(match.group(0)):
+                continue
+            found.append((kind, match.group(0), pos, match.end()))
+            pos = match.end()
+            break
+        else:
+            pos += 1
+    return tuple(found)
+
+
+@functools.lru_cache(maxsize=4096)
+def abstract(text: str) -> Abstraction:
+    """Replace every literal with a typed placeholder, left to right."""
+    pieces: list[str] = []
+    slots: list[str] = []
+    cursor = 0
+    for kind, _value, start, stop in _scan(text):
+        pieces.append(text[cursor:start])
+        pieces.append(f"<{kind}>")
+        slots.append(kind)
+        cursor = stop
+    pieces.append(text[cursor:])
+    template = "".join(pieces)
+    return Abstraction(
+        template=template,
+        slots=tuple(slots),
+        fingerprint=hashlib.sha256(template.encode("utf-8")).hexdigest()[:16],
+    )
+
+
+def _literal_forms(kind: str, value: str) -> set[str]:
+    """Every spelling of one literal that must count as the same literal.
+
+    A price is written three ways for the same money -- `$1.25`, `1.25 dollars`,
+    `1.25` -- and a leak check that compares only whole matches would let an
+    instruction restate the task's price in another notation and pass. So a
+    MONEY or PERCENT match also yields its bare numeric core, which is what
+    makes `"1.25"` in an instruction collide with `"1.25 dollars"` in the task.
+
+    This is the strictness the old per-pattern `finditer` had by accident (the
+    NUMBER pattern re-matched the digits inside a price). Kept on purpose here,
+    because losing it would open a leak; what is NOT kept is the context
+    blindness that came with it.
+    """
+    forms = {re.sub(r"[\s,]", "", value).lower()}
+    if kind in ("MONEY", "PERCENT"):
+        core = re.search(r"\d[\d,]*(?:\.\d+)?", value)
+        if core is not None:
+            forms.add(re.sub(r"[\s,]", "", core.group(0)))
+    return forms
+
+
+def literals(text: str) -> set[str]:
+    """Every literal value in a text, normalised for comparison.
+
+    Used to prove an instruction does not carry its source task's numbers.
+    Compared as whole tokens, never as substrings: `"2"` is not a leak of
+    `"1.25"` merely because the digit appears inside it. Read through `_scan`,
+    so a number the method owns -- `"round to 2 decimal places"` -- is not a
+    value at all and cannot be shared with anything.
+    """
+    found: set[str] = set()
+    for kind, value, _start, _stop in _scan(text):
+        if kind in _LITERAL_KINDS:
+            found |= _literal_forms(kind, value)
+    return found
+
+
+def shared_literals(instruction: str, source: str) -> set[str]:
+    """Literals present in BOTH an instruction and the task it came from."""
+    if not source.strip():
+        return set()
+    return literals(instruction) & literals(source)
+
+
+def strip_source_terms(text: str, source_texts: tuple[str, ...]) -> str:
+    """Replace the subject-matter words a step shares with its own task.
+
+    `abstract` cannot catch these: "pens" is a bare lowercase noun, structurally
+    indistinguishable from "total" without knowing what the task said. The
+    source text is what supplies that knowledge -- a word is subject matter
+    when it came from the task and is not method vocabulary.
+
+    Deliberately NOT applied to method or function words. A step reduced to
+    "<TERM> the <TERM> <TERM> of <NUMBER> <TERM>" teaches nothing, and the
+    point is to keep the verb while dropping the noun.
+    """
+    vocabulary: set[str] = set()
+    for source in source_texts:
+        vocabulary.update(_WORD.findall(source.lower()))
+    if not vocabulary:
+        return text
+
+    def replace(match: re.Match[str]) -> str:
+        token = match.group(0)
+        if token.startswith("<"):
+            return token
+        lowered = token.lower()
+        if lowered in METHOD_LEXICON or lowered in FUNCTION_WORDS:
+            return token
+        return "<TERM>" if lowered in vocabulary else token
+
+    stripped = _PLACEHOLDER_OR_WORD.sub(replace, text)
+    # A run of placeholders is one unknown, not several. Collapsing keeps the
+    # template stable when a task names the same thing in two words.
+    return re.sub(r"<TERM>(\s+<TERM>)+", "<TERM>", stripped)
+
+
+def render_pattern(template: str) -> str:
+    """`<NUMBER>` -> `slot_number`, so the retrieval tokenizer can see it.
+
+    `SkillLibrary.tokenize` matches `[a-z0-9_]+`, which drops angle brackets
+    and leaves the bare word "number" -- indistinguishable from a task that
+    genuinely says "number". A `slot_` prefix cannot collide with English.
+    """
+    return _PLACEHOLDER.sub(lambda m: f"slot_{m.group(0)[1:-1].lower()}", template)
+
+
+def merge_templates(a: str, b: str) -> str:
+    """What two abstracted steps have in common, with the rest collapsed.
+
+    Token-level longest common subsequence. Every non-matching run becomes one
+    `<TERM>`, so the result is literally what survived across two different
+    tasks rather than a heuristic guess at what might.
+
+        "compute the total cost of <NUMBER> pens at <MONEY> each"
+        "compute the total cost of <NUMBER> pencils at <MONEY> each"
+     -> "compute the total cost of <NUMBER> <TERM> at <MONEY> each"
+    """
+    left = [t if _PLACEHOLDER.fullmatch(t) else t.lower() for t in a.split()]
+    right = [t if _PLACEHOLDER.fullmatch(t) else t.lower() for t in b.split()]
+
+    rows, cols = len(left), len(right)
+    table = [[0] * (cols + 1) for _ in range(rows + 1)]
+    for i in range(rows - 1, -1, -1):
+        for j in range(cols - 1, -1, -1):
+            table[i][j] = (
+                table[i + 1][j + 1] + 1
+                if left[i] == right[j]
+                else max(table[i + 1][j], table[i][j + 1])
+            )
+
+    out: list[str] = []
+    i = j = 0
+    gap = False
+    while i < rows and j < cols:
+        if left[i] == right[j]:
+            if gap:
+                out.append("<TERM>")
+                gap = False
+            out.append(left[i])
+            i += 1
+            j += 1
+        elif table[i + 1][j] >= table[i][j + 1]:
+            gap = True
+            i += 1
+        else:
+            gap = True
+            j += 1
+    if gap or i < rows or j < cols:
+        out.append("<TERM>")
+    return " ".join(out)
+
+
+def content_tokens(text: str) -> list[str]:
+    """The words that carry subject matter: no placeholders, no method words.
+
+    Numbers are excluded because they are handled by `shared_literals`, which
+    refuses them outright rather than scoring them -- a shared number is never
+    acceptable at any generality.
+    """
+    without_slots = _PLACEHOLDER.sub(" ", text)
+    without_slots = re.sub(r"\bslot_[a-z]+\b", " ", without_slots.lower())
+    return [
+        token
+        for token in _WORD.findall(without_slots)
+        if token not in METHOD_LEXICON and token not in FUNCTION_WORDS
+    ]
+
+
+def generality(instruction: str, source_texts: tuple[str, ...]) -> float:
+    """Fraction of an instruction's content vocabulary NOT taken from its source.
+
+    1.0 when nothing subject-specific survives -- including when the
+    instruction is entirely method words and placeholders, which is the shape a
+    fully generalised step has. Scoring that 0.0 (nothing general because
+    nothing at all) would reject exactly the instructions this module exists
+    to produce.
+
+    The observed bug string scores 0.5 against its own two near-duplicate
+    phrasings: `calculate_pen_cost` is novel, `pens` is not.
+    """
+    tokens = content_tokens(instruction)
+    if not tokens:
+        return 1.0
+    vocabulary: set[str] = set()
+    for source in source_texts:
+        vocabulary.update(content_tokens(source))
+    novel = [token for token in tokens if token not in vocabulary]
+    return len(novel) / len(tokens)
+
+
+# A word, a literal placeholder, or a mark of punctuation. Punctuation is a
+# token here because it ENDS a noun phrase: "3 pens -- compute the total" must
+# not read "pens compute" as one phrase whose head is a verb.
+#
+# A dot only stays inside a word when a letter or digit follows it, so
+# `csv.dictreader` survives as one token while the full stop closing a sentence
+# is punctuation. Without that, `"...the total cost."` ends in the word
+# `"cost."`, which is not `"cost"`, so it is not method vocabulary, so a
+# trailing full stop mints a second task shape.
+_SHAPE_TOKEN = re.compile(r"<[A-Z]+>|[a-z][a-z0-9_'-]*(?:\.[a-z0-9_'-]+)*|[^\w\s]")
+
+
+@dataclass(frozen=True, slots=True)
+class TaskShape:
+    """What a task DOES, read off its structure rather than its wording.
+
+    Three parts, each answering a different question, and none of them holding
+    a word the task could not have shared with any other task on the subject:
+
+      slots     the SEQUENCE of literal kinds. Ordered, because rebinding one
+                task's stored artefacts onto another's literals is only
+                well-defined when the two carry the same kinds in the same
+                order.
+      subjects  the head nouns of the task's noun phrases, minus method
+                vocabulary. What the question is ABOUT.
+      actions   the method vocabulary the task uses. What the question DOES to
+                its subject.
+    """
+
+    slots: tuple[str, ...]
+    subjects: tuple[str, ...]
+    actions: tuple[str, ...]
+
+    @property
+    def signature(self) -> str:
+        """The evidence bar's unit: subject matter plus the kinds of literal."""
+        payload = (
+            f"{'|'.join(sorted(set(self.slots)))}"
+            f"||{'|'.join(sorted(set(self.subjects)))}"
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+    @property
+    def fingerprint(self) -> str:
+        """The near-match index: the same work on a different subject.
+
+        Subjects appear only as a COUNT. That is the whole difference from
+        `signature`: pens and pencils are two different questions (two pieces
+        of evidence) and one shape of work (one memo, rebindable from either
+        onto the other).
+        """
+        payload = (
+            f"{'|'.join(self.slots)}"
+            f"||{'|'.join(sorted(set(self.actions)))}"
+            f"||{len(set(self.subjects))}"
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _head(run: list[str]) -> str:
+    """The last content word of a noun phrase -- the noun the rest modifies.
+
+    Taking the head rather than the whole run is what makes "the total cost"
+    and "the overall cost" one shape: an adjective swapped in front of a noun
+    changes how the question reads and not what it is about.
+    """
+    return run[-1] if run else ""
+
+
+@functools.lru_cache(maxsize=4096)
+def task_shape(task: str) -> TaskShape:
+    """Read a task's structure: its literals, its subjects, its method.
+
+    ANATOMY: why position and not a word list
+      The previous rule counted every content token as subject matter and
+      subtracted a list of words that did not count. A list is a blocklist, and
+      a blocklist loses: `just`, `now`, `quickly`, `simply` and `approximately`
+      each minted a second task shape until someone noticed and added it, and
+      the supply of filler adverbs is not finite. English has no closed class
+      of them to enumerate.
+
+      What IS closed is the set of words that open a noun phrase -- determiners
+      and prepositions -- so this asks where a word sits instead of what it is.
+      Subject matter is the HEAD of a phrase introduced by one of those or by a
+      literal ("<NUMBER> pens"). An adverb dropped in front of the verb, at the
+      end of the sentence, or between the two sits in no phrase at all and is
+      never read, whatever it happens to be spelled.
+
+    ANATOMY: which way it fails
+      Toward collapsing, deliberately, exactly as before. A determiner-less
+      fronted noun phrase ("Pens: compute the total cost of 3 at 1.25 each")
+      contributes no subject, so it does NOT collapse onto the ordinary
+      phrasing -- that is the one residual split this rule still has, and it
+      costs a promotion that does not happen rather than a bar that can be
+      farmed by rewording. A clause-initial run is not read as a phrase because
+      an unknown VERB starts one too ("determine the total cost..."), and
+      reading those as subjects would let a synonym for "compute" mint the
+      second shape -- the cheapest farm of all.
+    """
+    # Whitespace and case folded HERE rather than by importing `memo.normalise`
+    # -- this module deliberately imports nothing from swarmd, and borrowing
+    # the memo's key discipline is what produced the defect above. Casefolding
+    # first also means TERM never fires on a task, so a re-typed capital
+    # cannot become a second shape.
+    template = abstract(" ".join(task.split()).casefold()).template
+    slots: list[str] = []
+    subjects: list[str] = []
+    actions: list[str] = []
+    run: list[str] = []
+    # Is the phrase being accumulated one that a determiner, a preposition or a
+    # literal opened? Only those are read; anything else is discarded on flush.
+    introduced = False
+
+    def flush() -> None:
+        head = _head(run)
+        if introduced and head and head not in METHOD_LEXICON:
+            subjects.append(head)
+        run.clear()
+
+    for token in _SHAPE_TOKEN.findall(template):
+        if token.startswith("<"):
+            flush()
+            slots.append(token[1:-1])
+            introduced = True
+        elif token in INTRODUCERS:
+            flush()
+            introduced = True
+        elif token in FUNCTION_WORDS or not token[0].isalpha():
+            # Grammar that does not open a phrase, or punctuation. Both END the
+            # phrase in progress without starting one.
+            flush()
+            introduced = False
+        else:
+            if token in METHOD_LEXICON:
+                actions.append(token)
+            run.append(token)
+    flush()
+    return TaskShape(tuple(slots), tuple(subjects), tuple(actions))
+
+
+def task_signature(task: str) -> str:
+    """What a task is ABOUT, as a fingerprint. The unit the evidence bar counts.
+
+    ANATOMY: why not the abstracted sentence
+      The evidence bar (`skills.MIN_DISTINCT_TASKS`) exists to tell "this
+      approach transfers" from "this is one task drawn twice". It was keyed on
+      `abstract(memo.normalise(task)).fingerprint` -- the abstracted SENTENCE,
+      hashed. That inherits `memo.normalise`'s deliberate property, stated in
+      its own docstring: "a paraphrase MISSES, and that is the correct
+      outcome". Correct for an exact-match cache, where a miss costs six
+      proposer calls. Exactly wrong here, where a miss MANUFACTURES the second
+      piece of evidence: asking the same question twice, once with "please"
+      and "for me" around it, produced two fingerprints and pushed a candidate
+      to a human as if a second, independent task had confirmed it.
+
+      So the signature is not the sentence. It is the pair that survives
+      rewording: the SUBJECT MATTER (`TaskShape.subjects` -- the head nouns of
+      the task's noun phrases, order-independent) and the KINDS OF LITERAL the
+      question carries. "Compute the total cost of 3 pens at 1.25 dollars
+      each", "please just compute the total cost of 3 pens at 1.25 dollars
+      each for me quickly" and "AT 1.25 DOLLARS EACH, 3 PENS -- COMPUTE THE
+      TOTAL COST" are one task: subject `{pens}`, literals `{MONEY, NUMBER}`.
+
+    ANATOMY: which way it fails
+      Deliberately toward collapsing. Two genuinely different questions about
+      the same subject with the same literal kinds ("count the pens" / "list
+      the pens") share a signature, and the cost of that is a promotion that
+      does not happen -- a candidate keeps accruing evidence and no human is
+      asked yet. The opposite error, splitting one task into two shapes, is
+      the farming channel itself. Method verbs are excluded from the subject
+      for the same reason: including them would let a synonym swap
+      ("compute" -> "calculate") mint a second task shape.
+
+      Not a hash of anything readable: the fingerprint is stored on a Skill,
+      and the same minimisation that keeps literals out of `instruction` and
+      `task_pattern` keeps the task's own words out of its evidence.
+    """
+    return task_shape(task).signature
+
+
+def abstract_fingerprint(task: str) -> str:
+    """The index for "a task of the same SHAPE", not the same subject.
+
+    `task_signature` splits pens from pencils, because two subjects are two
+    pieces of evidence. This joins them, because one stored criterion and plan
+    can serve both once its literals are rebound -- which is the whole of the
+    memo's near-match tier. Nothing is served on a fingerprint match alone:
+    see `swarm/run.py`, where the rebound criterion is re-attacked against the
+    new task before it may grade anything.
+    """
+    return task_shape(task).fingerprint
+
+
+def literal_map(source: str, target: str) -> tuple[tuple[str, str], ...] | None:
+    """How to read one task's literals as another's, or None if they cannot be.
+
+    Positional and kind-checked: the Nth literal of the source becomes the Nth
+    literal of the target, and only when every kind matches in order. Anything
+    looser would rewrite a date into a price. `None` means "these two tasks do
+    not line up", which is the answer that makes the caller pay for its own
+    synthesis rather than guess.
+
+    Longest source form first, so `"1.25 dollars"` is rewritten before the
+    `"1.25"` inside it and the currency word is not left stranded.
+    """
+    src = [(kind, value) for kind, value, _s, _e in _scan(source)]
+    tgt = [(kind, value) for kind, value, _s, _e in _scan(target)]
+    if [k for k, _ in src] != [k for k, _ in tgt]:
+        return None
+    pairs: dict[str, str] = {}
+    for (kind, old), (_kind, new) in zip(src, tgt, strict=True):
+        pairs[old] = new
+        if kind in ("MONEY", "PERCENT"):
+            # The bare numeric core, so a criterion that wrote the price
+            # without its currency word is rebound too -- the same notation
+            # equivalence `_literal_forms` enforces on the leak check.
+            old_core = re.search(r"\d[\d,]*(?:\.\d+)?", old)
+            new_core = re.search(r"\d[\d,]*(?:\.\d+)?", new)
+            if old_core is not None and new_core is not None:
+                pairs.setdefault(old_core.group(0), new_core.group(0))
+    return tuple(sorted(pairs.items(), key=lambda p: -len(p[0])))
+
+
+def rebind(text: str, mapping: tuple[tuple[str, str], ...]) -> str:
+    """Rewrite one task's literals as another's, matching whole tokens only.
+
+    Whole tokens for the same reason `literals` compares them that way: `"2"`
+    inside `"1.25"` is not the number 2, and a substring rewrite would turn a
+    price into rubble.
+    """
+    for old, new in mapping:
+        text = re.sub(rf"(?<![\w.]){re.escape(old)}(?![\w.])", new, text)
+    return text

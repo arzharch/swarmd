@@ -412,3 +412,44 @@ def test_cost_estimation_happens_before_the_call():
 def test_unknown_agents_raise_rather_than_silently_passing():
     with pytest.raises(KeyError):
         Economy().get("nobody")
+
+
+# --- retrieval must not be defeated by a plural ------------------------------
+
+
+def test_a_plural_does_not_hide_an_on_topic_skill(library):
+    """The shape rule compares method vocabulary as a SET, and sets are exact.
+
+    A skill distilled from "parse csv tabular files" refused the task "parse a
+    csv file of tabular data" because `files` and `file` are different strings.
+    A rule a plural can defeat is not a rule about meaning, and this is the
+    class of failure that only shows up in front of real traffic.
+    """
+    skill = _propose(library, name="csv", pattern="parse csv tabular files",
+                     instruction="use csv.DictReader with an explicit dialect")
+    library.approve(skill.skill_id, actor="r")
+
+    for query in (
+        "parse a csv file of tabular data",     # pattern plural, task singular
+        "parse csv files of tabular data",      # both plural
+    ):
+        assert library.retrieve(query), f"withheld an on-topic skill for {query!r}"
+
+
+def test_plural_folding_does_not_merge_unrelated_words(library):
+    """The fold is three plural rules, not a stemmer.
+
+    A general stemmer also folds tense and derivation, which would quietly
+    widen retrieval -- "compute" and "computation" are not the same claim.
+    These are the words a naive `rstrip("s")` breaks.
+    """
+    from swarmd.swarm.skills import _stem
+
+    # Singular words that merely end in s must survive intact.
+    for word in ("process", "address", "class", "css", "abs", "ops", "data"):
+        assert _stem(word) == word, f"{word!r} was wrongly treated as a plural"
+
+    # Genuine plurals fold to their singular.
+    assert _stem("files") == "file"
+    assert _stem("queries") == "query"
+    assert _stem("boxes") == "box"
