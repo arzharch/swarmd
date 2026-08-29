@@ -601,6 +601,11 @@ class ProviderPool(Provider):
         # run so its events reach the run's stream; a pool built without one
         # still works and simply waits without narrating.
         self.pacer = pacer if pacer is not None else Pacer()
+        # While parked, the pacer asks this each heartbeat. Without it a pause
+        # entered on one provider's clock sleeps through another provider's
+        # recovery -- observed live: a run parked on a Google slice 49 minutes
+        # out while OpenRouter had 350 requests free in its own sitting.
+        self.pacer.can_resume = self._capacity_available
 
     async def _ensure_quota_configured(self) -> None:
         """Seed each credential's bucket from its published limit, once.
@@ -1011,6 +1016,36 @@ class ProviderPool(Provider):
             await asyncio.sleep(sleep_for)
 
     # -- introspection ------------------------------------------------------
+
+    def _capacity_available(self) -> bool:
+        """Could any slot serve a call right now? Reserves nothing.
+
+        Deliberately side-effect free: it runs on the heartbeat while agents
+        are parked, and taking a reservation here would let the probe itself
+        consume the capacity it is reporting. It also errs toward False -- the
+        cost of a missed early wake is finishing at the original estimate,
+        while the cost of a false positive is waking every agent into the same
+        refusal and spinning.
+        """
+        now = time.time()
+        for slot in self._slots:
+            if self.budget.blocked(slot.spec.name, now=now):
+                continue
+            throttle, _ = self.budget.throttled(slot.spec.name, now=now)
+            if throttle:
+                continue
+            envelope = self.ration.envelope(
+                slot.spec.name, credential=slot.credential_id, now=now
+            )
+            if not envelope.get("rationed"):
+                return True  # no day to spread; the minute bucket governs it
+            for dimension in ("requests", "tokens"):
+                cap = envelope.get(f"envelope_{dimension}")
+                if cap is not None and envelope[f"used_{dimension}"] >= cap:
+                    break
+            else:
+                return True
+        return False
 
     def _declared_day(self, provider: str) -> Any:
         """What the table claims, so a correction can name what it corrected.

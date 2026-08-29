@@ -299,3 +299,47 @@ async def test_time_spent_parked_is_counted(pacer):
         provider="p", reason="session_ration"
     )._value.get()
     assert after > before
+
+
+# --- waking on recovered capacity --------------------------------------------
+
+
+async def test_a_pause_ends_early_when_another_provider_recovers(pacer):
+    """OBSERVED LIVE. A run parked on a Google slice 49 minutes out while
+    OpenRouter had 350 requests free in its own sitting. The pause is entered
+    on ONE provider's clock, and that is not the soonest moment ANY provider
+    can serve."""
+    recovered = {"yet": False}
+    pacer.can_resume = lambda: recovered["yet"]
+
+    task = asyncio.create_task(pacer.park(cause(seconds=3600), agent_id="a0001"))
+    await asyncio.sleep(0.05)
+    assert not task.done(), "parked agent was released before capacity returned"
+
+    recovered["yet"] = True
+    await asyncio.wait_for(task, timeout=2.0)
+
+
+async def test_the_early_wake_is_announced(pacer):
+    events = []
+    pacer.emit = events.append
+    pacer.can_resume = lambda: True
+    await pacer.park(cause(seconds=3600))
+    assert any(e["kind"] == "pace_woken_early" for e in events)
+
+
+async def test_a_probe_that_raises_leaves_the_pause_intact(pacer):
+    """The probe runs inside the ticker. One that raises would kill the
+    heartbeat, and the ticker's `finally` would wake the run into the same
+    refusal it just parked on."""
+    def explode():
+        raise RuntimeError("budget unreadable")
+
+    pacer.can_resume = explode
+    await asyncio.wait_for(pacer.park(cause(seconds=0.05)), timeout=3.0)
+
+
+async def test_no_probe_means_the_original_estimate_stands(pacer):
+    """A pool built without one still waits correctly."""
+    assert pacer.can_resume is None
+    await asyncio.wait_for(pacer.park(cause(seconds=0.05)), timeout=3.0)

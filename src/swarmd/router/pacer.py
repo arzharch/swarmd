@@ -161,6 +161,14 @@ class Pacer:
     on_pause: Any = None
     on_resume: Any = None
     no_wait: bool = False
+    # Asked once per heartbeat while parked: "can anything serve now?". The
+    # pause is entered on ONE provider's clock -- whichever refused with the
+    # soonest recovery -- and that is not the same as the soonest moment ANY
+    # provider can serve. A different provider's sitting rolling over, a minute
+    # bucket refilling, or an operator adding a credential all restore capacity
+    # without touching the ETA the pause was built from, and the run would go
+    # on sleeping through it.
+    can_resume: Any = None
     heartbeat_s: float = HEARTBEAT_S
     # Overshoot past the predicted opening before retrying. A field rather than
     # the bare constant for the same reason `heartbeat_s` is one: waking exactly
@@ -277,6 +285,14 @@ class Pacer:
                 if remaining <= self.heartbeat_s:
                     await asyncio.sleep(
                         remaining + random.uniform(0, WAKE_JITTER * remaining)
+                    )
+                    break
+                if self._capacity_returned():
+                    self._publish(
+                        "pace_woken_early",
+                        self.cause,
+                        waited_s=round(time.time() - self.paused_since, 1),
+                        expected_s=round(remaining, 1),
                     )
                     break
                 self._publish(
@@ -396,6 +412,22 @@ class Pacer:
             self.emit({"kind": kind, **payload})
         except Exception:
             logger.debug("pacer event sink raised; continuing", exc_info=True)
+
+    def _capacity_returned(self) -> bool:
+        """Whether the pool says it could serve now. False on any doubt.
+
+        Guarded because this runs inside the ticker: a probe that raises would
+        kill the heartbeat, and the ticker's `finally` would wake the run into
+        the same refusal it just parked on. Waiting out the original estimate
+        is the safe wrong answer; spinning is not.
+        """
+        if self.can_resume is None:
+            return False
+        try:
+            return bool(self.can_resume())
+        except Exception:  # a probe must not end the pause
+            logger.debug("capacity probe raised; staying parked", exc_info=True)
+            return False
 
     def _safely(self, hook: Any, cause: PauseCause | None) -> None:
         """Run a pause hook without letting it end the run.
