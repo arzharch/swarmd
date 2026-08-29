@@ -28,6 +28,7 @@ import {
   ReviewPanel,
   SessionPanel,
 } from "@/components/control";
+import { ForecastBanner, PauseBanner } from "@/components/pace";
 import { Rail, TopBar, VIEWS, type ViewId } from "@/components/shell";
 import { useRunStream } from "@/lib/useRunStream";
 import type {
@@ -236,16 +237,27 @@ export default function Dashboard() {
               and <code>swarmd eval</code> will refuse to report from them.
             </div>
           )}
-          {stream.preflight && !stream.preflight.fits && (
-            <div className="banner warn" role="status">
-              <strong>This run will not fit today.</strong> It needs about{" "}
-              {stream.preflight.estimated_calls.toLocaleString()} provider
-              requests and{" "}
-              {stream.preflight.remaining_today.toLocaleString()} remain — short
-              by {stream.preflight.shortfall.toLocaleString()}. It will exhaust
-              the budget and stop partway. Lower the agent count, or wait for
-              the daily quotas to reset.
-            </div>
+          {/* Live pause first: while the run is parked it is the only thing
+              distinguishing this screen from a hung one. */}
+          {stream.pause && <PauseBanner pause={stream.pause} />}
+          {/* The forecast supersedes the flat "does not fit" verdict below,
+              which was written when running out meant failing rather than
+              pausing. Kept as the fallback for a pool that cannot forecast. */}
+          {stream.preflight?.forecast ? (
+            <ForecastBanner forecast={stream.preflight.forecast} />
+          ) : (
+            stream.preflight &&
+            !stream.preflight.fits && (
+              <div className="banner warn" role="status">
+                <strong>This run will not fit today.</strong> It needs about{" "}
+                {stream.preflight.estimated_calls.toLocaleString()} provider
+                requests and{" "}
+                {stream.preflight.remaining_today.toLocaleString()} remain —
+                short by {stream.preflight.shortfall.toLocaleString()}. It will
+                exhaust the budget and stop partway. Lower the agent count, or
+                wait for the daily quotas to reset.
+              </div>
+            )
           )}
           {stream.preflight && stream.preflight.fits &&
             (stream.preflight.fraction_of_remaining ?? 0) > 0.25 && (

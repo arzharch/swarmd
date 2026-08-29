@@ -6,6 +6,7 @@ import type {
   AgentState,
   ConnectionState,
   CriterionView,
+  PauseView,
   PlanView,
   SwarmEvent,
   Thought,
@@ -51,6 +52,16 @@ interface StreamState {
   batches: SwarmEvent[];
   /** Cost of this run against the remaining budget, known before it starts. */
   preflight: Preflight | null;
+  /**
+   * Set while the run is parked on a spent provider ration.
+   *
+   * A paused run and a hung one look identical from here -- no events, no
+   * errors, nothing finishing -- so without this the dashboard's honest
+   * rendering of a working run is a blank screen for hours.
+   */
+  pause: PauseView | null;
+  /** Pauses this run has already come back from, newest last. */
+  pauseHistory: PauseView[];
 }
 
 const EMPTY: StreamState = {
@@ -65,6 +76,8 @@ const EMPTY: StreamState = {
   chaosEvents: [],
   batches: [],
   preflight: null,
+  pause: null,
+  pauseHistory: [],
 };
 
 function reduce(state: StreamState, event: SwarmEvent): StreamState {
@@ -175,8 +188,54 @@ function reduce(state: StreamState, event: SwarmEvent): StreamState {
       ];
       break;
 
+    // The pause. Every one of these carries the numbers, so the banner can say
+    // "groq, 225 of 225 requests this session, back at 18:40" rather than the
+    // "waiting for capacity" that nobody can act on.
+    case "run_paused":
+    case "run_pause_updated":
+      next.pause = event as unknown as PauseView;
+      next.runStatus = "paused";
+      break;
+
+    // The heartbeat. Its only job is to keep the countdown honest and prove the
+    // backend is still there; a pause with no tick is indistinguishable from a
+    // dropped socket.
+    case "pace_waiting":
+      next.pause = state.pause
+        ? { ...state.pause, ...(event as unknown as Partial<PauseView>) }
+        : (event as unknown as PauseView);
+      break;
+
+    case "run_resumed":
+      next.pauseHistory = state.pause
+        ? [
+            ...state.pauseHistory,
+            { ...state.pause, ...(event as unknown as Partial<PauseView>) },
+          ].slice(-50)
+        : state.pauseHistory;
+      next.pause = null;
+      next.runStatus = "running";
+      break;
+
+    // The ETA has stopped meaning anything: the run keeps being told it will
+    // resume and keeps not resuming. Surfaced because the alternative is a
+    // countdown that silently resets forever.
+    case "pace_stalled":
+      next.pause = state.pause
+        ? { ...state.pause, reason: "stalled" }
+        : (event as unknown as PauseView);
+      break;
+
+    // --no-wait was set and the ration was spent. The run stops rather than
+    // parks, so this is terminal.
+    case "run_pace_refused":
+      next.pause = event as unknown as PauseView;
+      next.runStatus = "paced_out";
+      break;
+
     case "run_finished":
       next.runStatus = String(event.status ?? "finished");
+      next.pause = null;
       break;
 
     case "run_failed":

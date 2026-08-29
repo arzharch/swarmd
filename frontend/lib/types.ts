@@ -325,4 +325,51 @@ export interface Preflight {
   fits: boolean;
   shortfall: number;
   fraction_of_remaining: number | null;
+  forecast?: Forecast;
+}
+
+/**
+ * When this run's calls will actually be spent.
+ *
+ * A yes/no verdict was the right shape when running out meant failing. Now
+ * that a run pauses and resumes, "does not fit today" covers both "finishes
+ * this evening after one pause" and "spans three days", and only the second is
+ * a reason not to press the button.
+ */
+export interface Forecast {
+  verdict:
+    | "fits_this_session"
+    | "fits_today_with_pauses"
+    | "spans_days"
+    | "exceeds_horizon";
+  estimated_calls: number;
+  sessions_needed: number;
+  expected_pauses: number;
+  /** Unix seconds, or null when the run never has to stop. */
+  first_pause_at: number | null;
+  projected_finish: number | null;
+  session_capacity: number;
+}
+
+/**
+ * Why the run is waiting, carrying the numbers rather than a sentence so every
+ * surface renders the same fact its own way. A pause reported as "waiting for
+ * capacity" is a pause nobody can act on.
+ */
+export interface PauseView {
+  reason: string;
+  provider: string;
+  credential: string;
+  /** Which ceiling was reached: "requests" or "tokens". */
+  dimension: string;
+  used: number;
+  envelope: number;
+  /** Unix seconds. */
+  resumes_at: number;
+  resumes_in_s: number;
+  human: string;
+  waiting_agents?: number;
+  checkpoint_path?: string;
+  /** Set once the run has come back; seconds actually spent parked. */
+  paused_for_s?: number;
 }
