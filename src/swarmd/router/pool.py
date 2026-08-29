@@ -810,36 +810,50 @@ class ProviderPool(Provider):
                     )
                     return resp
 
-            # RATION PAUSE, checked before the short-wait path. A spent
-            # session ration is not an outage and not a backoff: the capacity
-            # exists and belongs to a later slot, so the honest response is to
-            # wait for that slot rather than to fail a run that could finish.
+            # Reaching here means nothing served this pass. There are three
+            # kinds of wait available and they differ by ORDERS OF MAGNITUDE, so
+            # the choice between them is the whole decision:
             #
-            # This is deliberately NOT bounded by max_wait_s. That deadline
-            # exists for transient unavailability measured in seconds; a
-            # session boundary is measured in hours, and applying a 30-second
-            # patience to a 4-hour wait would turn "come back later" into "this
-            # run cannot complete", which is the outcome the whole module
-            # exists to prevent.
-            if ration_waits and not any(s.state.available() for s in ordered):
+            #   backoff   seconds   a provider is throttling us
+            #   quota     seconds   the minute bucket needs to refill
+            #   ration    hours     this session's share of the day is spent
+            #
+            # Short waits are tried first: if a bucket refills in four seconds
+            # there is no reason to park until the next session. Only when
+            # nothing short will help does the run park.
+            waits = [s.state.wait_s() for s in ordered if not s.state.available()]
+            waits.extend(quota_waits)
+            waits = [w for w in waits if w != float("inf")]
+            now = time.monotonic()
+            short_wait = min(waits) if waits else None
+
+            # RATION PAUSE. A spent session ration is not an outage and not a
+            # backoff: the capacity exists and belongs to a later slot, so the
+            # honest response is to wait for that slot rather than fail a run
+            # that could finish.
+            #
+            # Deliberately NOT bounded by max_wait_s. That deadline exists for
+            # transient unavailability measured in seconds; a session boundary
+            # is measured in hours, and applying a 30-second patience to a
+            # 4-hour wait would turn "come back later" into "this run cannot
+            # complete" -- the outcome this module exists to prevent.
+            #
+            # The condition is deliberately NOT "no slot is available". A slot
+            # refused by the ration is still available in the backoff sense, so
+            # that test never fired and the run raised NoCapacity while sitting
+            # on capacity it was merely too early to spend.
+            if ration_waits and (short_wait is None or now + short_wait >= deadline):
                 # The soonest returning capacity across every refused provider.
                 # Waiting for the latest would idle through openings.
                 soonest = min(ration_waits, key=lambda c: c.resumes_at)
                 await self.pacer.park(soonest, agent_id=agent_id)
                 # Woken: re-enter the loop and re-evaluate from scratch. The
-                # ration may have refilled, another provider may have recovered,
-                # or the operator may have unlocked capacity -- none of which
-                # this frame's stale decisions know about.
+                # ration may have refilled, another provider may have
+                # recovered, or the operator may have unlocked capacity --
+                # none of which this frame's stale decisions know about.
                 deadline = time.monotonic() + self.max_wait_s
                 continue
 
-            # Nothing usable right now. Wait for the soonest opening -- from
-            # either a backoff expiring or a quota bucket refilling -- if that
-            # fits inside the deadline.
-            waits = [s.state.wait_s() for s in ordered if not s.state.available()]
-            waits.extend(quota_waits)
-            waits = [w for w in waits if w != float("inf")]
-            now = time.monotonic()
             if not waits or now >= deadline:
                 detail = "; ".join(errors[-5:])
                 if ration_waits:
