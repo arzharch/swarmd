@@ -757,6 +757,17 @@ class ProviderPool(Provider):
                     errors.append(f"{slot.spec.name}: {blocked}")
                     continue
 
+                # A SELF-REFILLING window that is momentarily full is a wait,
+                # not a refusal. It used to be neither: `blocked` returned
+                # "minute budget exhausted" and this gate skipped the provider
+                # outright, so one busy minute took a workhorse out of routing
+                # and the run reported "no provider capacity" while three
+                # providers had a day's worth left between them.
+                throttle, resets_in = self.budget.throttled(slot.spec.name)
+                if throttle:
+                    quota_waits.append(resets_in)
+                    continue
+
                 # RATION gate. The budget gate above asks whether the DAY has
                 # anything left; this asks whether this six-hour session does.
                 # Without it a single run empties a day in an afternoon and the

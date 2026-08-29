@@ -82,6 +82,18 @@ WINDOWS: dict[str, float] = {
 # long one, and an operator reading top-down should meet it first.
 WINDOW_ORDER = ("month", "week", "day", "session", "hour", "minute")
 
+# Windows whose exhaustion means the provider has nothing left to give on any
+# timescale a call can wait for. These are the ones that should remove a
+# provider from routing and zero its contribution to "what is left today".
+#
+# The rest -- session, hour, minute -- refill on their own. Treating them the
+# same way was a real and expensive bug: one busy minute made `blocked` report
+# "minute budget exhausted", `remaining_today` skipped the provider entirely,
+# and a preflight announced "0 left today" against 940 genuinely available
+# requests. The run then proceeded on that false warning and failed.
+DAY_SCALE_WINDOWS = ("month", "week", "day")
+SHORT_WINDOWS = ("session", "hour", "minute")
+
 
 def _pacific_offset(now: datetime) -> timedelta:
     """US Pacific offset without a tzdata dependency.
@@ -615,6 +627,13 @@ class UsageJournal:
         self._lock = threading.Lock()
         self._rows: list[UsageRow] = []
         self._loaded = False
+        # Size and mtime as of the last load. The cache used to be
+        # load-once-forever, which is wrong the moment a second process shares
+        # the journal -- and that is the normal case here: a long-lived
+        # `swarmd serve` plus somebody running the CLI. The server would ration
+        # against a snapshot taken at boot and never see a request the CLI
+        # spent.
+        self._stat: tuple[int, float] = (-1, -1.0)
         # Whether the last append reached the disk. The ration gate reads it and
         # refuses rather than admitting: in-memory accounting is enough to keep
         # a report honest, but a ration that forgets a restart's worth of spend
@@ -623,9 +642,21 @@ class UsageJournal:
 
     # -- reading --------------------------------------------------------
 
+    def _fingerprint(self) -> tuple[int, float]:
+        try:
+            info = self.path.stat()
+        except OSError:
+            return (-1, -1.0)
+        return (info.st_size, info.st_mtime)
+
     def load(self) -> list[UsageRow]:
-        if self._loaded:
+        # One stat per read, against a file another process may be appending
+        # to. Not a substitute for RedisRation when replicas share a credential
+        # -- a stat cannot make read-then-write atomic -- but it is the
+        # difference between "eventually correct" and "wrong until restart".
+        if self._loaded and self._fingerprint() == self._stat:
             return self._rows
+        self._loaded = False
         rows: list[UsageRow] = []
         try:
             raw = self.path.read_text(encoding="utf-8") if self.path.exists() else ""
@@ -649,6 +680,7 @@ class UsageJournal:
                     logger.warning("skipping unreadable usage row in %s", self.path)
         self._rows = rows
         self._loaded = True
+        self._stat = self._fingerprint()
         return self._rows
 
     def rows_since(self, cutoff: float) -> list[UsageRow]:
@@ -714,6 +746,10 @@ class UsageJournal:
                 with self.path.open("a", encoding="utf-8") as handle:
                     handle.write(row.to_json() + "\n")
                 self.last_write_ok = True
+                # Our own row is already in `_rows`; adopt the new fingerprint
+                # so this append does not read as someone else's change and
+                # force a full reload on the next query.
+                self._stat = self._fingerprint()
             except OSError as exc:
                 # In-memory accounting continues. Losing durability degrades
                 # the month view after a restart; refusing the call would stop
@@ -727,6 +763,11 @@ class UsageJournal:
         now = now if now is not None else time.time()
         cutoff = now - keep_s
         with self._lock:
+            # Re-read immediately before rewriting. Compaction replaces the
+            # whole file from this process's view, so a stale view silently
+            # DELETES every row another process appended since we loaded --
+            # data loss dressed as maintenance, and invisible afterwards.
+            self._loaded = False
             rows = self.load()
             keep = [row for row in rows if row.ts >= cutoff]
             dropped = len(rows) - len(keep)
@@ -740,6 +781,7 @@ class UsageJournal:
                     "".join(row.to_json() + "\n" for row in keep), encoding="utf-8"
                 )
                 tmp.replace(self.path)
+                self._stat = self._fingerprint()
             except OSError as exc:
                 logger.warning("usage journal compaction failed: %s", exc)
             return dropped
@@ -966,7 +1008,13 @@ class BudgetTracker:
             )
         return worst
 
-    def blocked(self, provider: str, *, now: float | None = None) -> str:
+    def blocked(
+        self,
+        provider: str,
+        *,
+        now: float | None = None,
+        include_short: bool = False,
+    ) -> str:
         """Why this provider cannot take a call right now, or "".
 
         Returns the FIRST binding window rather than a list: an operator acting
@@ -986,11 +1034,28 @@ class BudgetTracker:
         grant = self.grant_state(provider, now=now)
         if grant and grant["exhausted"]:
             return "grant exhausted"
-        for window in WINDOW_ORDER:
+        windows = WINDOW_ORDER if include_short else DAY_SCALE_WINDOWS
+        for window in windows:
             state = self.window_state(provider, window, now=now)
             if state.exhausted:
                 return f"{window} budget exhausted"
         return ""
+
+    def throttled(
+        self, provider: str, *, now: float | None = None
+    ) -> tuple[str, float]:
+        """A self-refilling window that is full right now, and the wait for it.
+
+        Separate from `blocked` because the answers differ: a spent day means
+        route elsewhere, a spent minute means wait a moment. Collapsing them
+        threw away most of a day's capacity every time one minute filled up.
+        """
+        now = now if now is not None else time.time()
+        for window in SHORT_WINDOWS:
+            state = self.window_state(provider, window, now=now)
+            if state.exhausted:
+                return f"{window} budget full", max(0.0, state.resets_in_s)
+        return "", 0.0
 
     def report(self, provider: str, *, now: float | None = None) -> dict[str, Any]:
         spec = self.budgets.get(provider)

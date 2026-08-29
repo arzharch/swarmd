@@ -128,7 +128,7 @@ def test_saving_is_atomic(tmp_path):
 def test_provenance_is_recorded_for_forensics(library):
     """When a skill turns out harmful, 'what else came from that run' must be answerable."""
     skill = library.propose(
-        name="n", task_pattern="p", instruction="i",
+        name="n", task_pattern="p", instruction="use json.loads on the reply",
         run_id="run-42", criterion_hash="abc123",
     )
     assert skill.provenance_run == "run-42"
@@ -194,10 +194,10 @@ def test_idf_stops_common_words_dominating(library):
     """Otherwise retrieval degenerates to 'whichever skill has the most words'."""
     for i in range(5):
         s = _propose(library, name=f"n{i}", pattern=f"parse data format {i}",
-                     instruction="x")
+                     instruction="use csv.DictReader here")
         library.approve(s.skill_id, actor="r")
     special = _propose(library, name="special", pattern="parse quaternion payloads",
-                       instruction="x")
+                       instruction="use csv.DictReader here")
     library.approve(special.skill_id, actor="r")
 
     assert library.retrieve("parse quaternion payloads")[0].skill_id == (
@@ -247,8 +247,8 @@ def test_pruning_spares_skills_with_thin_evidence(library):
 
 
 def test_stats_summarise_the_library(library):
-    a = _propose(library, name="a", instruction="one")
-    _propose(library, name="b", instruction="two")
+    a = _propose(library, name="a", instruction="use csv.DictReader here")
+    _propose(library, name="b", instruction="use json.loads on the reply")
     library.approve(a.skill_id, actor="r")
     stats = library.stats()
     assert stats["total"] == 2

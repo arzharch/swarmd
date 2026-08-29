@@ -203,6 +203,10 @@ def main(argv: list[str] | None = None) -> int:
     swarm_session.add_argument("--profile", default="smoke",
                                choices=["smoke", "standard", "deep", "eval"])
     swarm_session.add_argument("--skills", default="skills.json", metavar="PATH")
+    swarm_session.add_argument(
+        "--agents", type=int, default=None, metavar="N",
+        help="population per task. Defaults to the profile's figure.",
+    )
     swarm_session.add_argument("--ledger", default=None, metavar="PATH")
     swarm_session.add_argument(
         "--no-skills", action="store_true",
@@ -249,6 +253,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     ev.add_argument("--profile", default="smoke",
                     choices=["smoke", "standard", "deep", "eval"])
+    ev.add_argument(
+        "--agents", type=int, default=None, metavar="N",
+        help="population per run, in BOTH arms. Defaults to the profile's "
+        "figure. An ablation whose arms differ in population is not an "
+        "ablation, so this is deliberately one flag rather than two.",
+    )
     ev.add_argument("--benchmarks", default=None, metavar="PATH",
                     help="generate BENCHMARKS.md here (refuses simulated data)")
     ev.add_argument(
@@ -948,6 +958,7 @@ async def _eval_command(args: argparse.Namespace) -> int:
             # it, so the only variable between arms is retrieval.
             skills=library,
             sandbox=sandbox,
+            agents=args.agents,
             run_id=f"eval-{task.task_id}-{seed}-{'t' if use_skills else 'c'}",
         )
         result = await run.run(task.prompt)

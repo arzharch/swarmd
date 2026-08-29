@@ -34,7 +34,7 @@ import math
 import re
 import time
 from collections import Counter
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
@@ -99,6 +99,54 @@ def make_skill_id(name: str, instruction: str) -> str:
     return hashlib.sha256(payload.encode()).hexdigest()[:12]
 
 
+# A distilled instruction has to be an INSTRUCTION. The distiller reads model
+# output, and model output is not trustworthy input just because this system
+# produced it -- the library once filled with entries whose "instruction" was a
+# JSON blob of a previous run's OUTPUT summary, which taught nothing and cost a
+# retrieval slot every run.
+# Low deliberately. The failure that actually happened was serialised OUTPUT,
+# not brevity, and real distilled instructions are legitimately terse -- "use
+# csv.DictReader with an explicit dialect" is a good skill. This floor only
+# rejects the degenerate case; hallucinated-but-plausible content is what the
+# human approval gate and success-rate pruning are for.
+MIN_INSTRUCTION_CHARS = 8
+MAX_INSTRUCTION_CHARS = 2_000
+MAX_NAME_CHARS = 120
+
+
+def validate_instruction(instruction: str) -> str:
+    """Reject what cannot be a reusable instruction. Raises, never repairs.
+
+    Repairing would be worse: a silently rewritten skill is one nobody
+    reviewed, and the human approval gate is the only thing standing between a
+    hallucinated approach and every future run's prompt.
+    """
+    text = (instruction or "").strip()
+    if not text:
+        raise SkillLibraryError("a skill with no instruction teaches nothing")
+    stripped = text.lstrip()
+    if stripped.startswith(("{", "[")):
+        # THE POISONING THAT HAPPENED. Distillation stored the longest OUTPUT
+        # as the instruction, so the library filled with serialised artifacts
+        # describing one run's answer rather than any reusable approach.
+        raise SkillLibraryError(
+            "instruction looks like serialised output, not an approach; "
+            "distillation must record the SHAPE of what worked, not the answer"
+        )
+    if len(text) < MIN_INSTRUCTION_CHARS:
+        raise SkillLibraryError(
+            f"instruction is {len(text)} chars; too short to be an approach"
+        )
+    if len(text) > MAX_INSTRUCTION_CHARS:
+        # An unbounded instruction is a prompt-budget leak: it is injected into
+        # every worker prompt that retrieves it.
+        raise SkillLibraryError(
+            f"instruction is {len(text)} chars, over the {MAX_INSTRUCTION_CHARS} "
+            f"limit; it would be injected into every retrieving worker's prompt"
+        )
+    return text
+
+
 class SkillLibraryError(RuntimeError):
     pass
 
@@ -126,8 +174,40 @@ class SkillLibrary:
             payload = json.loads(self.path.read_text(encoding="utf-8"))
         except json.JSONDecodeError as exc:
             raise SkillLibraryError(f"library at {self.path} is corrupt: {exc}") from exc
-        for entry in payload.get("skills", []):
-            skill = Skill(**entry)
+        known = {f.name for f in fields(Skill)}
+        for index, entry in enumerate(payload.get("skills", [])):
+            if not isinstance(entry, dict):
+                raise SkillLibraryError(
+                    f"library at {self.path}: entry {index} is not an object"
+                )
+            unknown = set(entry) - known
+            if unknown:
+                # A raw TypeError from Skill(**entry) took the whole run down
+                # over a file this module already tries hard to degrade around.
+                raise SkillLibraryError(
+                    f"library at {self.path}: entry {index} has unknown "
+                    f"field(s) {sorted(unknown)}; written by a different build"
+                )
+            try:
+                skill = Skill(**entry)
+            except TypeError as exc:
+                raise SkillLibraryError(
+                    f"library at {self.path}: entry {index} is malformed: {exc}"
+                ) from exc
+
+            # THE ID IS THE INTEGRITY CHECK, and it was never checked.
+            # `skill_id` is a content hash of name+instruction, so verifying it
+            # on load is what makes editing the file detectable. Without this a
+            # skills.json could carry any instruction under any id -- including
+            # `approved: true`, which is the entire human gate expressed as a
+            # boolean in a file anyone who can reach the disk can write.
+            expected = make_skill_id(skill.name, skill.instruction)
+            if skill.skill_id != expected:
+                raise SkillLibraryError(
+                    f"library at {self.path}: entry {index} ({skill.name!r}) "
+                    f"has id {skill.skill_id} but its contents hash to "
+                    f"{expected}; the file has been edited since it was written"
+                )
             self._skills[skill.skill_id] = skill
 
     def save(self) -> None:
@@ -157,8 +237,7 @@ class SkillLibrary:
         criterion_hash: str = "",
     ) -> Skill:
         """Record a candidate. It is NOT usable until a human approves it."""
-        if not instruction.strip():
-            raise SkillLibraryError("a skill with no instruction teaches nothing")
+        validate_instruction(instruction)
         skill_id = make_skill_id(name, instruction)
         existing = self._skills.get(skill_id)
         if existing is not None:

@@ -171,7 +171,7 @@ async def test_distilled_skills_stay_unusable_without_approval(library, tmp_path
     approvals = ApprovalManager(SqliteApprovalStore(tmp_path / "a.db"))
     session = SwarmSession(_factory(), library, approvals=approvals)
 
-    library.propose(name="n", task_pattern="p", instruction="i")
+    library.propose(name="n", task_pattern="p", instruction="use json.loads on the reply")
     await session.run(["t"] * 2)
     assert library.approved() == []
 
@@ -189,7 +189,7 @@ async def test_auto_approve_records_the_bypass_in_the_audit_trail(
 
     gate = SkillGate(approvals, library)
     skill, _ = await gate.submit(
-        name="n", task_pattern="p", instruction="i", run_id="r", evidence=2
+        name="n", task_pattern="p", instruction="use json.loads on the reply", run_id="r", evidence=2
     )
 
     session = SwarmSession(
@@ -205,7 +205,7 @@ async def test_auto_approve_records_the_bypass_in_the_audit_trail(
 
 async def test_auto_approve_works_without_an_approval_store(library):
     """Development convenience must not require infrastructure."""
-    library.propose(name="n", task_pattern="p", instruction="i")
+    library.propose(name="n", task_pattern="p", instruction="use json.loads on the reply")
     session = SwarmSession(_factory(), library, auto_approve=True)
     await session.run(["t"])
     assert len(library.approved()) == 1
