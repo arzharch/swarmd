@@ -44,6 +44,7 @@ from swarmd.server import control, middleware
 from swarmd.server.hub import EventHub
 from swarmd.server.jobs import JobRegistry
 from swarmd.swarm.run import PROFILES, RunResult, SwarmRun
+from swarmd.swarm.runstore import IncompatibleRunState, RunStore
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +80,12 @@ class RunRequest(BaseModel):
     # Deliberate misbehaviour to inject: "all", or a comma-separated subset of
     # the five patterns. Empty means a clean run.
     seed_rogues: str = ""
+    # What to do when the session's ration is spent. The default waits, because
+    # a run that resumes hours later still delivers what was asked for and a
+    # run that dies has thrown away everything it already paid for. A caller on
+    # a deadline -- CI, an eval sweep -- sets this and gets a prompt failure
+    # naming the wait instead.
+    no_wait: bool = False
 
 
 class RunRegistry:
@@ -142,6 +149,10 @@ def create_app(
     # repetition worth paying for is ACROSS runs -- a session working through a
     # curriculum, or two operators asking similar things.
     app.state.cache = SemanticCache(ttl_s=3600.0, capacity=2048, exact_only=True)
+    # Durable working sets. Survives the pod, not just the request: a run parked
+    # on a spent ration outlives any deployment, and the registry above is an
+    # in-process index that a restart empties.
+    app.state.run_store = RunStore()
     app.state.jobs = JobRegistry(hub=app.state.hub)
     app.state.config = control.HarnessConfig()
     control.register(app, registry=app.state.jobs, config=app.state.config)
@@ -233,6 +244,8 @@ def create_app(
                 ChaosHook(kill_rate=request.kill_rate) if request.chaos else None
             ),
             on_event=app.state.hub.publish,
+            no_wait=request.no_wait,
+            store=app.state.run_store,
         )
         app.state.registry.record(
             run.run_id,
@@ -246,10 +259,20 @@ def create_app(
                 "started": time.time(),
             },
         )
+        return _accept(run, request.task)
+
+    def _accept(run: SwarmRun, task: str) -> JSONResponse:
+        """Start a run in the background and answer immediately.
+
+        Shared by submit and resume so a resumed run reports through exactly
+        the same registry fields -- a second copy of this drifted into
+        reporting a resumed run as permanently "running", because only one of
+        them recorded the terminal status.
+        """
 
         async def execute() -> RunResult:
             try:
-                result = await run.run(request.task)
+                result = await run.run(task)
             finally:
                 app.state.registry.record(run.run_id, {"finished": time.time()})
             app.state.registry.record(
@@ -271,12 +294,57 @@ def create_app(
             return result
 
         # Fire and forget: an HTTP client must not hold a connection open for
-        # the 18 minutes a demo profile takes. Progress arrives over the
-        # websocket, which is what the websocket is for.
+        # the 18 minutes a demo profile takes -- let alone the hours a rationed
+        # run waits. Progress arrives over the websocket, which is what the
+        # websocket is for.
         app.state.registry.tasks[run.run_id] = asyncio.create_task(execute())
         return JSONResponse(
             {"run_id": run.run_id, "status": "accepted", "stream": "/api/stream"},
             status_code=202,
+        )
+
+    @app.get("/api/pace")
+    async def pace() -> JSONResponse:
+        """Whether the pool is waiting on a ration, and when it comes back.
+
+        A paused run looks identical to a hung one from outside: no events, no
+        errors, nothing finishing. This is what distinguishes them, and it is
+        why the dashboard can say "back at 18:40" instead of going quiet.
+        """
+        try:
+            provider = app.state.provider_factory()
+        except RuntimeError as exc:
+            return JSONResponse({"status": "no_provider_capacity", "detail": str(exc)})
+        status = provider.pace_status() if hasattr(provider, "pace_status") else {}
+        return JSONResponse(status or {"paused": False})
+
+    @app.get("/api/runs/resumable")
+    async def list_resumable() -> JSONResponse:
+        """Runs on disk that can be picked back up.
+
+        Deliberately NOT the in-process registry: that is emptied by a restart,
+        and a run parked on a spent ration is precisely the run most likely to
+        outlive the pod that started it. Registered before the
+        `/api/runs/{run_id}` route so "resumable" is not read as a run id.
+        """
+        return JSONResponse(
+            {
+                "runs": [
+                    {
+                        "run_id": s.run_id,
+                        "task": s.task,
+                        "profile": s.profile,
+                        "agents": s.agents,
+                        "status": s.status,
+                        "paused_reason": s.paused_reason,
+                        "resumes_at": s.resumes_at,
+                        "nodes_done": len(s.finished_nodes),
+                        "has_criterion": bool(s.criterion),
+                        "has_plan": bool(s.plan),
+                    }
+                    for s in app.state.run_store.list_runs()
+                ]
+            }
         )
 
     @app.get("/api/runs")
@@ -315,6 +383,74 @@ def create_app(
                 "verify": record.get("verify", {}),
             }
         )
+
+    @app.post("/api/runs/{run_id}/resume")
+    async def resume_run(run_id: str) -> JSONResponse:
+        """Pick a stored run back up, buying nothing it already paid for.
+
+        The criterion, plan and batch drafts come off disk. Re-deriving the
+        criterion would be worse than wasteful: the second half of the run
+        would be graded against a target the first half never saw, while the
+        report still quoted one hash for both.
+        """
+        existing = app.state.registry.tasks.get(run_id)
+        if existing is not None and not existing.done():
+            # Two live runs sharing a run id would interleave their writes into
+            # one document and one ledger, and the resulting report would
+            # describe neither.
+            raise HTTPException(409, f"run {run_id} is already running")
+
+        try:
+            provider = app.state.provider_factory()
+        except RuntimeError as exc:
+            raise HTTPException(503, f"no provider capacity: {exc}") from exc
+
+        from swarmd.harnesses.sandbox import SandboxHarness
+        from swarmd.swarm.skills import SkillLibrary
+
+        try:
+            run = SwarmRun.resume(
+                run_id,
+                provider,
+                store=app.state.run_store,
+                skills=(
+                    SkillLibrary(app.state.skills_path)
+                    if app.state.skills_path
+                    else None
+                ),
+                sandbox=SandboxHarness(),
+                cache=app.state.cache,
+                on_event=app.state.hub.publish,
+            )
+        except FileNotFoundError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        except IncompatibleRunState as exc:
+            # 409, not 500: the document is intact and the request is
+            # well-formed. What is wrong is that this build cannot read that
+            # shape, and no retry will change it.
+            raise HTTPException(409, str(exc)) from exc
+
+        task = run.state.task
+        if not task:
+            raise HTTPException(
+                422,
+                f"stored run {run_id} has no task recorded; it was interrupted "
+                f"before the task was persisted and cannot be resumed",
+            )
+
+        app.state.registry.record(
+            run.run_id,
+            {
+                "run_id": run.run_id,
+                "task": task,
+                "profile": run.state.profile,
+                "agents": run.agents,
+                "status": "running",
+                "resumed": time.time(),
+                "resumed_from_nodes": len(run.state.finished_nodes),
+            },
+        )
+        return _accept(run, task)
 
     @app.delete("/api/runs/{run_id}")
     async def cancel_run(run_id: str) -> JSONResponse:
