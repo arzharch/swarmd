@@ -44,6 +44,41 @@ from swarmd.demo import demo_kernel
 from swarmd.router.pacer import Paced
 
 
+def _load_dotenv() -> None:
+    """Read `.env` into the environment if the keys are not already set.
+
+    Nothing loaded it before, so a fresh checkout with a fully populated .env
+    reported "no usable providers: no GROQ_API_KEY" -- the single most likely
+    first experience for anyone trying this, and the least informative.
+
+    The existing environment always wins: a shell that exported a key meant it,
+    and a file silently overriding that is how someone spends the wrong account
+    without noticing. Parsing is deliberately minimal -- KEY=VALUE, `export`
+    prefix tolerated, quotes stripped, `#` comments ignored. It is not a shell
+    and must not try to be one.
+    """
+    path = Path.cwd() / ".env"
+    if not path.exists():
+        return
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        return
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        line = line.removeprefix("export ")
+        key, _, value = line.partition("=")
+        key = key.strip()
+        if not key or key in os.environ:
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        os.environ[key] = value
+
+
 def _ensure_examples_importable() -> None:
     """Make examples/ importable when running from an installed console script.
 
@@ -57,6 +92,7 @@ def _ensure_examples_importable() -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    _load_dotenv()
     parser = argparse.ArgumentParser(prog="swarmd")
     sub = parser.add_subparsers(dest="command", required=True)
 
