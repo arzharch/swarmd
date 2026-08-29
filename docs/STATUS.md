@@ -155,6 +155,16 @@ That is the budget system reporting exactly what it was built to report,
 including the finite grant reaching zero. It is also the honest reason G4
 carries a measured negative and an unmeasured fix rather than a result.
 
+**Two of those four blocks were self-inflicted, and that was found the next
+day.** Groq's daily token limit is 200,000 *per model*, not 100,000 across the
+account — the original figure came from measuring one model and applying it to
+all of them, so a run stopped while two other models were untouched. And
+OpenRouter's cap is 1,000/day because this account is funded; the table carried
+the unfunded 50/day. Both figures are corrected in `router/budget.py` with
+their sources and check dates, and `docs/CAPACITY.md` §7 records the
+correction. The lesson is not "the providers were stingy", it is that a limit
+written down without provenance is indistinguishable from one that is wrong.
+
 ---
 
 ## 5a. Sign-off status
@@ -203,6 +213,55 @@ calls against a measured budget of ~1,146 requests/day -- half a day of total
 capacity for one run. It is now 24 agents and ~90 calls, so a dozen fit a day.
 An operator can still ask for 500 or 1000; the count is honoured exactly, and
 `preflight` prices the run against the remaining budget before it starts.
+
+### Pacing: the run no longer dies when the day runs out
+
+Added after the sign-off above, and it changes what "blocked" means.
+
+A daily allowance is now cut into four 6-hour sittings per credential, per
+dimension, so one afternoon cannot spend a day (`router/ration.py`). When a
+sitting's slice is spent the run **pauses** rather than failing
+(`router/pacer.py`): one pause shared by every agent in the air, announced with
+the provider, the dimension that bound, and the instant capacity returns.
+
+The pause is durable. The criterion, plan, batch drafts, economy balances,
+containment set and finished nodes are written to `.swarmd/runs/<id>.json`
+before the wait begins (`swarm/runstore.py`), and `SwarmRun.resume` rebuilds
+from that without re-buying any of it.
+
+Verified rather than asserted, in two ways:
+
+- **A real process kill.** A child process is started, allowed to park on an
+  exhausted ration, killed with `taskkill /F`, and a *second* process resumes
+  from disk. Provider calls are counted from the usage journal, which both
+  processes append to and neither can rewrite.
+- **The integrity hash.** `tests/swarm/test_runstore_resume.py` asserts an
+  interrupted-and-resumed run reports the *same* integrity hash as an
+  uninterrupted one — not merely that it finishes.
+
+Two silent defects were found by the contract tests written for this and would
+not have been found by watching it work:
+
+- Every heartbeat raised `TypeError` inside the ticker, whose `finally` woke
+  the run, so a pause meant to last hours ended immediately and the run spun on
+  the refusal it had just parked on. It *looked* like pausing worked.
+- The pacer called its event sink as `emit(kind, **payload)`, which no sink in
+  the codebase accepts, and the guard swallowed the error — so no pause event
+  ever reached the dashboard, the logs or the run's own stream.
+
+Surfaces: `--no-wait` and `swarmd runs list` / `swarmd runs resume`;
+`no_wait` on `POST /api/runs`, `GET /api/runs/resumable`,
+`POST /api/runs/{id}/resume`, `GET /api/pace`; and a dashboard banner that
+counts down locally so it does not freeze between minute heartbeats.
+
+`preflight` now projects a timeline — `fits_this_session`,
+`fits_today_with_pauses`, `spans_days`, `exceeds_horizon` — with the first
+pause and projected finish, because a yes/no verdict stopped being the right
+shape once running out means waiting instead of failing.
+
+**Still not measured:** every pacing test above uses a fake clock or a
+deliberately tiny ration. The pause has not yet been exercised against a real
+provider's real daily reset, which takes a day to observe by construction.
 
 ### Smaller, and not blocking
 - No on-call rotation (single maintainer — stated, not solvable).

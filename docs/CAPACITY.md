@@ -1,6 +1,6 @@
 # Capacity Plan
 
-**Status:** v1.0 · **Updated:** 2026-08-27 · Owner: Arsh Zakee Chowhan
+**Status:** v1.1 · **Updated:** 2026-08-29 · Owner: Arsh Zakee Chowhan
 **Reviewed at:** every phase boundary, and whenever a provider is added or removed
 
 This document exists because in `swarmd` the bottleneck is not CPU, memory, or
@@ -12,27 +12,38 @@ written down and dated rather than assumed.
 
 ## 1. Supply
 
-Measured 2026-08-27. Published limits are treated as hints; `swarmd providers
-probe` discovers the real ones and the pool adapts (ADR-008).
+The **declared** position, re-checked 2026-08-29 against each provider's own
+documentation. Published limits are treated as hints; `swarmd providers probe`
+discovers the real ones and the pool adapts (ADR-008), so where this table and
+section 7 ever disagree, section 7 and `router/budget.py` are right.
 
-| Provider | Requests/min | Requests/day | Tokens/min | Cost | Notes |
+| Provider | Requests/min | Requests/day | Tokens/day | Cost | Kind |
 |---|---|---|---|---|---|
-| Groq | 30 | 14,400 | 6,000 | free | Fastest; ~700 tok/s on Llama 3.3 70B |
-| Google AI Studio | 15 | 1,500 | 250,000 | free | 1M context, strongest free quality |
-| **Configured total** | **45** | **15,900** | **256,000** | **$0** | |
-| Cerebras *(not yet configured)* | ~30 | ~1M tokens/day | 30,000 | free | Would roughly double daily headroom |
-| OpenRouter `:free` *(not yet configured)* | 20 | 200–1,000 | ~20,000 | free | Daily cap documented inconsistently |
-| GLM 5.3 Flash *(paid overflow)* | 60 | — | 200,000 | $0.075/$0.25 per M | ~180 calls inside the $0.05 ceiling |
+| Groq | 30 | 1,000 | 200,000 **per model** | free | quota |
+| Google AI Studio | 30 | 1,000 | — | free | quota |
+| OpenRouter | 20 | 1,000 | — | free | quota |
+| Mistral | 60 | *no daily cap* | 1B/month | free | rate |
+| NVIDIA NIM | 40 | ~33 | — | free | **grant, expires** |
+| GLM 5.3 Flash *(paid overflow)* | 60 | — | — | $0.075/$0.25 per M | paid |
 
-**The binding constraint is requests per minute, not tokens per minute.** At
-45 RPM and a realistic 1,500 tokens per call, we consume ~67,500 TPM against a
-256,000 TPM ceiling — token headroom is 3.8×. Optimising token usage therefore
-buys nothing. Optimising *call count* buys everything. This single observation
-drives every lever in section 3.
+**Groq's binding constraint is tokens, not requests.** At the ~1,000 tokens a
+call this system actually sends, 200,000 tokens/model/day is reached around 200
+requests while the 1,000-request cap is still four-fifths unspent. Any plan
+that counts Groq requests and ignores its tokens overstates it fivefold, which
+is precisely the error that blocked a run at 98 requests.
 
-**Latency is not the constraint either.** Groq returns in ~0.3–0.7s, Google in
-~2–3s. With even three requests in flight, RPM saturates before latency does.
-Concurrency is sized to keep the RPM budget full, not to the agent count.
+**Mistral has no day to spread**, so it is `kind: rate` and is never
+session-rationed (section 9). Cutting a day it does not publish into sittings
+would invent a scarcity and waste the most generous free tier configured here.
+
+**NVIDIA is a grant**: ~1,000 credits that never refill and expire 30 days
+after issue. It is treated as spent.
+
+**Latency is not the constraint.** Groq returns in ~0.3–0.7s, Google in ~2–3s.
+With even three requests in flight, the rate limit saturates before latency
+does. Concurrency is sized to keep the request budget full, not to the agent
+count — which is why the population and the concurrency bound are separate
+numbers (section 4).
 
 ---
 
@@ -239,12 +250,24 @@ wrong**.
 
 | Provider | Working model | Latency | Throughput | Daily allowance | Kind |
 |---|---|---|---|---|---|
-| groq | `openai/gpt-oss-20b` | 0.81s | 384 tok/s | 1,000 req | quota |
+| groq | `openai/gpt-oss-20b` | 0.81s | 384 tok/s | ~200 req *(token-bound)* | quota |
 | google-aistudio | `gemini-3.5-flash-lite` | 1.25s | 29 tok/s | 1,000 req | quota |
 | nvidia-nim | `nvidia/nemotron-3-super-120b-a12b` | 2.33s | 100 tok/s | ~33 req | **grant** |
-| openrouter | `minimax/minimax-m3:free` | 2.30s | 20 tok/s | 50 req | quota |
+| openrouter | `minimax/minimax-m3:free` | 2.30s | 20 tok/s | 1,000 req | quota |
 | mistral-free | `open-mistral-nemo` | 0.62s | 54 tok/s | no daily cap | rate |
 | cerebras | — | — | — | **none** | 402 |
+
+**Two of these were re-checked on 2026-08-29 and both had been wrong in the
+direction that costs capacity.** Groq's daily token limit is 200,000 per
+*model*, not 100,000 across the account — the original figure was measured on
+one model and applied to all of them, so a run reported "day budget exhausted"
+while two other models were untouched. OpenRouter's cap is 1,000/day because
+this account is funded; 50/day is the unfunded figure, and carrying it turned a
+workhorse into a tie-breaker. Google's 15 RPM was contradicted by the journal's
+own record of 16 successes inside one minute.
+
+Both blocks that stopped work the day before were therefore **self-inflicted**:
+the providers had capacity the table said they did not.
 
 **Groq is the workhorse.** Roughly 4x the throughput of anything else here and
 the joint-largest daily allowance, so it is ordered first.
@@ -267,21 +290,36 @@ call four. The rest return `404 Not found for account`.
 ### What this sustains
 
 ```
-plannable     1,146 requests/day   from published DAILY allowances
-  week        8,022 requests
-  month      34,380 requests
-one-off          29 requests/day   from finite grants -- these stop when spent
+plannable     2,200 requests/day   from published DAILY allowances
+  week       15,400 requests
+  month      66,000 requests
+one-off          33 requests/day   from finite grants -- these stop when spent
 unverified   86,400 requests/day   upper bound from a per-minute rate with no
                                    published daily cap. Assumes 24 hours of
                                    perfect saturation. Not a plan.
 ```
 
-**Groq's binding limit is tokens, not requests, and that halved this plan.** It
-publishes 1,000 requests *and* 100,000 tokens per day. At the ~1,035 tokens per
-call this system actually sends, the token budget runs out after **98
-requests** -- so the first version of this table overstated Groq tenfold.
-Discovered by running until it broke: the CLI printed "day budget exhausted"
-beside "98 / 1,000", because it was showing the dimension that was fine.
+Per provider, with the basis each figure rests on -- because "1,000/day" means
+something different when it is a request cap, a token cap divided by observed
+call size, or a grant that never refills:
+
+| Provider | Requests/day | Basis |
+|---|---|---|
+| google-aistudio | 1,000 | `daily_cap` |
+| openrouter | 1,000 | `daily_cap` |
+| groq | 200 | `daily_cap_tokens` |
+| nvidia-nim | 33 | `grant` |
+| mistral-free | 86,400 | `rate_only` — **excluded from the plan** |
+
+**Groq's binding limit is tokens, not requests.** It publishes 1,000 requests
+*and* 200,000 tokens per model per day. At the ~1,000 tokens per call this
+system sends, the token budget runs out around **200 requests**. Discovered by
+running until it broke: the CLI printed "day budget exhausted" beside
+"98 / 1,000", because it was showing the dimension that was fine.
+
+`rate_only` is excluded deliberately. Multiplying a per-minute rate by 1,440
+produced a headline in which every run "fits", including runs that then ran out
+within the hour — an 86,400 that is 100% extrapolation is not an allowance.
 
 Daily capacity is now `min(request cap, token cap / observed tokens per call)`,
 with the tokens-per-call figure measured from the usage journal rather than
@@ -292,8 +330,8 @@ Only the first figure is planned against. Folding the other two in would give a
 headline of ~88,000/day that is 98% extrapolation, which is exactly the kind of
 number this document exists not to print.
 
-At the `smoke` profile's ~16 calls per run, 2,050/day is roughly **128 runs a
-day, 900 a week**. A `standard` run at ~600 calls is 3 a day.
+At the `smoke` profile's ~25 calls per run, 2,200/day is roughly **88 runs a
+day**. A `standard` run at ~90 calls is about 24 a day.
 
 ### Windows, and why five hours is one of them
 
@@ -315,7 +353,77 @@ it all morning and over-commits against it at night.
 
 ---
 
-## 8. Assumptions, stated so they can be falsified
+## 8. Session rationing: spending a day across a day
+
+Sections 1–7 say how much there is. This says how fast it may be spent, which
+is a separate question and the one that was actually going wrong: a single
+afternoon could consume a whole day's allowance, and every run after it failed
+on 429s until the quota reset.
+
+### The rule
+
+```
+session length     6 hours
+sessions per day   4               (6 × 4 = 24 exactly; not a coincidence)
+safety             0.9             headroom for the metering being wrong
+envelope           (declared × 0.9 − spent in earlier sittings) ÷ sittings left
+```
+
+Applied **per credential and per dimension**. Requests and tokens are separate
+ceilings and the first one reached is what stops the call, so both are
+rationed; the refusal names which one bound.
+
+Three properties, each of which was a bug before it was a rule:
+
+- **A sitting does not shrink its own ration as it spends it.** Only earlier
+  sittings leave the numerator. Subtracting the current sitting's own usage
+  made the envelope fall with every call, so a run was refused well before
+  reaching the slice it had been promised.
+- **An unspent sitting rolls forward.** Dividing by *remaining* sittings rather
+  than by four means an operator who runs nothing all morning is not held to a
+  quarter of the day at 3pm.
+- **A refusal is "not yet", never "not ever".** It carries the instant capacity
+  returns, and the run parks until then rather than failing.
+
+### Reset semantics
+
+| Provider | Reset | Why it matters |
+|---|---|---|
+| google-aistudio | midnight **Pacific** | Treating it as rolling under-uses it all morning and over-commits at night |
+| openrouter | midnight **UTC** | — |
+| groq | **undocumented** | Treated as rolling and narrowed from `x-ratelimit-reset-*` headers |
+| mistral-free | n/a | No daily cap, so nothing to spread |
+
+Groq's page does not state how its daily window resets — not rolling, not a
+timezone, nothing, and the blog claims of midnight UTC are unsourced. Rolling
+is the error that under-uses rather than the one that double-spends.
+
+A scheduled reset is not raced: calls inside a guard band before the boundary
+wait for it rather than gambling on whose clock is right.
+
+### What a run does when the slice is spent
+
+It **pauses**, and the pause is durable. The criterion, plan, batch drafts,
+economy balances, containment set and completed nodes are written to
+`.swarmd/runs/<run_id>.json` before the wait begins, so a pause that outlives
+the process is recoverable rather than merely survivable — verified by killing
+the process mid-pause and resuming in a new one, then asserting the resumed run
+reports the same integrity hash as an uninterrupted run.
+
+`--no-wait` (and `no_wait` on `POST /api/runs`) turns the pause into a prompt
+failure for callers that cannot sit through it. Waiting is the default, because
+a run that dies has thrown away everything it already paid for.
+
+`preflight` projects this before the run starts: `fits_this_session`,
+`fits_today_with_pauses`, `spans_days`, or `exceeds_horizon`, with the first
+pause and the projected finish. A yes/no verdict was the right shape when
+running out meant failing; it stopped being right once running out means
+waiting, since "finishes this evening after one pause" and "spans three days"
+are the same answer to `fits` and only one of them is a reason not to start.
+
+---
+
+## 9. Assumptions, stated so they can be falsified
 
 1. **60% cache hit rate.** Now the weakest number in this document, and worth
    stating precisely. Exact keying means the hit rate on a run of *genuinely
