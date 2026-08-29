@@ -41,6 +41,7 @@ from pathlib import Path
 from typing import Any
 
 from swarmd.demo import demo_kernel
+from swarmd.router.pacer import Paced
 
 
 def _ensure_examples_importable() -> None:
@@ -185,6 +186,12 @@ def main(argv: list[str] | None = None) -> int:
                            help="skill library file (default: no library)")
     swarm_run.add_argument("--ledger", default=None, metavar="PATH",
                            help="write the append-only cost ledger here")
+    swarm_run.add_argument(
+        "--no-wait", action="store_true",
+        help="fail instead of pausing when this session's ration is spent. "
+        "The default waits and resumes, because a run that dies has thrown "
+        "away everything it already paid for; use this on a deadline.",
+    )
     swarm_run.add_argument("--json", action="store_true",
                            help="emit the full report as JSON")
 
@@ -274,6 +281,22 @@ def main(argv: list[str] | None = None) -> int:
     )
     lverify.add_argument("path")
     lverify.add_argument("--json", action="store_true")
+
+    runs = sub.add_parser("runs", help="list and resume runs paused on a ration")
+    runs_sub = runs.add_subparsers(dest="runs_command", required=True)
+    runs_list = runs_sub.add_parser("list", help="runs on disk that can be resumed")
+    runs_list.add_argument("--json", action="store_true")
+    runs_resume = runs_sub.add_parser(
+        "resume", help="pick a stored run back up without re-buying its work"
+    )
+    runs_resume.add_argument("run_id")
+    runs_resume.add_argument("--skills", default=None, metavar="PATH")
+    runs_resume.add_argument("--ledger", default=None, metavar="PATH")
+    runs_resume.add_argument(
+        "--no-wait", action="store_true",
+        help="fail instead of pausing again if the ration is still spent",
+    )
+    runs_resume.add_argument("--json", action="store_true")
 
     runcmd = sub.add_parser("run", help="inspect a completed run")
     run_sub = runcmd.add_subparsers(dest="run_command", required=True)
@@ -383,6 +406,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "eval":
         return asyncio.run(_eval_command(args))
+
+    if args.command == "runs":
+        return asyncio.run(_runs_command(args))
 
     if args.command in ("ledger", "run"):
         return _ledger_command(args)
@@ -535,8 +561,6 @@ async def _providers_command(args: argparse.Namespace) -> int:
 
 async def _swarm_command(args: argparse.Namespace) -> int:
     """Run one unknown task end to end and print what happened."""
-    import json as _json
-
     from swarmd.chaos import ChaosHook
     from swarmd.harnesses.sandbox import SandboxHarness
     from swarmd.router.pool import ProviderPool
@@ -568,16 +592,38 @@ async def _swarm_command(args: argparse.Namespace) -> int:
             chaos=ChaosHook(kill_rate=args.kill_rate) if args.chaos else None,
             ledger_path=args.ledger,
             on_event=_print_event,
+            no_wait=args.no_wait,
         )
     except (UnknownRogue, ValueError) as exc:
         print(f"error: {exc}")
         await pool.aclose()
         return 2
-    result = await run.run(args.task)
+    try:
+        result = await run.run(args.task)
+    except Paced as exc:
+        # --no-wait was asked for and the ration is spent. Everything bought so
+        # far is on disk, so this is a stop, not a loss.
+        await pool.aclose()
+        print(f"\npaused: {exc}")
+        print(f"resume with: swarmd runs resume {run.run_id}")
+        return 3
     report = run.report(result)
     await pool.aclose()
+    return _print_run(run, result, report, as_json=args.json)
 
-    if args.json:
+
+def _print_run(
+    run: Any, result: Any, report: dict[str, Any], *, as_json: bool
+) -> int:
+    """What a finished run looks like on a terminal.
+
+    Shared by `swarm run` and `runs resume` so a resumed run reports in exactly
+    the same shape -- including the integrity hash, which is the number that
+    says the resumed run produced the same work as an uninterrupted one.
+    """
+    import json as _json
+
+    if as_json:
         print(_json.dumps(report, indent=2))
         return 0 if result.status == "completed" else 1
 
@@ -617,6 +663,96 @@ async def _swarm_command(args: argparse.Namespace) -> int:
         if not run.rogues.passed():
             return 1
     return 0 if result.status == "completed" else 1
+
+
+async def _runs_command(args: argparse.Namespace) -> int:
+    """List and resume runs that are on disk.
+
+    Reads the run store rather than any live process, because the run this is
+    for is one that parked on a spent ration and outlived the terminal that
+    started it.
+    """
+    import json as _json
+
+    from swarmd.swarm.runstore import IncompatibleRunState, RunStore
+
+    store = RunStore()
+
+    if args.runs_command == "list":
+        states = store.list_runs()
+        if args.json:
+            print(_json.dumps([s.to_dict() for s in states], indent=2))
+            return 0
+        if not states:
+            print(f"no stored runs under {store.root}")
+            return 0
+        print(f"{'RUN':<22} {'STATUS':<10} {'NODES':>5}  TASK")
+        for state in states:
+            done = len(state.finished_nodes)
+            task = state.task[:48] + ("..." if len(state.task) > 48 else "")
+            print(f"{state.run_id:<22} {state.status:<10} {done:>5}  {task}")
+            if state.status == "paused" and state.resumes_at:
+                waiting = max(0.0, state.resumes_at - time.time())
+                print(
+                    f"{'':<22} paused on {state.paused_reason or 'a ration'}; "
+                    f"resumable in {waiting / 3600:.1f}h"
+                )
+        return 0
+
+    # resume
+    from swarmd.harnesses.sandbox import SandboxHarness
+    from swarmd.router.pool import ProviderPool
+    from swarmd.swarm.run import SwarmRun
+    from swarmd.swarm.skills import SkillLibrary
+
+    try:
+        pool = ProviderPool.from_env()
+    except RuntimeError as exc:
+        print(f"no provider capacity: {exc}")
+        return 2
+
+    try:
+        run = SwarmRun.resume(
+            args.run_id,
+            pool,
+            store=store,
+            skills=SkillLibrary(args.skills) if args.skills else None,
+            sandbox=SandboxHarness(),
+            ledger_path=args.ledger,
+            on_event=_print_event,
+            no_wait=args.no_wait,
+        )
+    except FileNotFoundError as exc:
+        print(f"error: {exc}")
+        await pool.aclose()
+        return 2
+    except IncompatibleRunState as exc:
+        print(f"error: {exc}")
+        await pool.aclose()
+        return 2
+
+    if not run.state.task:
+        print(
+            f"error: stored run {args.run_id} has no task recorded; it was "
+            f"interrupted before the task was persisted"
+        )
+        await pool.aclose()
+        return 2
+
+    print(
+        f"resuming {run.run_id}: {len(run.state.finished_nodes)} node(s) already "
+        f"done, criterion {'restored' if run.state.criterion else 'not yet frozen'}"
+    )
+    try:
+        result = await run.run(run.state.task)
+    except Paced as exc:
+        await pool.aclose()
+        print(f"\npaused again: {exc}")
+        print(f"resume with: swarmd runs resume {run.run_id}")
+        return 3
+    report = run.report(result)
+    await pool.aclose()
+    return _print_run(run, result, report, as_json=args.json)
 
 
 def _print_event(event: dict[str, Any]) -> None:
