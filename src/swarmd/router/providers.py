@@ -61,6 +61,17 @@ class LLMResponse:
       Typed loosely to keep `providers.py` free of a `budget` import -- the
       dependency runs the other way, and a backend with no notion of budgets
       still has to be constructible.
+
+    ANATOMY: cached_tokens / cached_tokens_reported
+      How many of `tokens_in` the provider says it served from its own prompt
+      cache, and whether it said anything at all. TWO fields rather than one
+      nullable count because 0 is ambiguous and the ambiguity matters: "this
+      provider does not report cached tokens" and "this provider reports that
+      nothing was cached" are different facts, and reading the first as the
+      second turns a working prefix cache into an apparent no-op (or the
+      reverse). Never estimated -- the provider's usage block is the only
+      honest measurement, which is the same discipline `router/cache.py`
+      states for the response cache.
     """
 
     text: str
@@ -70,6 +81,49 @@ class LLMResponse:
     tokens_in: int = 0
     tokens_out: int = 0
     rate_headers: Any = None
+    cached_tokens: int = 0
+    cached_tokens_reported: bool = False
+
+
+# The keys providers actually use for the same number. OpenAI, Groq,
+# OpenRouter and Google's OpenAI-compat shim all nest it under
+# `prompt_tokens_details.cached_tokens`; the Anthropic-shaped
+# `cache_read_input_tokens` appears flat in the usage block on gateways that
+# proxy it. Anything else is absent, and absent is reported as absent.
+CACHED_TOKEN_KEYS = ("cached_tokens", "cache_read_input_tokens")
+
+
+def parse_cached_tokens(usage: Any) -> tuple[int, bool]:
+    """Read cached prompt tokens out of an OpenAI-style usage block.
+
+    Returns (count, reported). DEFENSIVE ON PURPOSE: providers disagree about
+    this field's name, its nesting, and whether it exists at all, and several
+    send `prompt_tokens_details: null` rather than omitting it. A parser that
+    assumed the happy shape would raise inside a successful call and turn a
+    bookkeeping gap into a failed request.
+
+    A negative or non-numeric value is read as "not reported" rather than
+    clamped to zero, because a provider sending nonsense here has told us
+    nothing, and recording nothing as a measurement is how a fabricated
+    saving gets into a report.
+    """
+    if not isinstance(usage, dict):
+        return 0, False
+    details = usage.get("prompt_tokens_details")
+    sources: list[dict[str, Any]] = [usage]
+    if isinstance(details, dict):
+        sources.insert(0, details)
+    for source in sources:
+        for key in CACHED_TOKEN_KEYS:
+            if key not in source:
+                continue
+            raw = source[key]
+            if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+                continue
+            if raw < 0:
+                continue
+            return int(raw), True
+    return 0, False
 
 
 class ProviderError(RuntimeError):
@@ -105,8 +159,15 @@ class MockProvider(Provider):
     async def complete(self, request: LLMRequest) -> LLMResponse:
         start = time.monotonic()
         await asyncio.sleep(self.latency_s)
+        # THE SYSTEM MESSAGE IS PART OF THE REQUEST, so it is part of the
+        # digest. It was not, and once the run-stable layer (task + frozen
+        # criterion) moved into the system role, a mock whose output ignored
+        # it would return the same text for two runs graded against different
+        # criteria -- making every chaos integrity hash insensitive to the one
+        # thing the run is measured against.
         digest = hashlib.sha256(
-            f"{request.prompt}|{round(request.temperature, 2)}".encode()
+            f"{request.system or ''}|{request.prompt}|"
+            f"{round(request.temperature, 2)}".encode()
         ).hexdigest()
         n = int(digest[:8], 16)
         if "Respond with ONLY a JSON object" in request.prompt:
@@ -120,7 +181,11 @@ class MockProvider(Provider):
             provider=self.name,
             model="mock-v1",
             latency_s=time.monotonic() - start,
-            tokens_in=len(request.prompt.split()),
+            # Both roles, for the same reason `SimulatedProvider` counts both:
+            # the prefix reordering MOVED prompt bytes into `system`, it did
+            # not delete them, and a counter that saw only `prompt` would
+            # report the move as a token saving that no invoice will show.
+            tokens_in=len(f"{request.system or ''} {request.prompt}".split()),
             tokens_out=10,
         )
 
@@ -238,6 +303,7 @@ class OpenRouterProvider(Provider):
                 data = resp.json()
                 self._health[model].record_success()
                 usage = data.get("usage", {})
+                cached, cached_reported = parse_cached_tokens(usage)
                 return LLMResponse(
                     text=data["choices"][0]["message"]["content"],
                     provider=self.name,
@@ -245,6 +311,8 @@ class OpenRouterProvider(Provider):
                     latency_s=time.monotonic() - start,
                     tokens_in=usage.get("prompt_tokens", 0),
                     tokens_out=usage.get("completion_tokens", 0),
+                    cached_tokens=cached,
+                    cached_tokens_reported=cached_reported,
                 )
             except Exception as exc:  # noqa: BLE001 - chain boundary by design
                 self._health[model].record_error()

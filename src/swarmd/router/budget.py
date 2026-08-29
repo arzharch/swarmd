@@ -552,6 +552,14 @@ class UsageRow:
       against the daily allowance -- several do -- would otherwise let a retry
       storm overshoot by exactly the retry count. Defaults to `requests` when
       absent so old rows are unchanged.
+
+    ANATOMY: cached_tokens
+      How many of `tokens` the provider served from its own prompt cache.
+      OBSERVATIONAL ONLY, and never subtracted from `tokens`: providers
+      discount cached prompt tokens on PRICE, not on quota, so a journal that
+      netted them off would let the ration believe in headroom the account
+      does not have. Everything that reads this file for admission decisions
+      reads `tokens`.
     """
 
     ts: float
@@ -564,6 +572,7 @@ class UsageRow:
     rid: str = ""
     attempts: int = 0
     until: float = 0.0
+    cached_tokens: int = 0
 
     def to_json(self) -> str:
         payload: dict[str, Any] = {
@@ -585,6 +594,8 @@ class UsageRow:
             payload["attempts"] = self.attempts
         if self.until:
             payload["until"] = round(self.until, 3)
+        if self.cached_tokens:
+            payload["cached_tokens"] = self.cached_tokens
         return json.dumps(payload, separators=(",", ":"))
 
     @staticmethod
@@ -601,6 +612,7 @@ class UsageRow:
             rid=str(data.get("rid", "")),
             attempts=int(data.get("attempts", requests)),
             until=float(data.get("until", 0.0)),
+            cached_tokens=int(data.get("cached_tokens", 0)),
         )
 
 
@@ -726,6 +738,7 @@ class UsageJournal:
         rid: str = "",
         attempts: int | None = None,
         until: float = 0.0,
+        cached_tokens: int = 0,
     ) -> UsageRow:
         row = UsageRow(
             ts=ts if ts is not None else time.time(),
@@ -738,6 +751,7 @@ class UsageJournal:
             rid=rid,
             attempts=requests if attempts is None else attempts,
             until=until,
+            cached_tokens=cached_tokens,
         )
         with self._lock:
             self.load().append(row)

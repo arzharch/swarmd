@@ -104,8 +104,17 @@ class SimulatedProvider(Provider):
         start = time.monotonic()
         await asyncio.sleep(self.latency_s)
 
+        # THE SYSTEM MESSAGE IS PART OF THE REQUEST, so it is part of the seed.
+        # It was not, and the run-stable layer (TASK + the frozen criterion)
+        # now travels in the system role -- see swarm/worker.py. A seed that
+        # ignored it would return the same synthetic text for two runs of
+        # DIFFERENT tasks graded against DIFFERENT criteria, because the only
+        # per-run bytes left in `prompt` are the step name and instruction.
+        # Every offline integrity hash would then be blind to the two inputs
+        # the run is actually defined by.
         digest = hashlib.sha256(
-            f"{request.prompt}|{round(request.temperature, 2)}".encode()
+            f"{request.system or ''}|{request.prompt}|"
+            f"{round(request.temperature, 2)}".encode()
         ).hexdigest()
         n = int(digest[:8], 16)
 
@@ -121,7 +130,15 @@ class SimulatedProvider(Provider):
             provider=self.name,
             model=model,
             latency_s=time.monotonic() - start,
-            tokens_in=len(request.prompt.split()),
+            # BOTH ROLES, or the offline forecast reports a saving nobody made.
+            # Moving bytes from the user turn into the system message does not
+            # send fewer tokens; it sends the same tokens in an order a
+            # provider can cache. Counting only `prompt` would have made every
+            # simulated run's `tokens_in` fall by exactly the size of the
+            # hoisted block, and `docs/CAPACITY.md`'s token forecast is driven
+            # off simulated runs -- so the reorder would have appeared to cut
+            # prompt tokens roughly in half while the real bill was unchanged.
+            tokens_in=len(f"{request.system or ''} {request.prompt}".split()),
             tokens_out=len(text.split()),
         )
 

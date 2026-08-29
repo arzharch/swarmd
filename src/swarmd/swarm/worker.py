@@ -21,7 +21,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -49,6 +51,193 @@ WORKER_SYSTEM = (
     "right, because the criterion looks for the key it asked for."
 )
 
+# --- prompt layout ---------------------------------------------------------
+#
+# WHY THE ORDER OF THE BYTES IS A COST DECISION. Every provider this pool
+# talks to is OpenAI-compatible, and Groq/OpenAI-style automatic prefix
+# caching keys on a BYTE-IDENTICAL LEADING PREFIX of the rendered
+# conversation. The old layout emitted one user message ordered
+# TASK, STEP, REQUIRED, checks, skills, failures -- so the first thing that
+# differed between two agents was STEP, the SECOND line. Everything after it
+# (the criterion block, the skills block: by far the largest part of the
+# prompt) fell outside the shared prefix and was re-read from cold on every
+# one of the ~30 calls a smoke run makes. Only WORKER_SYSTEM, 640 characters,
+# was ever shared.
+#
+# The fix is placement, not content. Run-stable bytes (the base prompt, the
+# task, the frozen criterion) and node-stable bytes (the skills retrieved for
+# this node) move into the SYSTEM message, which is rendered first; the user
+# message carries only what actually varies per call (STEP, REQUIRED, and the
+# previous attempt's failures). Nothing is added, removed or reworded -- the
+# same text is sent, under a different role -- so `Candidate.output` and the
+# grading that reads it are unchanged. `SWARMD_PREFIX_ORDER=legacy` restores
+# the old single-message layout byte for byte, which is what makes that claim
+# testable rather than asserted.
+#
+# WHAT IS NOT PROVEN, and how to prove it. Byte identity is proven by tests.
+# QUALITY is not, and cannot be offline: moving the criterion into the system
+# role changes how a model WEIGHTS it, and a cheaper run that grades worse is
+# a regression however good the cache numbers look. The acceptance gate is
+# NODE PASS RATE parity on the `eval` profile against a fixed task set and
+# fixed seeds -- never `cached_tokens`, which measures the mechanism rather
+# than the outcome. The procedure, since `prefix_order()` reads the
+# environment per call and `swarmd eval` already spends its arms on the
+# skills ablation:
+#
+#     SWARMD_PREFIX_ORDER=legacy  swarmd eval --repeats 5 --report legacy.md
+#     SWARMD_PREFIX_ORDER=hoisted swarmd eval --repeats 5 --report hoisted.md
+#
+# and compare `node_pass_rate` per arm. That gate has NOT been run here -- it
+# needs live providers and a corpus -- so `hoisted` is the default on the
+# strength of the byte-equivalence argument alone, and `legacy` exists so the
+# answer to a measured regression is an env var rather than a revert.
+
+PREFIX_ORDER_ENV = "SWARMD_PREFIX_ORDER"
+HOISTED = "hoisted"
+LEGACY = "legacy"
+
+
+def prefix_order() -> str:
+    """Which prompt layout to build: "hoisted" (default) or "legacy".
+
+    Read from the environment on every call rather than captured at import,
+    for the same reason `use_skills` is a run flag: an ablation you cannot
+    flip between two runs in one process is an ablation nobody measures. An
+    unrecognised value is treated as "hoisted" and warned about, because
+    silently honouring a typo as "legacy" would make a rollback look applied
+    when it was not.
+    """
+    raw = os.environ.get(PREFIX_ORDER_ENV, "").strip().lower()
+    if raw in {"", HOISTED}:
+        return HOISTED
+    if raw == LEGACY:
+        return LEGACY
+    logger.warning(
+        "%s=%r is not %r or %r; using %r",
+        PREFIX_ORDER_ENV, raw, HOISTED, LEGACY, HOISTED,
+    )
+    return HOISTED
+
+
+def graded_block(criterion: Criterion | None) -> str:
+    """THE SPECIFICATION, written for the agent that has to satisfy it.
+
+    Withholding it was the largest single cause of live runs failing: the
+    criterion asked for a numeric artifact called `accuracy`, the step said
+    "extract the first claim", and the worker had no way to connect the two.
+    It produced correct data under keys nothing was looking for, three
+    attempts running.
+
+    Showing it does not let an agent move the target -- the criterion is
+    frozen and content-addressed before any worker exists, and something else
+    does the grading. See `Criterion.as_requirements`.
+    """
+    requirements = criterion.as_requirements() if criterion is not None else ""
+    if not requirements:
+        return ""
+    return (
+        "YOUR OUTPUT IS GRADED AGAINST THESE EXACT CHECKS. Satisfy "
+        "every one:\n" + requirements
+    )
+
+
+def skills_block(skills: Sequence[Skill]) -> str:
+    if not skills:
+        return ""
+    return "APPROACHES THAT WORKED BEFORE (use if applicable):\n" + "\n".join(
+        f"- {s.name}: {s.instruction}" for s in skills
+    )
+
+
+def failures_block(failures: Sequence[str]) -> str:
+    if not failures:
+        return ""
+    return "YOUR PREVIOUS ATTEMPT FAILED THESE CHECKS. Fix them:\n" + "\n".join(
+        f"- {f}" for f in failures
+    )
+
+
+def build_run_system(*, base: str, task: str, criterion: Criterion | None) -> str:
+    """The run-stable layer: identical for every agent, node and repair round.
+
+    Computed ONCE per run (in `SwarmRun._execute`) and carried on
+    `WorkerContext.run_system`. Recomputation is how a prefix drifts, so this
+    is deliberately a pure function of its three arguments: no timestamps, no
+    dict iteration, no float repr. Two calls with equal inputs return equal
+    strings, which is the property the cache is keyed on.
+    """
+    parts = [base, f"TASK: {task}"]
+    graded = graded_block(criterion)
+    if graded:
+        parts.append(graded)
+    return "\n\n".join(parts)
+
+
+def build_node_system(run_system: str, skills: Sequence[Skill]) -> str:
+    """The run-stable layer plus the skills retrieved for ONE node.
+
+    Skills sit here, not in the volatile block, because every agent in a
+    node's pool queries the library with the same node text and gets the same
+    answer -- so the retrieved advice is stable for the whole pool and belongs
+    in the shared prefix.
+
+    RETRIEVAL STAYS NODE-SCOPED, and that is the part that matters. Coarsening
+    the retrieval KEY to run scope was measured in this repo to make node pass
+    rate worse (0.567 against 0.656). This changes only which message carries
+    the retrieved text; the query is still `task + node.instruction`, and the
+    skills a node is offered are exactly the ones it was offered before.
+    """
+    block = skills_block(skills)
+    return f"{run_system}\n\n{block}" if block else run_system
+
+
+@dataclass(frozen=True, slots=True)
+class NodePrefix:
+    """The shared head of every prompt on one node, resolved exactly once.
+
+    Two agents on the same node must send byte-identical leading bytes or the
+    provider's prefix cache sees two different prompts. Retrieval alone does
+    not guarantee that: `SkillLibrary.retrieve` scores by success rate, and
+    `record_use` moves success rates DURING a run, so agent 1 and agent 12
+    querying the same library with the same text can be offered a different
+    ordering. Resolving the prefix once per node and handing the same object
+    to the batch call and to every worker is what makes the property hold.
+    """
+
+    system: str
+    skills: tuple[Skill, ...] = ()
+
+
+def system_for(
+    context: WorkerContext, task: str, skills: Sequence[Skill]
+) -> str:
+    """The system message a worker on this node sends.
+
+    ONE implementation, called both when a run freezes a node's prefix and
+    when a worker builds its own. Two would be two chances for the bytes to
+    diverge, and the whole mechanism is a byte comparison.
+    """
+    if prefix_order() == LEGACY:
+        # Legacy sends everything in one user message, so the system message
+        # is the bare base prompt exactly as it was before this change.
+        return context.system
+    run_system = context.run_system or build_run_system(
+        base=context.system, task=task, criterion=context.criterion
+    )
+    return build_node_system(run_system, skills)
+
+
+def build_node_prefix(
+    context: WorkerContext, task: str, node: PlanNode
+) -> NodePrefix:
+    """Retrieve this node's skills and freeze the prefix they belong to."""
+    skills = tuple(
+        context.skills.retrieve(f"{task} {node.instruction}")
+        if context.skills
+        else ()
+    )
+    return NodePrefix(system=system_for(context, task, skills), skills=skills)
+
 
 @dataclass
 class WorkerContext:
@@ -71,6 +260,12 @@ class WorkerContext:
     # cannot be improved, and a supervisor whose patches never reach a worker
     # is a report generator.
     system: str = WORKER_SYSTEM
+    # The run-stable prefix layer (`build_run_system`): base prompt + TASK +
+    # the frozen criterion, computed once by the run and shared by every agent
+    # in it. Left empty by a caller that builds a context by hand -- a worker
+    # then derives it from `system`, `criterion` and the task, which yields
+    # the same bytes because `build_run_system` is pure.
+    run_system: str = ""
     max_tokens: int = 512
     temperature: float = 0.7
     # Repair rounds inside a single node before giving up on this agent's
@@ -202,41 +397,62 @@ class GenericWorker:
     def build_prompt(
         self, task: str, node: PlanNode, skills: list[Skill], failures: tuple[str, ...]
     ) -> str:
-        """Assemble role + skill + repair feedback into one prompt.
+        """The VOLATILE half of the prompt: what changes from call to call.
 
-        Failures from a previous attempt are included verbatim. A repair round
-        that does not say what failed is just a re-roll, and re-rolling is how
-        a bounded repair budget gets spent without converging.
+        Under the default "hoisted" layout that is STEP, REQUIRED and the
+        failures of the previous attempt -- and nothing else. The task, the
+        criterion and this node's skills are stable for the whole run or the
+        whole node, so they ride in the system message (`build_system`) where
+        they form a prefix the provider can cache. Repeating them here would
+        send the same bytes twice under two roles and put the divergence point
+        back at the second line, which is the defect this layout removes.
+
+        Failures are included verbatim. A repair round that does not say what
+        failed is just a re-roll, and re-rolling is how a bounded repair
+        budget gets spent without converging.
+
+        `skills` is still a parameter, and the signature is deliberately
+        unchanged, because the legacy layout still renders them here.
         """
-        ctx_criterion = getattr(self.context, "criterion", None)
-        parts = [f"TASK: {task}", f"STEP: {node.name}", f"REQUIRED: {node.instruction}"]
-
-        # THE SPECIFICATION. Withholding it was the largest single cause of
-        # live runs failing: the criterion asked for a numeric artifact called
-        # `accuracy`, the step said "extract the first claim", and the worker
-        # had no way to connect the two. It produced correct data under keys
-        # nothing was looking for, three attempts running.
-        #
-        # Showing it does not let an agent move the target -- the criterion is
-        # frozen and content-addressed before any worker exists, and something
-        # else does the grading. See `Criterion.as_requirements`.
-        requirements = ctx_criterion.as_requirements() if ctx_criterion else ""
-        if requirements:
-            parts.append(
-                "YOUR OUTPUT IS GRADED AGAINST THESE EXACT CHECKS. Satisfy "
-                "every one:\n" + requirements
-            )
-        if skills:
-            parts.append(
-                "APPROACHES THAT WORKED BEFORE (use if applicable):\n"
-                + "\n".join(f"- {s.name}: {s.instruction}" for s in skills)
-            )
-        if failures:
-            parts.append(
-                "YOUR PREVIOUS ATTEMPT FAILED THESE CHECKS. Fix them:\n"
-                + "\n".join(f"- {f}" for f in failures)
-            )
+        if prefix_order() == LEGACY:
+            return self._legacy_prompt(task, node, skills, failures)
+        parts = [f"STEP: {node.name}", f"REQUIRED: {node.instruction}"]
+        tail = failures_block(failures)
+        if tail:
+            parts.append(tail)
         return "\n\n".join(parts)
+
+    def _legacy_prompt(
+        self, task: str, node: PlanNode, skills: Sequence[Skill],
+        failures: tuple[str, ...],
+    ) -> str:
+        """The pre-hoist single user message, reproduced byte for byte.
+
+        The rollback path. Kept as its own method rather than as branches
+        inside `build_prompt` so that "legacy is unchanged" is something a
+        test can assert against one function instead of a flag's worth of
+        conditionals.
+        """
+        parts = [f"TASK: {task}", f"STEP: {node.name}", f"REQUIRED: {node.instruction}"]
+        for block in (
+            graded_block(getattr(self.context, "criterion", None)),
+            skills_block(skills),
+            failures_block(failures),
+        ):
+            if block:
+                parts.append(block)
+        return "\n\n".join(parts)
+
+    def build_system(self, task: str, skills: Sequence[Skill]) -> str:
+        """The STABLE half of this worker's prompt, paired with `build_prompt`.
+
+        Derived from the run's precomputed `context.run_system` when there is
+        one. The fallback recomputes it, which is safe only because
+        `build_run_system` is pure -- a fallback that folded in anything
+        per-call would silently halve the cache hit rate and nothing would
+        report it.
+        """
+        return system_for(self.context, task, skills)
 
     # -- execution ----------------------------------------------------------
 
@@ -245,6 +461,7 @@ class GenericWorker:
         task: str,
         node: PlanNode,
         checkpoint: Checkpoint | None = None,
+        prefix: NodePrefix | None = None,
     ) -> WorkerResult:
         """Run one plan node, checkpointing at every step boundary.
 
@@ -273,7 +490,15 @@ class GenericWorker:
                 f"completed step(s): {', '.join(cp.completed_steps)}",
             )
 
-        skills = ctx.skills.retrieve(f"{task} {node.instruction}") if ctx.skills else []
+        # The node's prefix is normally resolved ONCE by the run and handed to
+        # every agent in the pool -- see `NodePrefix`. A worker constructed
+        # directly (a test, a seeded rogue) resolves its own, which retrieves
+        # the same skills the run would have.
+        node_prefix = prefix if prefix is not None else build_node_prefix(
+            ctx, task, node
+        )
+        skills = list(node_prefix.skills)
+        system = node_prefix.system
         skill_used = skills[0].skill_id if skills else ""
         if skills:
             self._think(
@@ -339,7 +564,7 @@ class GenericWorker:
                     f"attempt {attempt} of {ctx.max_repairs + 1} for step "
                     f"{node.name!r}",
                 )
-                text = await self._call(prompt)
+                text = await self._call(prompt, system)
                 cp = cp.with_step(generate_step, text)
 
                 if self._observe(
@@ -417,12 +642,16 @@ class GenericWorker:
 
     # -- helpers ------------------------------------------------------------
 
-    async def _call(self, prompt: str) -> str:
+    async def _call(self, prompt: str, system: str | None = None) -> str:
         from swarmd.router.providers import LLMRequest
 
+        # `system` is the resolved node prefix, not `context.system`: the
+        # difference between the two is the entire caching change. Defaulting
+        # to the bare base prompt keeps a hand-rolled caller (rogues, tests)
+        # working.
         request = LLMRequest(
             prompt=prompt,
-            system=self.context.system,
+            system=self.context.system if system is None else system,
             temperature=self.context.temperature,
             max_tokens=self.context.max_tokens,
             metadata={"agent_id": self.agent_id, "stage": "worker"},

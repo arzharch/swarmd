@@ -180,6 +180,61 @@ async def test_the_integrity_hash_ignores_completion_order():
     assert first.integrity_hash() == second.integrity_hash()
 
 
+async def test_moving_prompt_bytes_between_roles_does_not_change_the_result(
+    monkeypatch,
+):
+    """Prefix caching is a PLACEMENT change, and this is the proof.
+
+    The run-stable bytes -- the task and the frozen criterion -- moved out of
+    the user turn and into the system message so that a provider's automatic
+    prefix cache can hold them. Nothing was added, dropped or reworded, so
+    against a fixed scripted provider the two layouts must produce the same
+    candidates, the same grading and therefore the same integrity hash.
+
+    Asserted against `SWARMD_PREFIX_ORDER=legacy`, which rebuilds the
+    pre-change single user message byte for byte: if the hashes ever diverge,
+    the reordering changed what the run PRODUCED, and the rollback switch is
+    the thing to reach for.
+    """
+    monkeypatch.setenv("SWARMD_PREFIX_ORDER", "legacy")
+    before = await _run().run("reproduce the reported figure")
+
+    monkeypatch.setenv("SWARMD_PREFIX_ORDER", "hoisted")
+    after = await _run().run("reproduce the reported figure")
+
+    assert before.status == after.status == "completed"
+    assert before.criterion is not None and after.criterion is not None
+    assert before.criterion.hash == after.criterion.hash
+    assert before.integrity_hash() == after.integrity_hash()
+    assert [r.candidate.output for r in before.results] == [
+        r.candidate.output for r in after.results
+    ]
+
+
+async def test_the_two_prompt_layouts_are_genuinely_different_prompts():
+    """Guards the test above from being a tautology.
+
+    Equal hashes only mean something if the two arms really did send
+    different bytes. A `SWARMD_PREFIX_ORDER` that silently did nothing would
+    make the parity test pass forever while proving nothing at all.
+    """
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("SWARMD_PREFIX_ORDER", "legacy")
+        legacy = ScriptedProvider()
+        await SwarmRun(legacy, profile="smoke").run("reproduce the reported figure")
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("SWARMD_PREFIX_ORDER", "hoisted")
+        hoisted = ScriptedProvider()
+        await SwarmRun(hoisted, profile="smoke").run("reproduce the reported figure")
+
+    legacy_worker = [p for p in legacy.prompts if "STEP:" in p]
+    hoisted_worker = [p for p in hoisted.prompts if "STEP:" in p]
+    assert legacy_worker and hoisted_worker
+    assert all("TASK:" in p for p in legacy_worker)
+    assert not any("TASK:" in p for p in hoisted_worker)
+
+
 # --- honest failure --------------------------------------------------------
 
 

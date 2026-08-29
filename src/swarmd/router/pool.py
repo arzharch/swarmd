@@ -45,6 +45,7 @@ from swarmd.router.providers import (
     LLMResponse,
     Provider,
     ProviderError,
+    parse_cached_tokens,
 )
 from swarmd.router.quota import QuotaBackend, build_quota
 from swarmd.router.ration import Ration, build_ration
@@ -68,6 +69,19 @@ class ProviderSpec:
     # overwrites its behaviour with what a 429 actually tells it.
     hint_rpm: int = 20
     hint_tpm: int = 6_000
+    # How this provider caches a repeated prompt prefix. A LABEL, not a
+    # switch: nothing in the pool behaves differently on it today.
+    #
+    #   "auto"      the provider caches a byte-identical leading prefix by
+    #               itself, with no field in the request (Groq, OpenRouter,
+    #               Mistral, OpenAI-style generally). This is what the
+    #               prompt reordering in swarm/worker.py is aimed at.
+    #   "explicit"  caching exists but must be asked for (Google's
+    #               `cachedContents`), which is NOT reachable through the
+    #               OpenAI-compat endpoint this adapter talks to. Labelled so
+    #               the gap is visible rather than silently absent.
+    #   "none"      no prompt cache at all (simulated).
+    prefix_cache: str = "auto"
 
 
 # EVERY MODEL ID BELOW WAS CALLED BEFORE IT WAS WRITTEN DOWN, on 2026-08-28,
@@ -119,6 +133,11 @@ REGISTRY: dict[str, ProviderSpec] = {
         ),
         hint_rpm=15,
         hint_tpm=250_000,
+        # Gemini caches on request, via `cachedContents` -- a Google-native
+        # concept with no representation in the OpenAI-compatible payload
+        # this adapter sends. Deferred, deliberately, and named here so it
+        # reads as deferred rather than as forgotten.
+        prefix_cache="explicit",
     ),
     # A GRANT, not a tier: ~1,000 credits that never refill and expire 30 days
     # after issue (see router/budget.py). Ranked behind the replenishing free
@@ -349,6 +368,11 @@ class OpenAICompatProvider(Provider):
                 f"exhausts max_tokens before answering looks exactly like this."
             )
 
+        # What the provider says it served from its own prompt cache. Parsed
+        # on every success because it is the ONLY honest measurement of
+        # whether the prompt reordering in swarm/worker.py is working: a
+        # locally-invented hit counter would be measuring our own intent.
+        cached, cached_reported = parse_cached_tokens(usage)
         return LLMResponse(
             text=text,
             provider=self.name,
@@ -357,6 +381,8 @@ class OpenAICompatProvider(Provider):
             tokens_in=usage.get("prompt_tokens", 0),
             tokens_out=usage.get("completion_tokens", 0),
             rate_headers=headers,
+            cached_tokens=cached,
+            cached_tokens_reported=cached_reported,
         )
 
     async def aclose(self) -> None:
@@ -673,6 +699,7 @@ class ProviderPool(Provider):
                 tier="simulated",
                 hint_rpm=100_000,
                 hint_tpm=100_000_000,
+                prefix_cache="none",
             )
             sim = SimulatedProvider()
             return cls(
@@ -900,6 +927,16 @@ class ProviderPool(Provider):
                     # The estimate becomes the measurement. Until this
                     # call the ration held a forecast; leaving it there would
                     # ration the rest of the session against a guess.
+                    #
+                    # CACHED PROMPT TOKENS ARE NOT SUBTRACTED HERE, and that
+                    # is deliberate. A free tier's daily well generally counts
+                    # cached prompt tokens in full -- the discount, where one
+                    # exists at all, is on price, not on quota. Crediting the
+                    # ration for them would convert a latency win into an
+                    # afternoon of unexpected 429s, which is exactly the
+                    # failure the ration exists to prevent. Cached tokens are
+                    # a cost and latency signal, never quota headroom, until a
+                    # measurement on the live account says otherwise.
                     await self.ration.settle(
                         grant, tokens=resp.tokens_in + resp.tokens_out
                     )
@@ -914,6 +951,10 @@ class ProviderPool(Provider):
                         model=resp.model,
                         requests=1,
                         tokens=resp.tokens_in + resp.tokens_out,
+                        # Carried alongside `tokens`, never deducted from it:
+                        # the journal is what the ration reads back, and the
+                        # quota counts a cached prompt token like any other.
+                        cached_tokens=resp.cached_tokens,
                     )
                     if isinstance(resp.rate_headers, RateHeaders):
                         # The cheapest limit is the one the provider
@@ -933,6 +974,8 @@ class ProviderPool(Provider):
                             model=resp.model,
                             tokens_in=resp.tokens_in,
                             tokens_out=resp.tokens_out,
+                            cached_tokens=resp.cached_tokens,
+                            cached_tokens_reported=resp.cached_tokens_reported,
                             agent_id=agent_id,
                             stage=stage,
                             simulated=slot.simulated,
@@ -946,6 +989,15 @@ class ProviderPool(Provider):
                         model=resp.model,
                         latency_s=resp.latency_s,
                         cost_usd=cost,
+                    )
+                    # Two counters, never a ratio: the ratio is derived at
+                    # read time from numbers the provider stated, so a stored
+                    # hit rate cannot drift from the tokens it summarises.
+                    metrics.record_prompt_tokens(
+                        provider=resp.provider,
+                        stage=stage,
+                        prompt_tokens=resp.tokens_in,
+                        cached_tokens=resp.cached_tokens,
                     )
                     return resp
 
@@ -1113,6 +1165,13 @@ class ProviderPool(Provider):
         ask the provider. Runs providers concurrently but models serially within
         one provider, since a 429 from the first model means the second will
         429 too and probing it would only deepen the backoff.
+
+        Every row carries `prefix_cache`, the spec's label for how this
+        provider caches a repeated prompt prefix. It is not probed -- there is
+        no endpoint that answers it -- but it is reported, because an operator
+        looking at a run whose `cached_tokens` is 0 needs to know whether the
+        provider that served it can cache a prefix at all. "explicit" and
+        "none" explain a zero; "auto" makes a zero worth investigating.
         """
 
         async def one(slot: _Slot) -> dict[str, Any]:
@@ -1125,6 +1184,7 @@ class ProviderPool(Provider):
                 return {
                     "provider": slot.spec.name,
                     "tier": slot.spec.tier,
+                    "prefix_cache": slot.spec.prefix_cache,
                     "ok": False,
                     "reason": "rate_limited",
                     "retry_after_s": exc.retry_after_s,
@@ -1134,6 +1194,7 @@ class ProviderPool(Provider):
                 return {
                     "provider": slot.spec.name,
                     "tier": slot.spec.tier,
+                    "prefix_cache": slot.spec.prefix_cache,
                     "ok": False,
                     "reason": str(exc)[:160],
                 }
@@ -1141,6 +1202,7 @@ class ProviderPool(Provider):
             return {
                 "provider": slot.spec.name,
                 "tier": slot.spec.tier,
+                "prefix_cache": slot.spec.prefix_cache,
                 "ok": True,
                 "model": resp.model,
                 "latency_s": round(time.monotonic() - start, 3),
