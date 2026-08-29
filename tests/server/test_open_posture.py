@@ -100,7 +100,7 @@ def test_a_protected_bind_produces_no_warning():
 def test_the_serve_command_prints_the_warning(capsys, monkeypatch):
     """Printed rather than logged. A warning that only reaches the log is a
     warning that scrolls past during startup."""
-    import swarmd.cli as cli
+    from swarmd import cli
 
     monkeypatch.setenv(ENV_ALLOW_OPEN, "1")
     monkeypatch.delenv(ENV_TOKEN, raising=False)
