@@ -550,3 +550,74 @@ def test_egress_still_permits_the_provider_ranges():
             if 443 in ports:
                 https_targets += len(rule.get("to", []))
     assert https_targets >= 3, "no egress ranges permitted for provider APIs"
+
+
+# --- running without auth is only safe if something else restricts access ----
+
+
+def _open_mode_declared():
+    for path, doc in _all_deploy_docs():
+        if doc.get("kind") != "ConfigMap":
+            continue
+        value = str((doc.get("data") or {}).get("SWARMD_ALLOW_OPEN", ""))
+        if value in TRUTHY:
+            return path
+    return None
+
+
+def test_open_mode_is_backed_by_a_network_policy():
+    """The compensating control, made enforceable.
+
+    User auth is out of MVP scope, so the deployed control plane binds 0.0.0.0
+    with no token. What makes that defensible is NOT the missing token -- it is
+    that only the dashboard pod and the ingress controller can reach port 8000.
+    Delete the NetworkPolicy and the same manifests become an open run API that
+    spends real provider quota, with nothing in the diff to say so.
+    """
+    declared = _open_mode_declared()
+    if declared is None:
+        pytest.skip("open mode is not declared; the token is doing the work")
+
+    policies = [
+        doc for _, doc in _all_deploy_docs() if doc.get("kind") == "NetworkPolicy"
+    ]
+    assert policies, (
+        f"{declared} sets SWARMD_ALLOW_OPEN with no NetworkPolicy anywhere in "
+        f"deploy/: the control plane would accept run submissions from any pod "
+        f"in the cluster"
+    )
+
+    # A default-deny, so a new workload is restricted rather than exposed until
+    # somebody remembers to restrict it.
+    assert any(
+        p.get("spec", {}).get("podSelector") == {}
+        and set(p.get("spec", {}).get("policyTypes", [])) >= {"Ingress"}
+        for p in policies
+    ), "no default-deny ingress policy; allow-listing on top of nothing"
+
+    # And something has to actually name the control plane's port.
+    guarded = [
+        p for p in policies
+        if any(
+            str(port.get("port")) == "8000"
+            for rule in p.get("spec", {}).get("ingress", []) or []
+            for port in rule.get("ports", []) or []
+        )
+    ]
+    assert guarded, "no NetworkPolicy admits port 8000 from a restricted source"
+
+
+def test_open_mode_is_declared_rather_than_implied():
+    """`SWARMD_ALLOW_OPEN` must be set explicitly where a reviewer sees it.
+
+    The control plane refuses to bind a public interface without it, so its
+    absence is a crash rather than a silent exposure -- but its PRESENCE should
+    be a line someone consciously added, not a default buried in code.
+    """
+    declared = _open_mode_declared()
+    if declared is None:
+        pytest.skip("open mode is not declared")
+    text = declared.read_text(encoding="utf-8")
+    assert "NetworkPolicy" in text or "NO USER AUTH" in text, (
+        f"{declared} enables open mode without recording why it is safe"
+    )

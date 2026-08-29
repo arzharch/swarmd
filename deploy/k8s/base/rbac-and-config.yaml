@@ -57,6 +57,19 @@ data:
   # endpoint served without the operator token.
   SWARMD_ENV: "prod"
   SWARMD_LOG_FORMAT: "json"
+  # NO USER AUTH, DELIBERATELY, and this is where that decision is visible in a
+  # diff rather than implied by an unset variable. The container binds 0.0.0.0
+  # because a pod must; without this the control plane refuses to start, which
+  # is the intended behaviour for an accidental public bind.
+  #
+  # What makes it safe here is NOT the absence of a token. It is the
+  # default-deny NetworkPolicy below: port 8000 admits the dashboard pod and
+  # the ingress controller and nothing else. Remove that policy and this line
+  # becomes an open run API that spends real provider quota.
+  #
+  # Setting SWARMD_API_TOKEN in the secret turns auth on and this line becomes
+  # redundant; it is left out of MVP scope, not out of the design.
+  SWARMD_ALLOW_OPEN: "1"
 ---
 apiVersion: v1
 kind: Secret

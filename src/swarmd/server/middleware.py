@@ -71,16 +71,65 @@ class InsecureConfiguration(RuntimeError):
     """
 
 
-def require_safe_configuration(host: str, token: str | None) -> None:
-    """Refuse to start wide open on a non-loopback interface."""
-    loopback = host in {"127.0.0.1", "localhost", "::1"}
-    if loopback or token:
+ENV_ALLOW_OPEN = "SWARMD_ALLOW_OPEN"
+
+LOOPBACK = {"127.0.0.1", "localhost", "::1"}
+
+
+def require_safe_configuration(
+    host: str, token: str | None, *, allow_open: bool | None = None
+) -> None:
+    """Refuse to start wide open on a non-loopback interface BY ACCIDENT.
+
+    User authentication is deliberately out of MVP scope: this is an operator
+    tool, and the run API is not a multi-tenant surface. That is a defensible
+    decision and it is not the same as an unguarded one, so running open has to
+    be something you SAY, not something you get by forgetting a variable.
+
+    Three ways to start:
+
+      bind loopback             the default, and what local development uses
+      set SWARMD_API_TOKEN      auth on, for anything reachable off-host
+      set SWARMD_ALLOW_OPEN=1   auth off on a public bind, deliberately
+
+    The third is what a deployment uses while auth is out of scope, and it is
+    only honest because something else is doing the work: in Kubernetes a
+    default-deny NetworkPolicy admits port 8000 from the dashboard pod and the
+    ingress controller and nothing else (deploy/k8s/base/rbac-and-config.yaml).
+    Set it anywhere without an equivalent control and the run API -- which
+    spends real provider quota -- is reachable by anything that can route to
+    the port.
+    """
+    if allow_open is None:
+        allow_open = _truthy(os.environ.get(ENV_ALLOW_OPEN, ""))
+    if host in LOOPBACK or token or allow_open:
         return
     raise InsecureConfiguration(
         f"refusing to bind {host} with no {ENV_TOKEN} set. swarmd has no user "
-        f"auth by design (ADR-013); the operator token is what stands between "
-        f"the run API and anyone who can reach the port. Either bind 127.0.0.1 "
-        f"or set {ENV_TOKEN}."
+        f"auth by design (ADR-013); nothing here distinguishes one caller from "
+        f"another, and the run API spends real provider quota. Either bind "
+        f"127.0.0.1, set {ENV_TOKEN}, or set {ENV_ALLOW_OPEN}=1 to say you "
+        f"have restricted access some other way."
+    )
+
+
+def _truthy(value: str) -> bool:
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def exposure_warning(host: str, token: str | None) -> str:
+    """One line naming exactly what is exposed, or "" when nothing is.
+
+    Returned rather than logged so the CLI can print it where an operator will
+    actually see it. A warning that only reaches the log is a warning that
+    scrolls past during startup.
+    """
+    if token or host in LOOPBACK:
+        return ""
+    return (
+        f"OPEN: bound to {host} with no {ENV_TOKEN}. Every endpoint, including "
+        f"run submission, is reachable by anything that can route here. This is "
+        f"only safe behind a network control that restricts who can."
     )
 
 

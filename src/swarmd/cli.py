@@ -367,6 +367,13 @@ def main(argv: list[str] | None = None) -> int:
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8000)
     serve.add_argument("--skills", default=None, metavar="PATH")
+    serve.add_argument(
+        "--allow-open", action="store_true",
+        help="bind a non-loopback interface with no operator token. Required "
+        "to be explicit: user auth is out of MVP scope, so running open is a "
+        "decision, not a default. Only safe behind a network control that "
+        "restricts who can reach the port.",
+    )
 
     approve = sub.add_parser("approve", help="approve a pending item (HITL)")
     approve.add_argument("request_id")
@@ -1085,6 +1092,7 @@ def _serve_command(args: argparse.Namespace) -> int:
         from swarmd.server.middleware import (
             ENV_TOKEN,
             InsecureConfiguration,
+            exposure_warning,
             require_safe_configuration,
         )
     except ImportError:
@@ -1094,19 +1102,24 @@ def _serve_command(args: argparse.Namespace) -> int:
     logs.configure()
     token = os.environ.get(ENV_TOKEN, "")
     try:
-        require_safe_configuration(args.host, token)
+        require_safe_configuration(
+            args.host, token, allow_open=args.allow_open or None
+        )
     except InsecureConfiguration as exc:
         print(f"refusing to start: {exc}")
         return 2
 
     app = create_app(skills_path=args.skills)
     print(f"swarmd control plane on http://{args.host}:{args.port}")
-    print(
-        "  auth:      operator token required"
-        if token
-        else "  auth:      OPEN (loopback only; set "
-        f"{ENV_TOKEN} before exposing this)"
-    )
+    if token:
+        print("  auth:      operator token required")
+    else:
+        print(f"  auth:      OPEN, no user auth (MVP scope; set {ENV_TOKEN} to enable)")
+    warning = exposure_warning(args.host, token)
+    if warning:
+        # Printed, not just logged. An operator who deliberately opened this up
+        # should still be told, every start, exactly what they opened.
+        print(f"  ! {warning}")
     print(f"  stream:    ws://{args.host}:{args.port}/api/stream")
     print(f"  health:    http://{args.host}:{args.port}/healthz")
     print(f"  metrics:   http://{args.host}:{args.port}/metrics")

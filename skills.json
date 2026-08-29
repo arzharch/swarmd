@@ -329,6 +329,66 @@
       "successes": 0,
       "retired": false,
       "retired_reason": ""
+    },
+    {
+      "skill_id": "feee0bffd226",
+      "name": "profile_files approach",
+      "task_pattern": "A CSV has inconsistent column names ('Cust ID', 'customer_id', 'CustomerID') across three files. Produce a normalisation mapping and a summary of how many columns each file contributes after normalisation.",
+      "instruction": "When a step calls for this: Scan all three CSV files and emit a JSON object listing each file path, its raw column names, and a sample value for each column (first non-null cell) so column semantics can be guessed. Produce a JSON object with these fields: canonical_id_column (str), columns_per_file (dict), file_column_counts (dict), file_profiles (list), normalisation_mapping (dict), synonyms (list). Values must come from the task at hand -- this records the shape that satisfied the criterion 2 times, not the answer, which will differ.",
+      "provenance_run": "eval-cus-wrangle-1-2001-t",
+      "provenance_criterion": "462d441ca79dd8eb",
+      "created_ts": 1788005470.7390416,
+      "approved": false,
+      "approved_by": "",
+      "uses": 0,
+      "successes": 0,
+      "retired": false,
+      "retired_reason": ""
+    },
+    {
+      "skill_id": "e34a30c9e06e",
+      "name": "infer_canonical_fields approach",
+      "task_pattern": "A CSV has inconsistent column names ('Cust ID', 'customer_id', 'CustomerID') across three files. Produce a normalisation mapping and a summary of how many columns each file contributes after normalisation.",
+      "instruction": "When a step calls for this: Using the profile, cluster semantically equivalent columns (e.g. 'Cust ID', 'customer_id', 'CustomerID' -> canonical 'customer_id') and produce a JSON mapping: {raw_column_name: canonical_name} covering every raw column seen. Produce a JSON object with these fields: file_column_counts (dict), normalisation_mapping (dict). Values must come from the task at hand -- this records the shape that satisfied the criterion 2 times, not the answer, which will differ.",
+      "provenance_run": "eval-cus-wrangle-1-2001-t",
+      "provenance_criterion": "462d441ca79dd8eb",
+      "created_ts": 1788005470.7450786,
+      "approved": false,
+      "approved_by": "",
+      "uses": 0,
+      "successes": 0,
+      "retired": false,
+      "retired_reason": ""
+    },
+    {
+      "skill_id": "5a767d0fe499",
+      "name": "count_contributions approach",
+      "task_pattern": "A CSV has inconsistent column names ('Cust ID', 'customer_id', 'CustomerID') across three files. Produce a normalisation mapping and a summary of how many columns each file contributes after normalisation.",
+      "instruction": "When a step calls for this: For each file, apply the canonical mapping to its raw columns and emit a summary JSON: {file_path: {canonical_name: count_of_source_columns, total_canonical_columns: n}} showing how many raw columns collapsed into each canonical field. Produce a JSON object with these fields: file_column_counts (dict), normalisation_mapping (dict). Values must come from the task at hand -- this records the shape that satisfied the criterion 2 times, not the answer, which will differ.",
+      "provenance_run": "eval-cus-wrangle-1-2001-t",
+      "provenance_criterion": "462d441ca79dd8eb",
+      "created_ts": 1788005470.7487762,
+      "approved": false,
+      "approved_by": "",
+      "uses": 0,
+      "successes": 0,
+      "retired": false,
+      "retired_reason": ""
+    },
+    {
+      "skill_id": "66a8a8516d5c",
+      "name": "write_normalisation_report approach",
+      "task_pattern": "A CSV has inconsistent column names ('Cust ID', 'customer_id', 'CustomerID') across three files. Produce a normalisation mapping and a summary of how many columns each file contributes after normalisation.",
+      "instruction": "When a step calls for this: Write a single CSV or JSON report containing the raw-to-canonical mapping table and the per-file contribution summary, suitable for downstream pipelines. Produce a JSON object with these fields: canonical_schema (list), file_column_counts (dict), normalisation_mapping (dict), normalisation_rules (str), report_metadata (dict), summary (str). Values must come from the task at hand -- this records the shape that satisfied the criterion 2 times, not the answer, which will differ.",
+      "provenance_run": "eval-cus-wrangle-1-2001-t",
+      "provenance_criterion": "462d441ca79dd8eb",
+      "created_ts": 1788005470.751285,
+      "approved": false,
+      "approved_by": "",
+      "uses": 0,
+      "successes": 0,
+      "retired": false,
+      "retired_reason": ""
     }
   ]
 }
