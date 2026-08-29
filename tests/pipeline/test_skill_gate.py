@@ -20,6 +20,16 @@ from swarmd.hitl.stores import SqliteApprovalStore
 from swarmd.swarm.skills import SkillLibrary
 
 
+# The CLI loads `.env` so a fresh checkout finds its provider keys. That file
+# also carries DATABASE_URL, which would send these subprocesses to Postgres
+# instead of the SQLite store the fixture just populated. An explicit empty
+# value wins over the file -- the loader never overrides what the environment
+# already says -- which is the same escape hatch a developer gets.
+def _cli_env():
+    import os
+    return {**os.environ, "DATABASE_URL": "", "SWARMD_SIMULATED_PROVIDER": "true"}
+
+
 @pytest.fixture
 def gate(tmp_path):
     return SkillGate(
@@ -187,6 +197,7 @@ def test_approving_a_skill_from_the_cli_applies_it(tmp_path, monkeypatch):
             "--actor", "cli-reviewer", "--skills", str(library_path),
         ],
         capture_output=True, text=True, check=False, timeout=60,
+        env=_cli_env(),
     )
     assert result.returncode == 0, result.stderr
     assert "approved into the library" in result.stdout
@@ -210,6 +221,7 @@ def test_approving_a_skill_without_the_library_warns_about_divergence(
     result = subprocess.run(
         [sys.executable, "-m", "swarmd.cli", "approve", request.request_id],
         capture_output=True, text=True, check=False, timeout=60,
+        env=_cli_env(),
     )
     # No --skills: the gate builds an empty in-memory library, cannot find the
     # skill, and must say so rather than reporting success.
@@ -230,6 +242,7 @@ def test_queued_skills_show_up_in_the_shared_list_command(tmp_path, monkeypatch)
     result = subprocess.run(
         [sys.executable, "-m", "swarmd.cli", "list"],
         capture_output=True, text=True, check=False, timeout=60,
+        env=_cli_env(),
     )
     assert request.request_id in result.stdout
     assert "skill" in result.stdout
