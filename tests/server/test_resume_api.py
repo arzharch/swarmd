@@ -50,7 +50,9 @@ def test_a_run_is_persisted_where_a_resume_can_find_it(client, store_root):
                                           "profile": "smoke", "chaos": False}).json()
     wait_for(client, body["run_id"])
 
-    listed = client.get("/api/runs/resumable").json()["runs"]
+    # ?all=true, because a finished run is deliberately not offered as
+    # resumable; the question here is only whether it reached disk.
+    listed = client.get("/api/runs/resumable?all=true").json()["runs"]
     assert body["run_id"] in {r["run_id"] for r in listed}
 
 
@@ -97,20 +99,54 @@ def test_resuming_a_run_with_no_task_recorded_says_why(client, store_root):
     assert "no task recorded" in response.json()["detail"]
 
 
+def test_a_finished_run_is_not_offered_as_resumable(client, store_root):
+    """The stored status has to reach a terminal state, not just be set on the
+    way into a pause. It stayed "running" on disk forever, so the endpoint
+    offered every completed run as resumable."""
+    body = client.post("/api/runs", json={"task": "count the records",
+                                          "profile": "smoke",
+                                          "chaos": False}).json()
+    wait_for(client, body["run_id"])
+
+    listed = client.get("/api/runs/resumable").json()["runs"]
+    assert body["run_id"] not in {r["run_id"] for r in listed}
+
+    # Still visible when explicitly asked for, and reporting what happened.
+    every = client.get("/api/runs/resumable?all=true").json()["runs"]
+    row = next(r for r in every if r["run_id"] == body["run_id"])
+    assert row["status"] == "completed"
+
+
+def test_resuming_a_finished_run_is_refused(client, store_root):
+    """It would re-run distillation over work already banked and report a
+    second result against the same run id."""
+    body = client.post("/api/runs", json={"task": "count the records",
+                                          "profile": "smoke",
+                                          "chaos": False}).json()
+    wait_for(client, body["run_id"])
+
+    response = client.post(f"/api/runs/{body['run_id']}/resume")
+    assert response.status_code == 409
+    assert "already finished" in response.json()["detail"]
+
+
 def test_a_resumed_run_reports_a_terminal_status(client, store_root):
     """Submit and resume share one launcher for this reason: a second copy
     drifted into never recording the finish, leaving resumed runs permanently
     'running' in the dashboard."""
-    first = client.post("/api/runs", json={"task": "count the records",
-                                           "profile": "smoke",
-                                           "chaos": False}).json()
-    wait_for(client, first["run_id"])
-
-    response = client.post(f"/api/runs/{first['run_id']}/resume")
+    RunStore(store_root).save(
+        RunState(
+            run_id="run-midway",
+            task="count the records",
+            profile="smoke",
+            agents=15,
+            status="paused",
+        )
+    )
+    response = client.post("/api/runs/run-midway/resume")
     assert response.status_code == 202
-    body = wait_for(client, first["run_id"])
+    body = wait_for(client, "run-midway")
     assert body["status"] == "completed"
-    assert body["resumed_from_nodes"] >= 1
 
 
 def test_resuming_a_live_run_is_refused(client, store_root):

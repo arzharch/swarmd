@@ -318,8 +318,13 @@ def create_app(
         status = provider.pace_status() if hasattr(provider, "pace_status") else {}
         return JSONResponse(status or {"paused": False})
 
+    # A run that reached one of these is finished. Resuming it would re-run
+    # distillation over work already banked and report a second result for the
+    # same run id.
+    TERMINAL = {"completed", "failed_criterion", "aborted", "error", "cancelled"}
+
     @app.get("/api/runs/resumable")
-    async def list_resumable() -> JSONResponse:
+    async def list_resumable(all: bool = False) -> JSONResponse:
         """Runs on disk that can be picked back up.
 
         Deliberately NOT the in-process registry: that is emptied by a restart,
@@ -343,6 +348,7 @@ def create_app(
                         "has_plan": bool(s.plan),
                     }
                     for s in app.state.run_store.list_runs()
+                    if all or s.status not in TERMINAL
                 ]
             }
         )
@@ -393,6 +399,20 @@ def create_app(
         would be graded against a target the first half never saw, while the
         report still quoted one hash for both.
         """
+        try:
+            stored = app.state.run_store.load(run_id)
+        except IncompatibleRunState as exc:
+            # 409, not 500: the document is intact and the request is well
+            # formed. This build simply cannot read that shape, and no retry
+            # will change it.
+            raise HTTPException(409, str(exc)) from exc
+        if stored is not None and stored.status in TERMINAL:
+            raise HTTPException(
+                409,
+                f"run {run_id} already finished ({stored.status}); resuming it "
+                f"would re-run distillation over work already banked",
+            )
+
         existing = app.state.registry.tasks.get(run_id)
         if existing is not None and not existing.done():
             # Two live runs sharing a run id would interleave their writes into

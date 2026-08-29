@@ -610,6 +610,15 @@ class SwarmRun:
             self._emit("run_failed", reason=result.status, detail=result.error)
 
         result.duration_s = time.monotonic() - started
+        # The stored status has to reach a terminal state, not just be set on
+        # the way into a pause. Without this a finished run stayed "running" on
+        # disk forever, so `runs list` and `/api/runs/resumable` offered it as
+        # resumable -- and resuming a completed run re-runs its distillation
+        # against work that was already banked.
+        self.state.status = result.status
+        self.state.paused_reason = ""
+        self.state.resumes_at = 0.0
+        self.persist()
         self._emit("run_finished", **{
             k: v for k, v in result.to_dict().items() if k != "results"
         })

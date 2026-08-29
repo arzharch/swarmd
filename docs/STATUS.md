@@ -259,9 +259,41 @@ counts down locally so it does not freeze between minute heartbeats.
 pause and projected finish, because a yes/no verdict stopped being the right
 shape once running out means waiting instead of failing.
 
+### Not hitting the limit in the first place
+
+Pacing decides how fast a known allowance is spent. Two changes decide whether
+the allowance is known at all, and both closed gaps that were costing capacity
+silently.
+
+**The provider was telling us and we were not listening.** Every response
+carries `x-ratelimit-*` saying what is left and when it refills, and all of it
+was discarded until a 429 taught the same lesson one rejected request later —
+a rejection several providers charge to the daily allowance. A success
+reporting zero remaining for two hours now blocks the provider directly.
+
+Three defects surfaced wiring it, none of which were visible from outside:
+
+- `_retry_after` parsed reset headers with `float(raw.rstrip("s"))`, which
+  throws on Groq's `"2m59.56s"`. The provider that states its reset most
+  precisely was the one whose word was thrown away for a guessed backoff.
+- A 429 whose wait was measured in hours was answered by halving the
+  per-minute bucket — that is, by retrying a spent day slightly more slowly,
+  earning another rejection per retry.
+- `blocked()` never read the `exhausted` rows that `observe_day_limit` writes.
+  The ration honoured the provider's own word; the pool's budget gate did not,
+  and kept offering a provider that had already said no.
+
+**Tokens are now paced per minute, not just requests.** Groq allows 30 requests
+and 8,000 tokens a minute against calls averaging a little over 1,000 tokens,
+so a request-only limiter sends 30 legal requests carrying 30,000 tokens into
+an 8,000-token minute. Both dimensions are taken together or not at all:
+granting requests while refusing tokens leaked the request allowance every time
+tokens were the binding dimension.
+
 **Still not measured:** every pacing test above uses a fake clock or a
 deliberately tiny ration. The pause has not yet been exercised against a real
-provider's real daily reset, which takes a day to observe by construction.
+provider's real daily reset, which takes a day to observe by construction, and
+the header path has not yet seen a real provider report itself empty.
 
 ### Smaller, and not blocking
 - No on-call rotation (single maintainer — stated, not solvable).
