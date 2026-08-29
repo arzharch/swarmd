@@ -267,3 +267,35 @@ async def test_closing_the_pacer_stops_its_ticker(pacer):
     await pacer.aclose()
     await asyncio.wait_for(task, timeout=2.0)
     assert pacer._ticker is None or pacer._ticker.done()
+
+
+# --- observability -----------------------------------------------------------
+
+
+async def test_a_pause_is_visible_to_prometheus(pacer):
+    """The pacer exists to stop hitting 429s, so "throttled" stopped being the
+    saturation signal and "parked" became it. A parked run emits nothing,
+    finishes nothing and errors on nothing -- without a metric it is
+    indistinguishable from a hang to everything watching."""
+    from swarmd.observability import metrics
+
+    task = asyncio.create_task(pacer.park(cause(seconds=30), agent_id="a0001"))
+    await asyncio.sleep(0.03)
+    assert metrics.metric("run_paused")._value.get() == 1
+
+    await pacer.wake()
+    await asyncio.wait_for(task, timeout=2.0)
+    assert metrics.metric("run_paused")._value.get() == 0
+
+
+async def test_time_spent_parked_is_counted(pacer):
+    from swarmd.observability import metrics
+
+    before = metrics.metric("pause_seconds").labels(
+        provider="p", reason="session_ration"
+    )._value.get()
+    await pacer.park(cause(seconds=0.05))
+    after = metrics.metric("pause_seconds").labels(
+        provider="p", reason="session_ration"
+    )._value.get()
+    assert after > before

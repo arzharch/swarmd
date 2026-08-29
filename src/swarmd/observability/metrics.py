@@ -156,6 +156,26 @@ def _build() -> tuple[Any, dict[str, Any]]:
             "Requests believed remaining in a provider's window",
             ["provider", "window"],
         ),
+        # A PAUSED run is the saturation signal that replaced the 429. The
+        # pacer exists to stop hitting limits, so "throttled" stopped being the
+        # thing to alert on and "waiting for a ration" became it -- and a
+        # parked run emits nothing, finishes nothing and errors on nothing,
+        # which is indistinguishable from a hang to everything watching.
+        "run_paused": gauge(
+            "run_paused",
+            "1 while the pool is parked waiting for provider capacity",
+            [],
+        ),
+        "pause_seconds": counter(
+            "pause_seconds_total",
+            "Cumulative wall-clock spent parked on a provider ration",
+            ["provider", "reason"],
+        ),
+        "pauses": counter(
+            "pauses_total",
+            "Pauses entered, by provider and the dimension that ran out",
+            ["provider", "dimension"],
+        ),
         # --- cost, treated as a first-class signal -------------------------
         "cost_usd": counter(
             "cost_usd_total", "Cumulative spend, by provider", ["provider"]
@@ -235,6 +255,19 @@ def record_llm_call(
 def record_llm_error(*, provider: str, model: str, reason: str) -> None:
     metric("llm_calls").labels(provider=provider, model=model, outcome="error").inc()
     metric("llm_errors").labels(provider=provider, reason=reason).inc()
+
+
+def record_pause(*, provider: str, dimension: str) -> None:
+    """A run has parked. Paired with `record_resume`, which closes the gauge."""
+    metric("run_paused").set(1)
+    metric("pauses").labels(provider=provider or "-", dimension=dimension or "-").inc()
+
+
+def record_resume(*, provider: str, reason: str, waited_s: float) -> None:
+    metric("run_paused").set(0)
+    metric("pause_seconds").labels(
+        provider=provider or "-", reason=reason or "-"
+    ).inc(max(0.0, waited_s))
 
 
 def record_rate_limited(*, provider: str, model: str = "-") -> None:

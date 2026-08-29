@@ -37,6 +37,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+from swarmd.observability import metrics
+
 logger = logging.getLogger(__name__)
 
 # How often a paused run says it is still waiting. Sixty seconds because a
@@ -244,6 +246,7 @@ class Pacer:
                 self._publish("pace_stalled", cause, extensions=self.extensions)
         else:
             self.extensions = 0
+        metrics.record_pause(provider=cause.provider, dimension=cause.dimension)
         if self.on_pause is not None:
             self._safely(self.on_pause, cause)
         logger.warning(
@@ -302,6 +305,11 @@ class Pacer:
             cause = self.cause
             self.cause = None
             self._event.set()
+        metrics.record_resume(
+            provider=cause.provider if cause else "",
+            reason=cause.reason if cause else "",
+            waited_s=waited,
+        )
         if self.on_resume is not None:
             self._safely(self.on_resume, cause)
         logger.info("resumed after %.0fs (%s)", waited, by)
