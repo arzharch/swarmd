@@ -94,9 +94,12 @@ PROFILES = {
     # accuracy" where a numeric_range check wants 94.3 -- and giving it one
     # attempt meant the mechanism barely ran. Repairs are the cheapest quality
     # lever available: one extra call against a candidate that already exists.
+    # 15, not 8: plans typically come back with three nodes, and 8 over three
+    # nodes is two agents a node -- below MIN_POOL, so the profile's headline
+    # count described a population the run never actually kept in flight.
     "smoke": Profile(
-        "smoke", 8, 3, 2, 25,
-        "CI and quick checks: ~25 calls, under a minute",
+        "smoke", 15, 3, 2, 30,
+        "CI and quick checks: ~30 calls, under a minute",
     ),
     # The everyday run. ~90 calls means roughly a dozen a day inside the
     # measured budget, with room left for an eval sweep.
@@ -114,7 +117,7 @@ PROFILES = {
     # this by tasks x arms x repeats, so a profile that is merely "small" here
     # becomes a day's budget there.
     "eval": Profile(
-        "eval", 8, 3, 2, 25,
+        "eval", 15, 3, 2, 30,
         "one task within a sweep: kept small because the sweep multiplies it",
     ),
 }
@@ -123,6 +126,22 @@ PROFILES = {
 # ADVISORY_POOL caps the pool a PROFILE implies, so a profile cannot silently
 # become enormous. An explicit `--agents` is honoured in full instead.
 ADVISORY_POOL = 32
+
+# MIN_POOL is the operating floor: how many agents a node keeps in flight at
+# once unless the operator explicitly asks for fewer.
+#
+# Five, not two, and the reason is operational rather than statistical. Two is
+# the floor DISTILLATION needs -- it will not propose a skill without two
+# independent verified successes on the same node -- so a pool of two makes the
+# learning loop technically alive and practically useless: every candidate has
+# to succeed for anything to be learned. Five leaves room for the population to
+# actually differ, which is the entire premise of running a population rather
+# than one agent with retries.
+#
+# It is also what the deployment is sized for before scaling up: the profiles
+# below are set so their stated agent count divides into at least this per
+# node, rather than quietly running two.
+MIN_POOL = 5
 
 # MAX_IN_FLIGHT bounds how many agents run at once, whatever the population.
 # This is a concurrency bound, not a population bound, and the distinction is
@@ -750,9 +769,35 @@ class SwarmRun:
           thundering herd.
         """
         nodes = max(1, len(plan.nodes))
-        budget = max(2, self.agents // nodes)
+        budget = max(MIN_POOL, self.agents // nodes)
         if not self.agents_explicit:
             return min(ADVISORY_POOL, budget)
+
+        # An operator who explicitly asks for fewer than the floor gets fewer.
+        # The floor is an operating default, not a veto: a deliberate 2-agent
+        # run is a legitimate thing to ask for, and a cap that cannot be
+        # overridden is a lie about who is in control.
+        if self.agents < MIN_POOL * nodes:
+            # Down to two, never to one. Two is not an operating preference,
+            # it is what distillation structurally requires: it will not
+            # propose a skill without two independent verified successes on the
+            # same node, so a pool of one turns the learning loop off entirely.
+            budget = max(2, self.agents // nodes)
+            self._emit(
+                "pool_below_floor",
+                requested=self.agents,
+                per_node=budget,
+                floor=MIN_POOL,
+                reason=(
+                    f"{self.agents} agents over {nodes} nodes is {budget} per "
+                    f"node, below the {MIN_POOL} the run normally keeps in "
+                    f"flight. Honoured as asked. Note that distillation needs "
+                    f"two independent verified successes on the same node, so "
+                    f"a per-node pool of one makes the learning loop "
+                    f"structurally dead."
+                ),
+            )
+            return budget
 
         # AN EXPLICIT COUNT IS HONOURED EXACTLY. Asking for 1000 agents used to
         # give 192 -- HARD_POOL silently clamped each node's pool to 64 -- and
