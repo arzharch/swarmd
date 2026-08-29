@@ -232,3 +232,49 @@ def test_pace_says_whether_the_pool_is_waiting(client):
     errors, nothing finishing. This is what separates them."""
     body = client.get("/api/pace").json()
     assert "paused" in body
+
+
+def test_shutdown_marks_in_flight_runs_as_interrupted(tmp_path, store_root):
+    """Runs are background tasks, not request handlers, so uvicorn exits
+    thinking it is idle. The work survives -- the store persists at every
+    boundary -- but the RECORD did not: a killed run's document still said
+    "running", so the listing reported work no process was doing, forever.
+
+    Leaving the TestClient context is what fires the shutdown event, which is
+    the same path SIGTERM takes.
+    """
+    import asyncio
+
+    RunStore(store_root).save(
+        RunState(run_id="run-inflight", task="going", profile="smoke")
+    )
+    app = create_app(
+        provider_factory=FakeProvider, skills_path=str(tmp_path / "skills.json")
+    )
+    with TestClient(app) as client:
+        async def plant():
+            app.state.registry.tasks["run-inflight"] = asyncio.create_task(
+                asyncio.sleep(30)
+            )
+
+        client.portal.call(plant)  # type: ignore[attr-defined]
+
+    state = RunStore(store_root).load("run-inflight")
+    assert state is not None
+    assert state.status == "interrupted"
+    assert "shut down" in state.paused_reason
+
+
+def test_an_interrupted_run_is_still_resumable(client, store_root):
+    """"interrupted" is not terminal: it is precisely the state a resume is
+    for. Classifying it as finished would strand the work."""
+    RunStore(store_root).save(
+        RunState(
+            run_id="run-cut", task="count the records", profile="smoke",
+            agents=15, status="interrupted",
+        )
+    )
+    listed = client.get("/api/runs/resumable").json()["runs"]
+    assert "run-cut" in {r["run_id"] for r in listed}
+    assert client.post("/api/runs/run-cut/resume").status_code == 202
+    wait_for(client, "run-cut")

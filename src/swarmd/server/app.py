@@ -50,6 +50,12 @@ logger = logging.getLogger(__name__)
 
 START_TS = time.time()
 
+# A run that reached one of these is finished. Resuming it would re-run
+# distillation over work already banked and report a second result for the same
+# run id. "interrupted" is deliberately NOT here: that is exactly the state a
+# resume is for.
+TERMINAL = {"completed", "failed_criterion", "aborted", "error", "cancelled"}
+
 # Ledger rows retained per run in the in-process index. Why 5000: enough to
 # reconstruct a standard run end to end, bounded so a deep run does not pin
 # tens of thousands of rows in a long-lived control plane.
@@ -109,6 +115,53 @@ class RunRegistry:
         )
 
 
+@contextlib.asynccontextmanager
+async def _lifespan(app: Any) -> Any:
+    """Startup and shutdown for the control plane.
+
+    Nothing to do on the way in. On the way out, say what happened to the runs
+    this pod was carrying -- see `_mark_in_flight_interrupted`.
+    """
+    yield
+    await _mark_in_flight_interrupted(app)
+
+
+async def _mark_in_flight_interrupted(app: Any) -> None:
+    """Record that in-flight runs stopped, so the listing stays honest.
+
+    Runs are background tasks, not request handlers, so uvicorn considers
+    itself idle and exits while they are still going -- the 120s grace period
+    in the Deployment was being spent waiting for nothing. The work itself is
+    safe: the run store persists at every boundary that costs money, so a
+    resume picks up where it stopped.
+
+    What was NOT safe was the record. A killed run's document still said
+    "running", so `swarmd runs list` and /api/runs/resumable reported work in
+    progress that no process was doing, indefinitely. Marking it is the
+    difference between a resumable run and a lie.
+    """
+    store = app.state.run_store
+    for run_id, task in list(app.state.registry.tasks.items()):
+        if task.done():
+            continue
+        task.cancel()
+        app.state.registry.record(run_id, {"status": "interrupted"})
+        try:
+            state = store.load(run_id)
+        except Exception as exc:  # noqa: BLE001 - shutdown must not raise
+            logger.warning("could not mark run %s interrupted: %s", run_id, exc)
+            continue
+        if state is None or state.status in TERMINAL:
+            continue
+        # Not "paused": nothing is waiting on a clock, and a resume should not
+        # tell an operator to expect it to come back on its own.
+        state.status = "interrupted"
+        state.paused_reason = "control plane shut down"
+        state.resumes_at = 0.0
+        store.save(state)
+        logger.warning("run %s interrupted by shutdown; resumable", run_id)
+
+
 def create_app(
     *,
     hub: EventHub | None = None,
@@ -131,6 +184,7 @@ def create_app(
         # reaches the port. Useful locally; not a thing to expose.
         docs_url="/docs" if os.environ.get("SWARMD_ENV", "dev") == "dev" else None,
         redoc_url=None,
+        lifespan=_lifespan,
         openapi_url="/openapi.json"
         if os.environ.get("SWARMD_ENV", "dev") == "dev"
         else None,
@@ -321,11 +375,6 @@ def create_app(
             return JSONResponse({"status": "no_provider_capacity", "detail": str(exc)})
         status = provider.pace_status() if hasattr(provider, "pace_status") else {}
         return JSONResponse(status or {"paused": False})
-
-    # A run that reached one of these is finished. Resuming it would re-run
-    # distillation over work already banked and report a second result for the
-    # same run id.
-    TERMINAL = {"completed", "failed_criterion", "aborted", "error", "cancelled"}
 
     @app.get("/api/runs/resumable")
     async def list_resumable(all: bool = False) -> JSONResponse:
