@@ -23,9 +23,11 @@ from __future__ import annotations
 
 from swarmd.swarm.generalise import (
     MIN_GENERALITY,
+    _stem,
     abstract,
     content_tokens,
     generality,
+    leaked_subject_terms,
     literals,
     merge_templates,
     render_pattern,
@@ -318,6 +320,48 @@ def test_a_price_still_leaks_in_whatever_notation_it_is_rewritten_in():
     assert "10" in shared_literals("apply 10 percent", "add a 10% surcharge")
 
 
+# --- leaked subject terms: the near-tier's other half ------------------------
+#
+# `rebind` deliberately never touches TERM -- an ordinary noun like "pens" is
+# not one of `_LITERAL_KINDS`, because a plan's human-facing text is supposed
+# to keep its words. A CHECK PARAMETER is not human-facing text, though: it is
+# a string a grader compares byte-for-byte, and one that still says "pens"
+# after being rebound onto a pencils task can never be satisfied by any
+# correct answer. `leaked_subject_terms` is what lets `swarm/run.py` catch
+# that before trusting a rebound criterion -- see `_criterion_from_near_memo`.
+
+
+def test_a_surviving_subject_word_is_reported_as_leaked():
+    """The exact shape of the bug: a criterion built for PEN still says "pens"
+    after being rebound onto a task about pencils, and this is the function
+    that has to say so."""
+    criterion_text = '{"checks": [{"params": {"substrings": ["pens", "verified"]}}]}'
+    assert leaked_subject_terms(criterion_text, PEN, PENCIL) == {"pens"}
+
+
+def test_a_word_only_the_criterion_added_is_not_a_leak():
+    """"verified" never came from PEN, so it is not PEN's leftover -- it is
+    part of what the criterion is actually checking, and flagging it would
+    refuse a rebind that was never at fault."""
+    criterion_text = '{"checks": [{"params": {"substrings": ["verified"]}}]}'
+    assert leaked_subject_terms(criterion_text, PEN, PENCIL) == set()
+
+
+def test_a_word_both_tasks_share_is_not_a_leak():
+    """"total" and "cost" are method vocabulary, shared by construction, and
+    "dollars" and "each" are shared by this fixture pair on purpose: a word
+    the TARGET task itself contains is not evidence the rebind failed."""
+    criterion_text = '{"checks": [{"params": {"substrings": ["cost", "dollars"]}}]}'
+    assert leaked_subject_terms(criterion_text, PEN, PENCIL) == set()
+
+
+def test_no_source_only_vocabulary_means_nothing_can_leak():
+    """When PEN and PENCIL happen to share every content word (a degenerate
+    fixture, not this pair), there is nothing left to leak -- the empty first
+    return short-circuits before `text` is even scanned."""
+    assert leaked_subject_terms("anything at all, even pens", PEN, PEN) == set()
+
+
 # --- what counts as a second task --------------------------------------------
 
 
@@ -375,3 +419,247 @@ def test_a_signature_holds_no_word_of_the_task_it_came_from():
     assert "pens" not in signature
     assert "1.25" not in signature
     assert all(c in "0123456789abcdef" for c in signature)
+
+
+# A blocklist loses because filler words are unbounded: catch one adverb and
+# the next farm just picks a different one. These are not on any list -- they
+# collapse because `task_shape` never reads a word that sits outside a noun
+# phrase, whatever that word is spelled. Each line below is one attempt to
+# farm a second task shape out of PEN; every one of them must fail.
+PEN_PARAPHRASES = (
+    # filler adverbs, singly and in combination -- the exact five named as
+    # currently-differing in the bug report, plus a few more of the same kind
+    "just compute the total cost of 3 pens at 1.25 dollars each",
+    "now compute the total cost of 3 pens at 1.25 dollars each",
+    "quickly compute the total cost of 3 pens at 1.25 dollars each",
+    "simply compute the total cost of 3 pens at 1.25 dollars each",
+    "approximately compute the total cost of 3 pens at 1.25 dollars each",
+    "compute the total cost of 3 pens at 1.25 dollars each right now",
+    "basically, compute the total cost of 3 pens at 1.25 dollars each",
+    # politeness, in every position a request wraps it in
+    "please compute the total cost of 3 pens at 1.25 dollars each",
+    "could you compute the total cost of 3 pens at 1.25 dollars each",
+    "kindly compute the total cost of 3 pens at 1.25 dollars each for me",
+    "compute the total cost of 3 pens at 1.25 dollars each, thanks",
+    (
+        "can you please just compute the total cost of 3 pens at 1.25 dollars "
+        "each for me now?"
+    ),
+    # reordered clauses -- the literals and the subject swap ends of the
+    # sentence around the verb
+    "at 1.25 dollars each, compute the total cost of 3 pens",
+    "3 pens at 1.25 dollars each -- compute the total cost",
+    "of 3 pens at 1.25 dollars each, compute the total cost",
+    # punctuation and whitespace, none of it grammatical
+    "Compute the total cost of 3 pens at 1.25 dollars each.",
+    "compute the total cost of 3 pens, at 1.25 dollars each!",
+    "compute   the   total   cost   of  3  pens  at  1.25 dollars each",
+    # casing
+    "COMPUTE THE TOTAL COST OF 3 PENS AT 1.25 DOLLARS EACH",
+    # plural/singular -- folded by the same `_stem` shape agreement already
+    # relies on, so "3 pens" and "1 pen" name one subject
+    "compute the total cost of 3 pen at 1.25 dollars each",
+    "calculate the cost of 1 pen at 1.25 dollars",
+    # synonyms for the method verb -- excluded from the subject entirely, so
+    # swapping it can never mint a second shape
+    "calculate the total cost of 3 pens at 1.25 dollars each",
+    "determine the total cost of 3 pens at 1.25 dollars each",
+    "work out the total cost of 3 pens at 1.25 dollars each",
+    "find the total cost of 3 pens at 1.25 dollars each",
+    # a synonym for a modifier, not the subject itself -- "overall" for
+    # "total" -- which the head-noun rule already collapses for free
+    "compute the overall cost of 3 pens at 1.25 dollars each",
+    # every channel stacked at once
+    (
+        "so, could you please just quickly compute the overall cost of 3 pen "
+        "at 1.25 dollars each for me, thanks?"
+    ),
+)
+
+
+def test_twenty_paraphrases_of_one_task_collapse_to_one_signature():
+    """THE FARMING CASE, exhaustively. `MIN_DISTINCT_TASKS` counts signatures,
+    so every one of these has to be worth zero additional evidence -- a filler
+    adverb, a plural, a synonym for "compute", or any combination of the three
+    must never be the second observation that promotes a candidate nobody
+    actually re-asked.
+
+    At least twenty phrasings, because the previous fix was a blocklist and a
+    blocklist's failure only shows up on the word that was never added to it.
+    A list this long is not proof no word can still slip through -- see
+    `test_a_fronted_noun_phrase_is_the_one_named_residual_split` for the split
+    this rule still has -- but it is proof the fix is not just yesterday's
+    five words with today's five words appended.
+    """
+    assert len(PEN_PARAPHRASES) >= 20
+    target = task_signature(PEN)
+    for paraphrase in PEN_PARAPHRASES:
+        assert task_signature(paraphrase) == target, paraphrase
+
+
+def test_a_genuinely_different_task_still_gets_its_own_signature():
+    """The collapse above is only meaningful if the same machinery still
+    tells two different questions apart. Headcount and teams share no
+    vocabulary with pens and cost, so folding filler, case, order and
+    plurality must not fold this too."""
+    assert task_signature(PEN) != task_signature(
+        "compute the total headcount of 5 teams"
+    )
+    assert task_signature(PEN) != task_signature(
+        "please just quickly compute the total headcount of 5 teams for me"
+    )
+
+
+def test_a_fronted_noun_phrase_is_the_one_named_residual_split():
+    """The residual this module's own docstring names, kept as a fixture
+    rather than a comment so it cannot silently start passing (a subject
+    would have leaked somewhere) or silently start failing (a real fix would
+    need this test rewritten, not deleted).
+
+    A determiner-less fronted noun phrase contributes no subject, because
+    admitting a clause-initial run as a phrase is how a synonym for "compute"
+    would mint a second shape (see `task_shape`'s ANATOMY). The cost is this:
+    it does not collapse onto the ordinary phrasing of the same task.
+    """
+    assert task_signature(PEN) != task_signature(
+        "Pens: compute the total cost of 3 at 1.25 dollars each"
+    )
+
+
+# Nouns ending in a silent `-se`: the plural is spelled `...ses`, which looks
+# identical -- for the last four letters -- to a bare-sibilant base plus `es`
+# (`house`+`s` and `bus`+`es` both end `-uses`). Real task-subject vocabulary
+# in this system's domain skews toward the `-se` reading (a database, a
+# license, an expense, a case), so `_stem` resolves the tie that way. See its
+# own docstring for the full trade and what it costs.
+_SE_NOUNS = (
+    "house", "case", "database", "response", "expense", "purpose", "phrase",
+    "license", "horse",
+)
+
+
+def test_se_ending_subjects_fold_across_singular_and_plural():
+    """The gap this module's docstring used to leave silent: a bare
+    pluralization of an ordinary `-se` subject noun ("1 database" -> "3
+    databases") is not a rewording anyone would call adversarial, and before
+    `_stem` resolved the `...ses` tie toward `-se`, it minted a second
+    signature for the same task -- the "farming channel itself" direction
+    `task_signature`'s own docstring names as the dangerous one.
+    """
+    for noun in _SE_NOUNS:
+        singular = task_signature(f"compute the total cost of 1 {noun} at 12 dollars")
+        plural = task_signature(
+            f"compute the total cost of 3 {noun}s at 12 dollars each"
+        )
+        assert singular == plural, noun
+
+
+def test_bare_sibilant_loanword_subjects_are_a_disclosed_residual_split():
+    """The tie-break above is a choice, not a discovery, and it has a named
+    cost: kept as a fixture, like the fronted-noun-phrase split above, so it
+    cannot silently start passing (the ambiguity would have to have grown a
+    lexicon somewhere) or silently start failing worse than documented.
+
+    Two flavours, both already explained in `_stem`'s own docstring:
+
+      bus/gas    short bases that need `-es` and, before this change, folded
+                 correctly BY ACCIDENT (the ambiguous tie went their way).
+                 Resolving the tie toward `-se` for the common case costs
+                 these two -- disclosed, not hidden.
+      lens/virus/atlas/campus/cactus/canvas/circus/iris
+                 longer Latin/Greek loanwords whose SINGULAR already ends in
+                 a bare `s` indistinguishable from a genuine plural's
+                 (`lens` and `pens` share their last two letters). This gap
+                 predates this change and is untouched by it: no suffix rule
+                 tells "already singular" from "needs stripping" apart.
+    """
+    for singular, plural in (
+        ("bus", "buses"),
+        ("gas", "gases"),
+        ("atlas", "atlases"),
+        ("virus", "viruses"),
+        ("lens", "lenses"),
+        ("campus", "campuses"),
+        ("iris", "irises"),
+        ("cactus", "cactuses"),
+        ("canvas", "canvases"),
+        ("circus", "circuses"),
+    ):
+        assert _stem(singular) != _stem(plural), (singular, plural)
+
+
+# --- the fold has to meet in the middle --------------------------------------
+
+
+def test_a_sibilant_plural_and_its_silent_e_singular_reach_one_stem():
+    """Stripping "es" folds the PLURAL of a sibilant noun but left the SINGULAR
+    of a silent-e one untouched, so `niches` reached `nich` while `niche` stayed
+    `niche` and one task registered as two.
+
+    That is the farming channel this module exists to close, opened by the very
+    fold meant to close it -- which is why both directions are pinned here.
+    """
+    from swarmd.swarm.generalise import _stem
+
+    for singular, plural in (
+        ("niche", "niches"), ("cache", "caches"), ("size", "sizes"),
+        ("batch", "batches"), ("dish", "dishes"), ("box", "boxes"),
+    ):
+        assert _stem(singular) == _stem(plural), (
+            f"{singular!r} and {plural!r} split into two task shapes"
+        )
+
+
+def test_the_se_class_is_not_pushed_apart_by_the_symmetric_fold():
+    """`s` is excluded from the symmetric fold on purpose.
+
+    For an `-se` word the plural is already resolved toward the singular
+    (`cases` -> `case`), so folding the singular's `e` as well would push the
+    pair apart again in the opposite direction -- trading one split for another.
+    """
+    from swarmd.swarm.generalise import _stem
+
+    for singular, plural in (
+        ("case", "cases"), ("house", "houses"), ("phrase", "phrases"),
+        ("database", "databases"), ("response", "responses"), ("price", "prices"),
+    ):
+        assert _stem(singular) == _stem(plural)
+
+
+def test_words_that_merely_end_in_s_are_still_left_alone():
+    from swarmd.swarm.generalise import _stem
+
+    for word in ("process", "address", "class", "css", "abs", "ops", "data"):
+        assert _stem(word) == word
+
+
+# --- the near-tier leak guard must see through inflection --------------------
+
+
+def test_the_leak_guard_catches_a_singular_of_the_source_subject():
+    """The guard compares SUBJECTS, and `pen` is the same subject as `pens`.
+
+    Comparing surface forms let an ordinary singular/plural paraphrase walk
+    through: a criterion rebound off a task about `pens` onto one about
+    `pencils` could keep a check parameter naming `pen` and be reported clean,
+    which is exactly the leak the guard exists to refuse.
+    """
+    from swarmd.swarm.generalise import leaked_subject_terms
+
+    source = "compute the total cost of 3 pens at 1.25 dollars each"
+    target = "compute the total cost of 7 pencils at 0.40 dollars each"
+
+    assert leaked_subject_terms("count the pens", source, target)
+    assert leaked_subject_terms("count the pen", source, target)
+
+
+def test_the_leak_guard_stays_clean_on_an_honest_rebind():
+    """It must refuse leaks without refusing the transfer it exists to allow."""
+    from swarmd.swarm.generalise import leaked_subject_terms
+
+    source = "compute the total cost of 3 pens at 1.25 dollars each"
+    target = "compute the total cost of 7 pencils at 0.40 dollars each"
+
+    assert not leaked_subject_terms("count the pencils", source, target)
+    assert not leaked_subject_terms("count the pencil", source, target)
+    assert not leaked_subject_terms("count the items", source, target)

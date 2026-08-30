@@ -102,6 +102,103 @@ METHOD_LEXICON = frozenset(
     }
 )
 
+
+def _stem(word: str) -> str:
+    """Fold the plural forms English actually produces. Deterministic, no data.
+
+    ANATOMY: why this exists at all
+      Shape agreement compares METHOD VOCABULARY as a set, and set comparison
+      is exact. A skill distilled from `"parse csv tabular files"` therefore
+      refused `"parse a csv file of tabular data"` -- `files` and `file` are
+      different strings, so the subset test failed and a correct, on-topic
+      skill was withheld. A rule that a plural can defeat is not a rule about
+      meaning, and this is the shape of failure that only appears in front of
+      real traffic. `task_shape` below reuses it for the same reason on the
+      other side of the same problem: "3 pens" and "1 pen" are one subject.
+
+    ANATOMY: three rules, not a stemmer library
+      Porter and friends are heavier than the job and, more to the point, they
+      also fold verb tense and derivational endings -- which would start
+      merging `"compute"` with `"computation"` and quietly widen retrieval.
+      This narrows to plurals and stops:
+
+        queries -> query      (`ies` is never a plural `y` word's own ending)
+        boxes   -> box        (`es` after an UNAMBIGUOUS sibilant: x/z/ch/sh,
+                                or a doubled `ss` -- `class`, `address`,
+                                `process` are singular, so `classes` must fold
+                                to `class` rather than `classe`)
+        houses  -> house      (`es` after a bare, non-doubled `s`: this is the
+                                ambiguous case, resolved below)
+        files   -> file       (bare `s`, guarded below)
+
+      Short words are excluded from the bare-`s` rule because `css`, `abs` and
+      `ops` are whole words rather than plurals.
+
+    ANATOMY: the bare-`s`-before-`es` ambiguity, and which way it is resolved
+      `"...ses"` is genuinely two different plurals wearing one spelling, and
+      nothing in the word alone says which: `house + s = houses` (the base
+      already ends in a silent `e`) and `bus + es = buses` (the base has no
+      `e` to carry) produce the identical last four letters. There is no
+      suffix rule that reads both correctly -- telling them apart needs a
+      dictionary of which bare string is a real word, which is exactly the
+      lookup this module refuses to keep (see WHY REGEX AND NOT A MODEL).
+
+      This resolves the tie toward the `-se` reading (`word[:-1]`, keeping the
+      `e`) rather than the bare-sibilant reading (`word[:-2]`, dropping it).
+      That is a deliberate, disclosed choice, not a discovery of the "right"
+      answer: `-se` nouns (case, database, expense, house, license, phrase,
+      purpose, response) are common task-subject vocabulary in this system's
+      domain, while short bare-sibilant loanwords that need `-es` (bus, gas)
+      are not, so this is the side of the ambiguity worth folding correctly.
+      The cost is disclosed, not hidden: `bus`/`buses` and `gas`/`gases` --
+      previously folding correctly by accident -- now land on `bus`/`buse` and
+      `gas`/`gase` and no longer unify. Longer Latin/Greek loanwords ending in
+      a bare sibilant (`atlas`, `campus`, `cactus`, `canvas`, `circus`,
+      `iris`, `lens`, `virus`) were ALREADY unfixable before this rule existed
+      -- their SINGULAR is indistinguishable from a genuine bare-`s` plural
+      (`lens` and `pens` end in the identical two letters), so the bare-`s`
+      rule above strips a letter no plural ever added. That gap is untouched
+      by this rule and remains open for the same reason: no suffix pattern
+      separates "already singular" from "needs stripping" without a lexicon.
+    """
+    if len(word) > 4 and word.endswith("ies"):
+        return word[:-3] + "y"
+    if len(word) > 3 and word.endswith("es"):
+        base = word[:-2]
+        if base.endswith(("x", "z", "ch", "sh", "ss")):
+            return base
+        if base.endswith("s"):
+            return word[:-1]
+    if len(word) > 3 and word.endswith("s") and not word.endswith("ss"):
+        return word[:-1]
+    # THE SYMMETRIC HALF, and the reason the branch above is not enough on its
+    # own. Stripping "es" folds the PLURAL of a sibilant noun (`boxes` -> `box`)
+    # but leaves the SINGULAR of a silent-e one untouched, so `niches` reached
+    # `nich` while `niche` stayed `niche` and one task registered as two -- the
+    # farming channel this module exists to close, opened by the fold meant to
+    # close it. Folding the same trailing `e` on the way in makes both sides
+    # land on the same form:
+    #
+    #     niche -> nich   niches -> nich      cache/caches, size/sizes
+    #     case  -> cas    cases  -> cas       house/houses, phrase/phrases
+    #
+    # It also recovers `bus`/`buses` and `gas`/`gases`, which the previous
+    # resolution of this ambiguity had to give up.
+    #
+    # `price` is deliberately untouched: `pric` does not end in a sibilant, so
+    # neither side folds and the pair still meets at `price`.
+    # `s` is NOT in this set, and that is the whole subtlety. For an `-se`
+    # word the branch above already resolves the plural toward the singular
+    # (`cases` -> `case`), so folding the singular here too would push them
+    # apart again in the opposite direction. Only the sibilants whose plural
+    # sheds a full `es` need their singular to shed the `e`.
+    if len(word) > 3 and word.endswith("e") and word[:-1].endswith(
+        ("x", "z", "ch", "sh")
+    ):
+        return word[:-1]
+    return word
+
+
 # Grammar, not subject matter. Never stripped, never counted as content: an
 # instruction reduced to placeholders joined by nothing is unreadable, and
 # "the" appearing in both a step and its task is not evidence of anything.
@@ -353,6 +450,56 @@ def strip_source_terms(text: str, source_texts: tuple[str, ...]) -> str:
     return re.sub(r"<TERM>(\s+<TERM>)+", "<TERM>", stripped)
 
 
+def leaked_subject_terms(text: str, source: str, target: str) -> frozenset[str]:
+    """Subject-matter words in `text` that belong to `source` but not `target`.
+
+    WHY THIS EXISTS. `_LITERAL_KINDS` deliberately excludes TERM (see its own
+    comment): `rebind` rewrites URL/PATH/DATE/MONEY/PERCENT/QUOTED/NUMBER
+    tokens onto a new task's literals but leaves an ordinary noun like "pens"
+    exactly as the source task wrote it. That is correct for PLAN TEXT a human
+    reads for sense -- but a memo's CRITERION carries CHECK PARAMETERS a
+    machine compares byte-for-byte (`contains_all`, `regex_match`,
+    `stdout_contains`), and those are exactly as likely to spell out the
+    subject noun as any other string a proposer writes. A rebound criterion
+    that still says "pens" can never be satisfied by a correct answer about
+    pencils, and unlike a garbled or degenerate criterion, `synthesis.attack`
+    cannot catch it: attack only tries degenerate candidates, none of which
+    happen to contain the one specific word a genuinely correct answer never
+    would.
+
+    This is `strip_source_terms`'s other half. That function SCRUBS a step's
+    surviving nouns before a human ever reads them into a skill library; this
+    one DETECTS when a rebound criterion still carries one, so `swarm/run.py`
+    can refuse the near-tier hit rather than trust a criterion that no
+    candidate on the new subject could ever pass. Same vocabulary rule as
+    `strip_source_terms` -- method and function words never count, because
+    "total" appearing in both tasks is not evidence of anything -- and
+    deliberately NOT stemmed, for the same reason `strip_source_terms` is not:
+    a plural surviving as a singular (or the reverse) is a smaller, different
+    leak than this function exists to catch, and folding the two together
+    would refuse pairings that rebind perfectly clean.
+    """
+    def subject_stems(phrase: str) -> set[str]:
+        return {
+            _stem(w) for w in _WORD.findall(phrase.lower())
+            if w not in METHOD_LEXICON and w not in FUNCTION_WORDS
+        }
+
+    # COMPARED AS STEMS, not as surface forms. Comparing what the two tasks
+    # literally wrote let an ordinary singular/plural paraphrase walk straight
+    # through the guard: a criterion rebound from a task about `pens` onto one
+    # about `pen` had nothing "only in the source" to find, so a check
+    # parameter still naming the source's subject was reported as clean. The
+    # guard is about whether the SUBJECT survived the rebind, and `pen` is the
+    # same subject as `pens`.
+    only_source = subject_stems(source) - subject_stems(target)
+    if not only_source:
+        return frozenset()
+    return frozenset(
+        w for w in _WORD.findall(text.lower()) if _stem(w) in only_source
+    )
+
+
 def render_pattern(template: str) -> str:
     """`<NUMBER>` -> `slot_number`, so the retrieval tokenizer can see it.
 
@@ -471,7 +618,9 @@ class TaskShape:
                 well-defined when the two carry the same kinds in the same
                 order.
       subjects  the head nouns of the task's noun phrases, minus method
-                vocabulary. What the question is ABOUT.
+                vocabulary and folded to singular by `_stem`. What the
+                question is ABOUT -- "3 pens" and "1 pen" are the same thing
+                to be about, so the count is `slots`' job, not this one's.
       actions   the method vocabulary the task uses. What the question DOES to
                 its subject.
     """
@@ -511,9 +660,12 @@ def _head(run: list[str]) -> str:
 
     Taking the head rather than the whole run is what makes "the total cost"
     and "the overall cost" one shape: an adjective swapped in front of a noun
-    changes how the question reads and not what it is about.
+    changes how the question reads and not what it is about. Folded through
+    `_stem` for the same reason "3 pens" and "1 pen" must be one subject: a
+    plural is a grammatical fact about the count, not a second thing the task
+    is about, and the count itself already lives in `slots`.
     """
-    return run[-1] if run else ""
+    return _stem(run[-1]) if run else ""
 
 
 @functools.lru_cache(maxsize=4096)
@@ -536,7 +688,16 @@ def task_shape(task: str) -> TaskShape:
       never read, whatever it happens to be spelled.
 
     ANATOMY: which way it fails
-      Toward collapsing, deliberately, exactly as before. A determiner-less
+      Also residual: `_stem`'s bare-`s`-before-`es` tie-break (see its own
+      docstring) leaves a small, named class of subject nouns unfolded --
+      short bare-sibilant loanwords (`bus`/`buses`, `gas`/`gases`) and longer
+      Latin/Greek ones whose singular already ends in `s` (`lens`, `virus`,
+      `atlas`...). Toward SPLITTING, which is the direction this module's own
+      standard treats as the dangerous one; disclosed rather than fixed
+      because no suffix rule resolves it without a lexicon this module
+      deliberately does not keep.
+
+      Otherwise toward collapsing, deliberately, exactly as before. A determiner-less
       fronted noun phrase ("Pens: compute the total cost of 3 at 1.25 each")
       contributes no subject, so it does NOT collapse onto the ordinary
       phrasing -- that is the one residual split this rule still has, and it
@@ -604,11 +765,12 @@ def task_signature(task: str) -> str:
 
       So the signature is not the sentence. It is the pair that survives
       rewording: the SUBJECT MATTER (`TaskShape.subjects` -- the head nouns of
-      the task's noun phrases, order-independent) and the KINDS OF LITERAL the
-      question carries. "Compute the total cost of 3 pens at 1.25 dollars
-      each", "please just compute the total cost of 3 pens at 1.25 dollars
-      each for me quickly" and "AT 1.25 DOLLARS EACH, 3 PENS -- COMPUTE THE
-      TOTAL COST" are one task: subject `{pens}`, literals `{MONEY, NUMBER}`.
+      the task's noun phrases, order-independent and folded to singular) and
+      the KINDS OF LITERAL the question carries. "Compute the total cost of 3
+      pens at 1.25 dollars each", "please just compute the total cost of 3
+      pens at 1.25 dollars each for me quickly", "AT 1.25 DOLLARS EACH, 3 PENS
+      -- COMPUTE THE TOTAL COST" and "calculate the cost of 1 pen at 1.25
+      dollars" are one task: subject `{pen}`, literals `{MONEY, NUMBER}`.
 
     ANATOMY: which way it fails
       Deliberately toward collapsing. Two genuinely different questions about
@@ -619,6 +781,14 @@ def task_signature(task: str) -> str:
       the farming channel itself. Method verbs are excluded from the subject
       for the same reason: including them would let a synonym swap
       ("compute" -> "calculate") mint a second task shape.
+
+      One disclosed exception sits on the wrong (splitting) side: `_stem`'s
+      bare-`s`-before-`es` tie-break folds the common `-se` subject class
+      correctly (house/case/database/response/...) at the cost of a few short
+      bare-sibilant loanwords (bus, gas) and unfixably ambiguous ones (lens,
+      virus, atlas...) that still mint two signatures across singular and
+      plural. See `_stem`'s docstring for why: it is a lexicon-shaped problem
+      and this module keeps no lexicon.
 
       Not a hash of anything readable: the fingerprint is stored on a Skill,
       and the same minimisation that keeps literals out of `instruction` and
