@@ -125,7 +125,14 @@ def test_a_kill_mid_execution_resumes_without_re_buying_the_work(tmp_path):
         env=_env(ej, er), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
     )
     doc = er / "run-drop.json"
-    parked, deadline = False, time.time() + 120
+    # 600s, not 120s. The child has to spend a whole session ration -- roughly
+    # fifteen real provider round trips through the simulated stack -- before it
+    # parks, and on a loaded machine that overran 120s often enough that this
+    # test failed about half the time. A gate that flaky is worse than no gate:
+    # it trains people to re-run rather than read. The number is a CEILING on
+    # patience, not an expected duration; the run parks in a few seconds when
+    # the box is idle, and nothing waits longer than it needs to.
+    parked, deadline = False, time.time() + 600
     while time.time() < deadline and first.poll() is None:
         if doc.exists():
             try:
