@@ -156,6 +156,9 @@ class Skill:
     successes: int = 0
     retired: bool = False
     retired_reason: str = ""
+    # Covers the DECISION, where `skill_id` covers only the content. Written by
+    # `save`, verified by `_load`. See `attestation_for`.
+    attestation: str = ""
     # Distinct task shapes this approach has been verified on. Defaulted so a
     # library written by an older build still loads; an older build reading a
     # file with these fields refuses it, which is the one-way direction
@@ -336,6 +339,37 @@ def _shapes_agree(terms: set[str], pattern: str, query: set[str]) -> bool:
     return _method_terms(set(tokenize(pattern))) <= query_method
 
 
+def attestation_for(skill: Skill) -> str:
+    """A checksum over everything a reviewer decided, not just what they read.
+
+    WHY THIS EXISTS SEPARATELY FROM `skill_id`. The id is a content address of
+    name+instruction, so it is invariant under flipping `approved` -- which
+    made the human gate defeatable by editing one boolean in a JSON file. The
+    id answers "is this the same skill"; nothing answered "is this the same
+    decision", so nothing was checking the field that decides whether a skill
+    reaches every future run's prompt.
+
+    WHAT THIS IS NOT. It is TAMPER EVIDENCE, not authentication. Anyone who can
+    write the file can also recompute this value -- there is no secret here,
+    deliberately: a keyfile was considered and rejected because it introduces a
+    trust primitive nothing else in this codebase has, for a threat model
+    (local write access) already accepted as out of scope. What it does catch
+    is the realistic case: an accidental edit, a merge artifact, a truncated
+    write, or someone flipping a flag without understanding the format. The
+    durable approval store remains the record of who decided what and when.
+    """
+    payload = "|".join((
+        skill.skill_id,
+        skill.name,
+        skill.instruction,
+        "1" if skill.approved else "0",
+        skill.approved_by,
+        "1" if skill.retired else "0",
+        skill.retired_reason,
+    ))
+    return hashlib.sha256(payload.encode()).hexdigest()[:16]
+
+
 class SkillLibraryError(RuntimeError):
     pass
 
@@ -390,6 +424,25 @@ class SkillLibrary:
             # skills.json could carry any instruction under any id -- including
             # `approved: true`, which is the entire human gate expressed as a
             # boolean in a file anyone who can reach the disk can write.
+            # An APPROVED skill must carry an attestation. Refused rather than
+            # upgraded in place: an entry that grants itself approval with no
+            # checksum is the precise shape of the attack, so accepting it
+            # "just this once for legacy files" would reopen the hole it
+            # closes. An unapproved entry may lack one -- it grants nothing,
+            # and refusing it would break libraries mid-review for no gain.
+            if skill.approved and not skill.attestation:
+                raise SkillLibraryError(
+                    f"library at {self.path}: entry {index} ({skill.name!r}) is "
+                    f"marked approved but carries no attestation; re-approve it "
+                    f"through the gate rather than editing the file"
+                )
+            if skill.attestation and skill.attestation != attestation_for(skill):
+                raise SkillLibraryError(
+                    f"library at {self.path}: entry {index} ({skill.name!r}) has "
+                    f"an attestation that does not match its contents or its "
+                    f"approval state; this entry has been edited since it was "
+                    f"written"
+                )
             expected = make_skill_id(skill.name, skill.instruction)
             if skill.skill_id != expected:
                 raise SkillLibraryError(
@@ -406,6 +459,12 @@ class SkillLibrary:
         # Write-then-rename: a crash mid-write must not leave a truncated
         # library, because the failure mode is silently losing every skill.
         tmp = self.path.with_suffix(".tmp")
+        # Re-stamped here rather than at each mutation site, because `save` is
+        # the one funnel every change passes through -- approve, reject, prune
+        # and record_use all end here, and a new mutator added later gets the
+        # attestation for free instead of silently skipping it.
+        for skill in self._skills.values():
+            skill.attestation = attestation_for(skill)
         tmp.write_text(
             json.dumps(
                 {"skills": [s.to_dict() for s in self._skills.values()]}, indent=2

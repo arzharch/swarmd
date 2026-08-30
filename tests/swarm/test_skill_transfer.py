@@ -459,12 +459,45 @@ def test_a_step_is_abstracted_even_with_no_task_to_compare_against():
 
 
 def test_a_library_written_by_an_older_build_still_loads(tmp_path):
-    """The new fields are additive and defaulted, so a file predating them
-    loads rather than bricking the library the integrity check protects.
+    """New fields are additive and defaulted, so old EVIDENCE still reads.
 
-    The reverse direction is already refused by `_load`'s unknown-field check,
-    which is the correct asymmetry: a new build must read old evidence, an old
-    build must not silently drop evidence it cannot understand.
+    This test used to also assert that an old file marking a skill `approved`
+    loads. It no longer does, and the split is deliberate -- see
+    `test_an_old_approval_without_an_attestation_is_refused`. Reading old
+    evidence is compatibility; honouring an old approval that carries no
+    attestation is the hole the attestation exists to close, and "it is an old
+    file" is precisely the excuse an attacker would offer.
+    """
+    instruction = "use csv.DictReader with an explicit dialect"
+    path = tmp_path / "skills.json"
+    path.write_text(
+        json.dumps(
+            {
+                "skills": [
+                    {
+                        "skill_id": make_skill_id("old", instruction),
+                        "name": "old",
+                        "task_pattern": "parse csv files",
+                        "instruction": instruction,
+                        "approved": False,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    loaded = SkillLibrary(path)
+    assert loaded.all()[0].evidence_tasks == ()
+    assert not loaded.all()[0].approved
+
+
+def test_an_old_approval_without_an_attestation_is_refused(tmp_path):
+    """And the refusal has to say how to fix it, or it is just breakage.
+
+    A library that predates the attestation cannot prove its approvals were
+    ever made by a human, so it is refused rather than trusted -- but the
+    operator is told the remedy (re-approve through the gate) instead of being
+    left with a file that will not load and no next step.
     """
     instruction = "use csv.DictReader with an explicit dialect"
     path = tmp_path / "skills.json"
@@ -484,11 +517,8 @@ def test_a_library_written_by_an_older_build_still_loads(tmp_path):
         ),
         encoding="utf-8",
     )
-    loaded = SkillLibrary(path)
-    assert loaded.all()[0].evidence_tasks == ()
-    assert loaded.all()[0].generality == 0.0
-    assert not loaded.all()[0].promotable
-
+    with pytest.raises(SkillLibraryError, match="no attestation"):
+        SkillLibrary(path)
 
 def test_the_evidence_fields_do_not_move_a_skill_id():
     """Ids hash name+instruction and nothing else. If accruing evidence moved
