@@ -784,6 +784,27 @@ def task_shape(task: str) -> TaskShape:
                 actions.append(token)
             run.append(token)
     flush()
+    if not subjects:
+        # NOTHING WAS INTRODUCED, so the sentence never offered a phrase to
+        # take a head from. Rather than return no subject -- which merges every
+        # such task onto one signature and splits each from its own ordinary
+        # phrasing -- fall back to the content words: whatever is left once the
+        # method vocabulary, the function words and the slots are removed.
+        #
+        # Deliberately a FALLBACK and not the primary rule. Head-of-phrase is
+        # the better signal when it is available, because it ignores the
+        # adjectives that decorate a noun without changing what the task is
+        # about; this coarser pass exists only so a phrasing the parser cannot
+        # read produces a weaker signature rather than an absent one.
+        subjects = [
+            _stem(token)
+            for token in _SHAPE_TOKEN.findall(template)
+            if not token.startswith("<")
+            and token[0].isalpha()
+            and token not in METHOD_LEXICON
+            and token not in FUNCTION_WORDS
+            and token not in INTRODUCERS
+        ]
     return TaskShape(tuple(slots), tuple(subjects), tuple(actions))
 
 

@@ -510,19 +510,48 @@ def test_a_genuinely_different_task_still_gets_its_own_signature():
     )
 
 
-def test_a_fronted_noun_phrase_is_the_one_named_residual_split():
-    """The residual this module's own docstring names, kept as a fixture
-    rather than a comment so it cannot silently start passing (a subject
-    would have leaked somewhere) or silently start failing (a real fix would
-    need this test rewritten, not deleted).
+def test_a_fronted_noun_phrase_no_longer_splits_from_its_ordinary_form():
+    """This test used to assert the opposite, and said so: its previous
+    docstring recorded that a real fix would need it REWRITTEN rather than
+    deleted. This is that rewrite.
 
-    A determiner-less fronted noun phrase contributes no subject, because
-    admitting a clause-initial run as a phrase is how a synonym for "compute"
-    would mint a second shape (see `task_shape`'s ANATOMY). The cost is this:
-    it does not collapse onto the ordinary phrasing of the same task.
+    A determiner-less fronted noun phrase contributed no subject at all, which
+    failed in both directions at once -- it split the fronted phrasing from the
+    ordinary phrasing of one task (a farm, because it mints the second shape a
+    promotion needs), and it merged every such task onto the single empty
+    subject (so a skill proven on pens could claim pencils). `task_shape` now
+    falls back to content words when nothing was introduced, closing both.
     """
-    assert task_signature(PEN) != task_signature(
+    assert task_signature(PEN) == task_signature(
         "Pens: compute the total cost of 3 at 1.25 dollars each"
+    )
+    assert task_signature(
+        "Pens: compute the total cost of 3 at 1.25 dollars each"
+    ) != task_signature(
+        "Pencils: compute the total cost of 3 at 1.25 dollars each"
+    )
+
+
+def test_the_fallback_leaves_a_narrower_residual_and_this_is_it():
+    """What the fix costs, pinned so it cannot widen unnoticed.
+
+    The fallback keeps every content word, and it cannot tell a verb it does
+    not recognise from a noun. So in a sentence with NO determiner anywhere,
+    a verb outside `METHOD_LEXICON` is read as part of the subject matter, and
+    the same task phrased with a recognised verb gets a different signature.
+
+    That is strictly narrower than what it replaced: it needs BOTH a
+    determiner-less sentence AND an unrecognised verb, where the old residual
+    fired on any fronted phrase. The honest fix is to widen METHOD_LEXICON when
+    such a verb turns up, not to widen this fallback -- so this test failing
+    means a word needs adding to the lexicon.
+    """
+    assert task_signature("tally widgets") != task_signature("count widgets")
+
+    # A determiner is enough to avoid it entirely, because the head-of-phrase
+    # rule then applies and the fallback never runs.
+    assert task_signature("tally the widgets") == task_signature(
+        "count the widgets"
     )
 
 
@@ -696,3 +725,42 @@ def test_a_word_that_merely_contains_a_numeral_is_untouched():
     contain "one" and "number" does not contain "nine"."""
     for phrase in ("summarise the money in the account", "list every phone number"):
         assert "<NUMBER>" not in abstract(phrase).template
+
+
+# --- a fronted subject is still a subject -------------------------------------
+
+
+def test_a_fronted_subject_matches_its_ordinary_phrasing():
+    """Head-of-phrase needs an introducer, and a fronted subject has none.
+
+    "pens: compute the total cost of 3 at 1.25 each" introduced nothing, so the
+    shape came back with NO subject -- which split it from the same task written
+    ordinarily. One task, two phrasings, two signatures is a farm: it mints the
+    second piece of evidence a promotion needs without anyone solving a second
+    task.
+    """
+    ordinary = "compute the total cost of 3 pens at 1.25 dollars each"
+    fronted = "pens: compute the total cost of 3 at 1.25 dollars each"
+    assert task_signature(fronted) == task_signature(ordinary)
+
+
+def test_two_fronted_subjects_do_not_collapse_into_one():
+    """The same empty-subject bug merged genuinely different tasks.
+
+    Both "pens:" and "pencils:" reduced to no subject at all, so two questions
+    about different things shared one signature -- which withholds evidence in
+    one direction and, worse, lets a skill proven on one claim the other.
+    """
+    pens = "pens: compute the total cost of 3 at 1.25 dollars each"
+    pencils = "pencils: compute the total cost of 3 at 1.25 dollars each"
+    assert task_signature(pens) != task_signature(pencils)
+
+
+def test_the_fallback_does_not_disturb_ordinary_phrasing():
+    """It is a fallback, and must only run when nothing was introduced."""
+    ordinary = "compute the total cost of 3 pens at 1.25 dollars each"
+    assert task_signature("just " + ordinary) == task_signature(ordinary)
+    assert task_signature(ordinary.replace("3", "three")) == task_signature(ordinary)
+    assert task_signature(ordinary) != task_signature(
+        "compute the total cost of 3 pencils at 1.25 dollars each"
+    )
