@@ -668,6 +668,45 @@ def _head(run: list[str]) -> str:
     return _stem(run[-1]) if run else ""
 
 
+# The spelled-out cardinals, folded to digits for SHAPE purposes only.
+#
+# WHY ONLY FOR SHAPE. `abstract()` also renders distilled skill instructions,
+# where a small number is usually method guidance -- "write one paragraph"
+# means what it says, and rewriting it to "write <NUMBER> paragraph" destroys
+# the advice. But a task SHAPE that separates "three pens" from "3 pens" is a
+# FARM: one task, written twice, clears the two-distinct-shapes bar without
+# anyone solving a second task. Folding here and nowhere else serves both.
+#
+# WHY A WORD LIST IS LEGITIMATE HERE, having rejected one for filler adverbs:
+# the cardinals are a CLOSED class. There are finitely many ways to write a
+# small number in English and the list cannot go stale, whereas there is no
+# bound on the ways to pad a sentence. Above twenty English composes
+# ("twenty-one"), which the alternation covers piecewise.
+_CARDINALS = {
+    "zero": "0", "one": "1", "two": "2", "three": "3", "four": "4",
+    "five": "5", "six": "6", "seven": "7", "eight": "8", "nine": "9",
+    "ten": "10", "eleven": "11", "twelve": "12", "thirteen": "13",
+    "fourteen": "14", "fifteen": "15", "sixteen": "16", "seventeen": "17",
+    "eighteen": "18", "nineteen": "19", "twenty": "20", "thirty": "30",
+    "forty": "40", "fifty": "50", "sixty": "60", "seventy": "70",
+    "eighty": "80", "ninety": "90",
+}
+_CARDINAL_RE = re.compile(
+    r"\b(?:" + "|".join(sorted(_CARDINALS, key=len, reverse=True)) + r")\b"
+)
+
+
+def _digits_for_shape(text: str) -> str:
+    """Rewrite cardinal WORDS as digits so both spellings reach one shape.
+
+    Runs before `abstract`, so the ordinary NUMBER rules -- including
+    `_keeps_literal`, which spares a number that IS the method -- then apply
+    to both spellings identically: "round to two decimal places" and "round to
+    2 decimal places" are both kept, because "decimal" is what decides.
+    """
+    return _CARDINAL_RE.sub(lambda m: _CARDINALS[m.group(0)], text)
+
+
 @functools.lru_cache(maxsize=4096)
 def task_shape(task: str) -> TaskShape:
     """Read a task's structure: its literals, its subjects, its method.
@@ -712,7 +751,7 @@ def task_shape(task: str) -> TaskShape:
     # the memo's key discipline is what produced the defect above. Casefolding
     # first also means TERM never fires on a task, so a re-typed capital
     # cannot become a second shape.
-    template = abstract(" ".join(task.split()).casefold()).template
+    template = abstract(_digits_for_shape(" ".join(task.split()).casefold())).template
     slots: list[str] = []
     subjects: list[str] = []
     actions: list[str] = []

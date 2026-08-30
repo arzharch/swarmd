@@ -663,3 +663,36 @@ def test_the_leak_guard_stays_clean_on_an_honest_rebind():
     assert not leaked_subject_terms("count the pencils", source, target)
     assert not leaked_subject_terms("count the pencil", source, target)
     assert not leaked_subject_terms("count the items", source, target)
+
+
+# --- a quantity written as a word is the same quantity ------------------------
+
+
+def test_a_spelled_out_number_is_the_same_shape_as_its_digit():
+    """One task, written twice, must not clear the two-distinct-shapes bar.
+
+    Matching only digits made "three pens" and "3 pens" two task shapes, so an
+    author could mint the second piece of evidence a promotion needs without
+    ever solving a second task. That is a farm, and it is the exact thing the
+    distinct-shape bar exists to refuse.
+    """
+    base = "compute the total cost of 3 pens at 1.25 dollars each"
+    for word in ("one", "two", "three", "seven", "ten", "twelve", "twenty"):
+        assert task_signature(base.replace("3", word)) == task_signature(base), (
+            f"{word!r} minted a second task shape"
+        )
+
+
+def test_a_number_that_is_the_method_still_survives_when_spelled_out():
+    """The digit branch already protects "round to 2 decimal places" -- that 2
+    is advice, not data. Recognising number WORDS must not quietly strip the
+    spelled version of the same advice."""
+    for phrase in ("round to 2 decimal places", "round to two decimal places"):
+        assert "<NUMBER>" not in abstract(phrase).template
+
+
+def test_a_word_that_merely_contains_a_numeral_is_untouched():
+    """The cardinals are matched on word boundaries, so "money" does not
+    contain "one" and "number" does not contain "nine"."""
+    for phrase in ("summarise the money in the account", "list every phone number"):
+        assert "<NUMBER>" not in abstract(phrase).template
