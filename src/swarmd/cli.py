@@ -383,6 +383,12 @@ def main(argv: list[str] | None = None) -> int:
         help="skill library, for approving a queued skill. Approving a skill "
         "without it records the decision but leaves the library out of sync.",
     )
+    approve.add_argument(
+        "--force", action="store_true",
+        help="approve a skill short of MIN_DISTINCT_TASKS evidence anyway. "
+        "The bypass is written to the skill's own record so it stays "
+        "visible to the next reader. Ignored for non-skill approvals.",
+    )
 
     reject = sub.add_parser("reject", help="reject a pending item (HITL)")
     reject.add_argument("request_id")
@@ -1201,7 +1207,9 @@ async def _hitl_command(args: argparse.Namespace) -> int:
         gate = SkillGate(mgr, SkillLibrary(args.skills))
         try:
             decision = await gate.decide(
-                args.request_id, args.command, actor=args.actor
+                args.request_id, args.command, actor=args.actor,
+                # `reject` has no --force; getattr covers that subcommand.
+                force=getattr(args, "force", False),
             )
         except KeyError:
             print(f"unknown request: {args.request_id}")

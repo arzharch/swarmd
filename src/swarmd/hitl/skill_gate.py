@@ -88,6 +88,24 @@ class SkillGate:
             # human to approve something they already approved.
             raise SkillAlreadyApproved(skill)
 
+        # DEDUPE ON SKILL_ID, not on this call. Distillation re-proposes the
+        # same skill from every task that produces it, and each one that
+        # keeps the candidate promotable calls `submit` again -- a third
+        # distinct task shape re-submits a skill that a second shape already
+        # queued. Without this, that produced TWO pending requests for one
+        # skill_id, and deciding the stale one after the fresh one had
+        # already been approved silently un-approved and retired it (see
+        # `decide`'s matching guard, which is the defence for whatever
+        # duplicate gets past this one -- a request queued before this fix
+        # shipped, or a caller that writes to `approvals` directly).
+        existing = await self._pending_request_for(skill.skill_id)
+        if existing is not None:
+            logger.info(
+                "skill %s already queued as %s; not re-queuing",
+                skill.skill_id, existing.request_id,
+            )
+            return skill, existing
+
         request = await self.approvals.submit(
             {
                 "kind": "skill",
@@ -110,8 +128,20 @@ class SkillGate:
         )
         return skill, request
 
+    async def _pending_request_for(self, skill_id: str) -> ApprovalRequest | None:
+        """Is there already a PENDING skill request for this skill_id?
+
+        Content addressing gives every proposal of the same advice the same
+        skill_id; a second live request for it is never new information for a
+        reviewer, only a second copy of the same question.
+        """
+        for req in await self.approvals.pending():
+            if req.stage == STAGE and req.item.get("skill_id") == skill_id:
+                return req
+        return None
+
     async def decide(
-        self, request_id: str, action: str, *, actor: str
+        self, request_id: str, action: str, *, actor: str, force: bool = False
     ) -> SkillDecision:
         """Record the decision, then apply it to the library.
 
@@ -119,15 +149,35 @@ class SkillGate:
         exists even if applying to the library fails; a decision that happened
         but left no record is worse than one recorded and not yet applied,
         because the second is recoverable by re-running and the first is not.
+
+        `force` passes straight through to `SkillLibrary.approve` for a
+        reviewer who has looked at a candidate short of its evidence bar and
+        wants it in anyway; irrelevant to `reject`, which has no such bar.
         """
         request = await self.approvals.decide(request_id, action, actor=actor)
         skill_id = str(request.item.get("skill_id", ""))
         if not skill_id:
             return SkillDecision(request, None, False, "not a skill request")
 
+        # A STALE DUPLICATE. `submit` dedupes going forward, but a second
+        # pending request for the same skill_id can still exist -- one queued
+        # before that dedupe shipped, or a caller that writes to `approvals`
+        # directly. If this skill_id was already decided by an EARLIER
+        # request, this decision is that duplicate surfacing late: applying
+        # it would replay a decision nobody meant to make twice, and applying
+        # "reject" specifically would retire a skill a human already approved.
+        # The audit entry above still stands -- the decision on THIS request
+        # is real and recorded -- it is only the library that must not move
+        # twice.
+        skill = self.library.get(skill_id)
+        if skill is not None and (skill.approved or skill.retired):
+            detail = f"stale duplicate: skill {skill_id} was already decided"
+            logger.info("skill %s request %s ignored as %s", skill_id, request_id, detail)
+            return SkillDecision(request, skill, False, detail)
+
         try:
             if request.state is ApprovalState.APPROVED:
-                skill = self.library.approve(skill_id, actor=actor)
+                skill = self.library.approve(skill_id, actor=actor, force=force)
                 detail = "approved into the library"
             elif request.state is ApprovalState.REJECTED:
                 skill = self.library.reject(skill_id, actor=actor)

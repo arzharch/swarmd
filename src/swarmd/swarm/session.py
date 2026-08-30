@@ -364,14 +364,24 @@ class SwarmSession:
         Goes through the same gate and audit trail as a human decision, with
         `auto-approve` as the actor, so the bypass is visible in the record
         rather than indistinguishable from review.
+
+        `force=True` on every approval here is deliberate, not a shortcut
+        around `SkillLibrary.approve`'s evidence bar: with no human in the
+        loop to be asked, there is no reviewer to wait for a second task
+        shape, so the bar can only ever be met or bypassed, never satisfied
+        by review. `approve` still writes the bypass to the skill's own
+        record whenever it actually applies, which keeps it visible even
+        though `auto-approve` already marks every decision here as one.
         """
         if self.approvals is None:
             for skill in self.library.pending():
-                self.library.approve(skill.skill_id, actor="auto-approve")
+                self.library.approve(skill.skill_id, actor="auto-approve", force=True)
             return
 
         from swarmd.hitl.skill_gate import SkillGate
 
         gate = SkillGate(self.approvals, self.library)
         for request in await gate.pending():
-            await gate.decide(request.request_id, "approve", actor="auto-approve")
+            await gate.decide(
+                request.request_id, "approve", actor="auto-approve", force=True
+            )

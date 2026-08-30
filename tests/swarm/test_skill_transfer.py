@@ -166,7 +166,10 @@ async def test_a_skill_learned_from_pens_is_retrieved_for_pencils(library):
     each", and the skill that solves it would never have been offered.
     """
     skill = await distil(library, PEN_TASK, "calculate_pen_cost", PEN_TASK)
-    library.approve(skill.skill_id, actor="reviewer")
+    # One distillation is one evidence shape, short of MIN_DISTINCT_TASKS;
+    # these tests are about retrieval, not the evidence bar, so force past it
+    # the way a reviewer who has actually looked at the candidate would.
+    library.approve(skill.skill_id, actor="reviewer", force=True)
 
     hits = library.retrieve("7 pencils at 40c each")
     assert [s.skill_id for s in hits] == [skill.skill_id]
@@ -177,7 +180,10 @@ async def test_an_unrelated_task_still_retrieves_nothing(library):
     looser. A wrong skill actively misleads a worker; no skill just leaves it
     to reason from the task."""
     skill = await distil(library, PEN_TASK, "calculate_pen_cost", PEN_TASK)
-    library.approve(skill.skill_id, actor="reviewer")
+    # One distillation is one evidence shape, short of MIN_DISTINCT_TASKS;
+    # these tests are about retrieval, not the evidence bar, so force past it
+    # the way a reviewer who has actually looked at the candidate would.
+    library.approve(skill.skill_id, actor="reviewer", force=True)
 
     assert library.retrieve("compose a haiku about volcanoes") == []
 
@@ -198,7 +204,10 @@ async def test_a_task_that_only_shares_generic_words_retrieves_nothing(library):
     both.
     """
     skill = await distil(library, PEN_TASK, "calculate_pen_cost", PEN_TASK)
-    library.approve(skill.skill_id, actor="reviewer")
+    # One distillation is one evidence shape, short of MIN_DISTINCT_TASKS;
+    # these tests are about retrieval, not the evidence bar, so force past it
+    # the way a reviewer who has actually looked at the candidate would.
+    library.approve(skill.skill_id, actor="reviewer", force=True)
 
     assert library.retrieve("Compute the average rainfall in millimetres for 12 cities") == []
     assert library.retrieve("Compute the total distance of 5 marathons at 42.2 km each") == []

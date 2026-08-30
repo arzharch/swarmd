@@ -141,6 +141,77 @@ async def test_an_already_approved_skill_is_not_requeued(gate):
         await _submit(gate)
 
 
+# --- deduping the queue -----------------------------------------------------
+
+
+async def test_a_second_pending_submission_reuses_the_first_request(gate):
+    """Distillation re-proposes the same skill from every task that produces
+    it. Without this, a third distinct task shape submitted a second pending
+    request for a skill the second shape had already queued -- two requests
+    for one skill_id, only one of which a reviewer's decision can apply to."""
+    _, first = await _submit(gate)
+    _, second = await _submit(gate)
+
+    assert second.request_id == first.request_id
+    pending = await gate.approvals.pending()
+    assert [r.request_id for r in pending] == [first.request_id]
+
+
+async def test_deciding_a_stale_duplicate_is_a_no_op(gate):
+    """THE BUG THIS FIXES. Two pending requests for one skill_id -- queued
+    before the dedupe above shipped, or written to the approval store
+    directly -- used to let a decision on the SECOND un-approve and RETIRE a
+    skill the FIRST had already approved. The audit trail must still record
+    that the second request was decided; the library must not move twice."""
+    skill, first = await _submit(gate)
+    # Simulate a duplicate that predates dedupe-on-submit: a second pending
+    # request for the same skill_id, written straight to the approval store.
+    second = await gate.approvals.submit(dict(first.item), stage=STAGE)
+
+    approved = await gate.decide(first.request_id, "approve", actor="reviewer")
+    assert approved.applied
+    assert gate.library.get(skill.skill_id).usable
+
+    stale = await gate.decide(second.request_id, "reject", actor="late-reviewer")
+    assert not stale.applied
+    assert "stale duplicate" in stale.detail
+
+    # The skill is exactly as the first decision left it: approved, usable,
+    # not retired -- the second decision left no mark on the library at all.
+    still = gate.library.get(skill.skill_id)
+    assert still.usable
+    assert not still.retired
+
+    # The audit trail still shows both decisions were made.
+    audit = await gate.approvals.audit()
+    assert [e.action for e in audit] == ["submit", "submit", "approve", "reject"]
+
+
+async def test_deciding_approve_forwards_force_to_the_library(gate):
+    """`decide` is the human-approval path's only route to `library.approve`;
+    an operator's explicit override has to reach it or the CLI flag that sets
+    it is a no-op. Two skills because a decided request is immutable -- a
+    refused decision cannot be retried with `force` on the same request."""
+    short, refused_request = await _submit(gate, name="short a", instruction="do the short thing a")
+    gate.library.record_evidence(short.skill_id, "only-shape")
+    assert not gate.library.get(short.skill_id).promotable
+
+    refused = await gate.decide(refused_request.request_id, "approve", actor="r")
+    assert not refused.applied
+    assert not gate.library.get(short.skill_id).usable
+
+    thin, forced_request = await _submit(gate, name="short b", instruction="do the short thing b")
+    gate.library.record_evidence(thin.skill_id, "only-shape")
+    assert not gate.library.get(thin.skill_id).promotable
+
+    forced = await gate.decide(
+        forced_request.request_id, "approve", actor="reviewer", force=True
+    )
+    assert forced.applied
+    assert gate.library.get(thin.skill_id).usable
+    assert "bypassed" in gate.library.get(thin.skill_id).approval_note
+
+
 async def test_the_queue_survives_a_process_boundary(tmp_path):
     """The whole reason for using the durable store rather than a JSON list."""
     approvals = tmp_path / "approvals.db"
@@ -202,6 +273,57 @@ def test_approving_a_skill_from_the_cli_applies_it(tmp_path, monkeypatch):
     assert result.returncode == 0, result.stderr
     assert "approved into the library" in result.stdout
     assert SkillLibrary(library_path).get(skill.skill_id).usable
+
+
+def test_the_cli_force_flag_reaches_the_library(tmp_path, monkeypatch):
+    """The escape has to work for the actual operator, not just the library
+    call under it -- a `--force` that only the internal API understands is
+    not an escape a reviewer can use."""
+    approvals = tmp_path / "approvals.db"
+    library_path = tmp_path / "skills.json"
+    monkeypatch.setenv("SWARMD_APPROVALS_DB", str(approvals))
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+
+    library = SkillLibrary(library_path)
+    library.propose(
+        name="csv parsing", task_pattern="parse csv files",
+        instruction="use csv.DictReader", evidence_task="only-shape",
+    )
+    gate = SkillGate(ApprovalManager(SqliteApprovalStore(approvals)), library)
+    skill, request = asyncio.run(_submit(gate))
+    assert not skill.promotable
+
+    without_force = subprocess.run(
+        [
+            sys.executable, "-m", "swarmd.cli", "approve", request.request_id,
+            "--actor", "cli-reviewer", "--skills", str(library_path),
+        ],
+        capture_output=True, text=True, check=False, timeout=60,
+        env=_cli_env(),
+    )
+    assert without_force.returncode == 1
+    assert not SkillLibrary(library_path).get(skill.skill_id).usable
+
+    # decisions are immutable, so the refused decision needs a fresh request
+    library.propose(
+        name="csv parsing 2", task_pattern="parse csv files",
+        instruction="use csv.DictReader v2", evidence_task="only-shape",
+    )
+    skill2, request2 = asyncio.run(
+        _submit(gate, name="csv parsing 2", instruction="use csv.DictReader v2")
+    )
+    with_force = subprocess.run(
+        [
+            sys.executable, "-m", "swarmd.cli", "approve", request2.request_id,
+            "--actor", "cli-reviewer", "--skills", str(library_path), "--force",
+        ],
+        capture_output=True, text=True, check=False, timeout=60,
+        env=_cli_env(),
+    )
+    assert with_force.returncode == 0, with_force.stderr
+    approved = SkillLibrary(library_path).get(skill2.skill_id)
+    assert approved.usable
+    assert "bypassed" in approved.approval_note
 
 
 def test_approving_a_skill_without_the_library_warns_about_divergence(

@@ -23,6 +23,7 @@ import pytest
 
 from swarmd.swarm.skills import (
     MAX_INSTRUCTION_CHARS,
+    MIN_DISTINCT_TASKS,
     Skill,
     SkillLibrary,
     SkillLibraryError,
@@ -198,6 +199,72 @@ def test_an_unproven_skill_does_not_outrank_a_proven_one():
     through a population before anyone noticed it was wrong."""
     fresh = Skill(skill_id="a", name="n", task_pattern="p", instruction=GOOD)
     assert fresh.success_rate == 0.0
+
+
+def test_approve_refuses_a_candidate_short_of_the_evidence_bar(tmp_path):
+    """MIN_DISTINCT_TASKS used to gate only which requests reach a human
+    (`run.py` checks `promotable` before queueing); `approve` itself had no
+    floor, so a candidate that reached it some other way -- a stale duplicate,
+    `--auto-approve`, a direct call -- could be approved on one task's worth
+    of evidence."""
+    library = SkillLibrary(tmp_path / "s.json")
+    skill = library.propose(
+        name="extract claims", task_pattern="any", instruction=GOOD,
+        evidence_task="shape-a",
+    )
+    assert len(skill.evidence_tasks) == 1 < MIN_DISTINCT_TASKS
+    assert not skill.promotable
+
+    with pytest.raises(SkillLibraryError, match="only 1 distinct task shape"):
+        library.approve(skill.skill_id, actor="reviewer")
+    assert not library.get(skill.skill_id).usable
+
+
+def test_force_approves_past_the_bar_and_writes_why(tmp_path):
+    """The escape for an operator who has looked at a thin candidate and
+    wants it in anyway. The bypass is written to the skill's own record --
+    not just logged -- because the record is what the next reader sees."""
+    library = SkillLibrary(tmp_path / "s.json")
+    skill = library.propose(
+        name="extract claims", task_pattern="any", instruction=GOOD,
+        evidence_task="shape-a",
+    )
+
+    approved = library.approve(skill.skill_id, actor="reviewer", force=True)
+    assert approved.usable
+    assert "reviewer" in approved.approval_note
+    assert "1" in approved.approval_note
+
+
+def test_a_candidate_with_no_tracked_evidence_is_not_gated_by_the_bar(tmp_path):
+    """`propose` without `evidence_task` never happens on the real
+    distillation path (`run.py` always supplies it); a candidate with an
+    empty `evidence_tasks` was never put through per-task tracking, so a rule
+    about DISTINCT shapes has nothing to check -- same idiom as
+    `MIN_SHAPE_SLOTS` being vacuous below its own floor."""
+    library = SkillLibrary(tmp_path / "s.json")
+    skill = library.propose(name="extract claims", task_pattern="any", instruction=GOOD)
+    assert skill.evidence_tasks == ()
+
+    approved = library.approve(skill.skill_id, actor="reviewer")
+    assert approved.usable
+    assert approved.approval_note == ""
+
+
+def test_a_second_shape_clears_the_bar_without_force(tmp_path):
+    """The positive case: real evidence from a second distinct task shape is
+    what the bar exists to require, and it is enough on its own."""
+    library = SkillLibrary(tmp_path / "s.json")
+    skill = library.propose(
+        name="extract claims", task_pattern="any", instruction=GOOD,
+        evidence_task="shape-a",
+    )
+    library.record_evidence(skill.skill_id, "shape-b")
+    assert library.get(skill.skill_id).promotable
+
+    approved = library.approve(skill.skill_id, actor="reviewer")
+    assert approved.usable
+    assert approved.approval_note == ""
 
 
 def test_a_skill_that_keeps_failing_is_prunable(tmp_path):

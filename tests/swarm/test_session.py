@@ -211,6 +211,27 @@ async def test_auto_approve_works_without_an_approval_store(library):
     assert len(library.approved()) == 1
 
 
+async def test_auto_approve_marks_a_thin_candidate_it_pushes_through(library):
+    """With no human in the loop, MIN_DISTINCT_TASKS can only be met or
+    bypassed -- there is no reviewer to wait on a second task shape for.
+    `--auto-approve` bypassing is already documented and visible via the
+    `auto-approve` actor; this is the SAME bypass now also visible on the
+    skill's own record when the candidate was genuinely short of evidence,
+    which the actor alone does not say."""
+    skill = library.propose(
+        name="n", task_pattern="p", instruction="use json.loads on the reply",
+        evidence_task="only-shape",
+    )
+    assert not skill.promotable
+
+    session = SwarmSession(_factory(), library, auto_approve=True)
+    await session.run(["t"])
+
+    approved = library.get(skill.skill_id)
+    assert approved.usable
+    assert "bypassed" in approved.approval_note
+
+
 # --- outcomes --------------------------------------------------------------
 
 

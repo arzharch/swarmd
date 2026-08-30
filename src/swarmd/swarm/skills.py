@@ -49,6 +49,7 @@ from typing import Any
 
 from swarmd.swarm.generalise import (
     METHOD_LEXICON,
+    _stem,
     abstract,
     render_pattern,
     shared_literals,
@@ -165,6 +166,12 @@ class Skill:
     # gate: a low score says "this step was mostly the task restated", which is
     # worth seeing next to the advice it produced.
     generality: float = 0.0
+    # Set only when `approve(..., force=True)` let a skill through short of
+    # MIN_DISTINCT_TASKS evidence. Mirrors `retired_reason`: the bypass has to
+    # be visible on the record itself, not just in whatever process invoked
+    # it, because the record is what a later reader -- or the next `_load` --
+    # actually sees.
+    approval_note: str = ""
 
     def __post_init__(self) -> None:
         # JSON has no tuples. Coerced here rather than at the load site so the
@@ -280,43 +287,6 @@ def validate_instruction(instruction: str, *, source_task: str = "") -> str:
 def _slot_kinds(terms: set[str]) -> set[str]:
     """The literal kinds in a term set, less the stripped-noun placeholder."""
     return {t for t in terms if t.startswith(_SLOT_PREFIX)} - {_SLOT_TERM}
-
-
-def _stem(word: str) -> str:
-    """Fold the plural forms English actually produces. Deterministic, no data.
-
-    ANATOMY: why this exists at all
-      Shape agreement compares METHOD VOCABULARY as a set, and set comparison
-      is exact. A skill distilled from `"parse csv tabular files"` therefore
-      refused `"parse a csv file of tabular data"` -- `files` and `file` are
-      different strings, so the subset test failed and a correct, on-topic
-      skill was withheld. A rule that a plural can defeat is not a rule about
-      meaning, and this is the shape of failure that only appears in front of
-      real traffic.
-
-    ANATOMY: three rules, not a stemmer library
-      Porter and friends are heavier than the job and, more to the point, they
-      also fold verb tense and derivational endings -- which would start
-      merging `"compute"` with `"computation"` and quietly widen retrieval.
-      This narrows to plurals and stops:
-
-        queries -> query      (`ies` is never a plural `y` word's own ending)
-        boxes   -> box        (`es` only after a sibilant, so `files` is safe)
-        files   -> file       (bare `s`, guarded below)
-
-      `ss` is excluded because `process`, `address` and `class` are singular,
-      and short words are excluded because `css`, `abs` and `ops` are whole
-      words rather than plurals.
-    """
-    if len(word) > 4 and word.endswith("ies"):
-        return word[:-3] + "y"
-    if len(word) > 3 and word.endswith("es") and word[:-2].endswith(
-        ("s", "x", "z", "ch", "sh")
-    ):
-        return word[:-2]
-    if len(word) > 3 and word.endswith("s") and not word.endswith("ss"):
-        return word[:-1]
-    return word
 
 
 def _method_terms(words: set[str]) -> set[str]:
@@ -517,8 +487,47 @@ class SkillLibrary:
         skill.evidence_tasks = (*skill.evidence_tasks, task_fingerprint)
         return True
 
-    def approve(self, skill_id: str, *, actor: str) -> Skill:
+    def approve(self, skill_id: str, *, actor: str, force: bool = False) -> Skill:
+        """Approve a candidate. Refuses a candidate short of its own evidence bar.
+
+        ANATOMY: the check
+          `run.py` only calls `SkillGate.submit` once a candidate is
+          `promotable` (MIN_DISTINCT_TASKS), but that check lives at the
+          CALLER -- it gates who reaches the queue, not what `approve` itself
+          will do. Nothing stopped a candidate that slipped past it (a stale
+          duplicate, `--auto-approve`, a direct call) from being approved on
+          one task's evidence. Checked here, at the one place every approval
+          path converges, closes that regardless of how it arrived.
+
+          Vacuous for a candidate with NO recorded evidence_tasks at all,
+          same idiom as `MIN_SHAPE_SLOTS` above: the real distillation path
+          (`run.py`) always supplies `evidence_task` to `propose`, so an
+          empty `evidence_tasks` means this skill was never put through
+          per-task tracking in the first place -- typically a skill entered
+          by hand -- and a rule about DISTINCT task shapes has nothing to
+          say about a candidate that was never counted against it.
+
+        ANATOMY: force
+          The explicit escape for an operator who has looked at a thin
+          candidate and wants it in anyway. The bypass is written to the
+          skill's own record, not just logged, because the record is what a
+          later reader sees -- the same reason `retired_reason` exists.
+        """
         skill = self._require(skill_id)
+        short_of_bar = bool(skill.evidence_tasks) and not skill.promotable
+        if short_of_bar and not force:
+            raise SkillLibraryError(
+                f"skill {skill_id} has evidence from only "
+                f"{len(skill.evidence_tasks)} distinct task shape(s); needs "
+                f"{MIN_DISTINCT_TASKS} before it can be approved "
+                f"(pass force=True to approve it anyway)"
+            )
+        if short_of_bar:
+            skill.approval_note = (
+                f"evidence bar bypassed by {actor}: only "
+                f"{len(skill.evidence_tasks)}/{MIN_DISTINCT_TASKS} distinct "
+                f"task shape(s)"
+            )
         skill.approved = True
         skill.approved_by = actor
         self.save()
