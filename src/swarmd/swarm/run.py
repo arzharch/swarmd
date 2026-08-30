@@ -17,6 +17,7 @@ skills — a human does, because a skill is inherited by every future run.
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 import uuid
@@ -31,7 +32,11 @@ from swarmd.swarm.economy import Economy
 from swarmd.swarm.generalise import (
     MIN_GENERALITY,
     abstract,
+    abstract_fingerprint,
     generality,
+    leaked_subject_terms,
+    literal_map,
+    rebind,
     render_pattern,
     strip_source_terms,
     task_signature,
@@ -482,26 +487,7 @@ class SwarmRun:
             metrics.record_memo_miss(reason="absent")
             return None
 
-        reason = entry.reusable(now=time.time())
-        label = "unusable"
-        if reason:
-            label = "provenance_unfinished" if entry.status != "completed" else "stale"
-        else:
-            # Second opinion from the run store. `record_outcome` settles the
-            # memo when a run ends normally, but a control plane killed mid-run
-            # marks its documents "interrupted" without touching the memo, and
-            # an interrupted run's criterion never graded a full run.
-            try:
-                stored = self.store.load(entry.run_id) if entry.run_id else None
-            except Exception:  # noqa: BLE001 - an unreadable document is not a veto
-                stored = None
-            if stored is not None and stored.status != "completed":
-                reason = (
-                    f"provenance run document reports {stored.status!r}, "
-                    f"not completed"
-                )
-                label = "provenance_unfinished"
-
+        reason, label = self._memo_admission(entry)
         if reason:
             metrics.record_memo_miss(reason=label)
             self._emit(
@@ -512,6 +498,255 @@ class SwarmRun:
             )
             return None
         return entry
+
+    def _memo_admission(self, entry: TaskMemo) -> tuple[str, str]:
+        """(reason, metric label), both empty when `entry` may be inherited.
+
+        A property of the stored document and ITS provenance run alone --
+        shared by the exact-key lookup above and the near-shape lookup below,
+        because a memo whose provenance run never completed, or that has aged
+        past `MEMO_MAX_AGE_S`, is unusable whichever key found it.
+
+        A SIDE EFFECT, not just a report: when the run-store's document is
+        what disqualifies `entry` (its own `status` field looked fine), the
+        entry is deleted here too. See the comment at that branch below.
+        """
+        reason = entry.reusable(now=time.time())
+        if reason:
+            label = "provenance_unfinished" if entry.status != "completed" else "stale"
+            return reason, label
+        # Second opinion from the run store. `record_outcome` settles the
+        # memo when a run ends normally, but a control plane killed mid-run
+        # marks its documents "interrupted" without touching the memo, and
+        # an interrupted run's criterion never graded a full run.
+        try:
+            stored = self.store.load(entry.run_id) if entry.run_id else None
+        except Exception:  # noqa: BLE001 - an unreadable document is not a veto
+            stored = None
+        if stored is not None and stored.status != "completed":
+            # Unlike the branch above, `entry.reusable()` saw nothing wrong --
+            # the memo's OWN status field says "completed". Left on disk, it
+            # would keep reporting reusable to `remember()` on every future
+            # run of this task, which refuses to overwrite an entry that
+            # claims to be reusable (see `MemoStore.remember`): the same
+            # interrupted document would refuse every run of this task
+            # forever and none of them could ever write a replacement.
+            # Deleted, not quarantined -- this is an ordinary interrupted run,
+            # not a document that disagrees with its own recorded hash, so it
+            # is not evidence of tampering the way `MemoStore.quarantine`
+            # guards.
+            if self.memo is not None:
+                self.memo.delete(entry.task_key)
+            return (
+                f"provenance run document reports {stored.status!r}, not completed",
+                "provenance_unfinished",
+            )
+        return "", ""
+
+    # -- the near-match tier --------------------------------------------
+    #
+    # The exact key above only fires on a repeat of the exact same question.
+    # This tier answers the harder, more valuable case: a task of the same
+    # SHAPE as one already solved -- pencils where pens were asked about
+    # before. `abstract_fingerprint` is the key (see generalise.py); nothing
+    # is ever served on a fingerprint match alone, because a shared shape
+    # says nothing about whether THIS task's literals can be read as the
+    # provenance task's. `_criterion_from_near_memo` and `_plan_from_near_memo`
+    # rebind them and, for the criterion, re-attack before trusting anything.
+
+    def _near_memo_lookup(self, task: str) -> TaskMemo | None:
+        """The best same-shape memo for this task, or None.
+
+        Only ever consulted once the exact tier has missed -- see `run()`,
+        which looks both up before either stage so the criterion and the plan
+        it may reuse come from the SAME provenance entry. Iterates newest-first
+        over every candidate `by_fingerprint` returns, skipping any whose OWN
+        provenance run disqualifies it, exactly as the exact lookup does.
+        """
+        if self.memo is None:
+            return None
+        if self.state.criterion or self.state.results:
+            return None  # a resume beats a near match for the same reason it beats an exact one
+        fingerprint = abstract_fingerprint(task)
+        for entry in self.memo.by_fingerprint(fingerprint, exclude_key=key_for(task)):
+            reason, label = self._memo_admission(entry)
+            if reason:
+                metrics.record_memo_miss(reason=f"near_{label}")
+                self._emit(
+                    "memo_refused",
+                    task_key=entry.task_key,
+                    provenance_run_id=entry.run_id,
+                    reason=reason,
+                    tier="near",
+                )
+                continue
+            return entry
+        metrics.record_memo_miss(reason="near_absent")
+        return None
+
+    def _near_refuse(self, entry: TaskMemo, reason: str) -> None:
+        """A same-shape memo could not be rebound onto THIS task. Kept, not deleted.
+
+        The exact tier's `_memo_reject` deletes on refusal because everything
+        routed there is a property of the STORED document -- it will fail the
+        same way for every future run of that exact task. A rebind failure is
+        the opposite: a property of THIS pairing of two tasks. The entry is
+        still exactly as good as it ever was for its own task, or for the next
+        task that shares its shape and happens to rebind cleanly.
+        """
+        metrics.record_memo_miss(reason="near_rebind_failed")
+        self._emit(
+            "memo_refused",
+            task_key=entry.task_key,
+            provenance_run_id=entry.run_id,
+            reason=reason,
+            tier="near",
+        )
+
+    def _criterion_from_near_memo(
+        self, entry: TaskMemo, task: str
+    ) -> FrozenCriterion | None:
+        """Rebind a same-shape memo's criterion onto THIS task, or None.
+
+        NEVER replays a stored result: only the CRITERION is rebound, and it
+        is re-attacked against THIS task's text before it may grade anything
+        -- the same discipline `_criterion_from_memo` applies to an exact hit,
+        run again here because rebinding is itself a rewrite that could
+        produce a criterion nobody attacked. A rebind whose attack fails falls
+        through to full synthesis; it does not degrade to "close enough".
+
+        THE GAP ATTACK ALONE DOES NOT COVER: `rebind` only rewrites the literal
+        kinds `_LITERAL_KINDS` names -- TERM (an ordinary subject noun like
+        "pens") is deliberately excluded there, because that exclusion is
+        correct for a plan's human-facing text. It is not correct for a check
+        PARAMETER a grader compares byte-for-byte: a criterion that requires
+        the literal string "pens" can never be satisfied by any candidate about
+        pencils, correct or not, and `attack` cannot catch that -- it only
+        tries degenerate candidates, none of which happen to contain the one
+        word a genuinely correct pencils answer never would. So the rebound
+        criterion is checked for a surviving source-only subject word BEFORE
+        it is trusted, the same way `attack`'s own failure is checked after.
+        """
+        from swarmd.swarm.criteria import CheckError, Criterion
+        from swarmd.swarm.synthesis import attack
+
+        mapping = literal_map(entry.task, task)
+        if mapping is None:
+            self._near_refuse(
+                entry, "task literals do not line up with the stored task"
+            )
+            return None
+        try:
+            rebound_text = rebind(json.dumps(entry.criterion or {}), mapping)
+            rebound = json.loads(rebound_text)
+            criterion = Criterion.from_dict(rebound)
+        except (CheckError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            self._near_refuse(entry, f"rebind produced an unusable criterion: {exc}")
+            return None
+        leaked = leaked_subject_terms(rebound_text, entry.task, task)
+        if leaked:
+            self._near_refuse(
+                entry,
+                f"rebound criterion still names {sorted(leaked)} from the "
+                f"source task; no candidate about this task could ever pass it",
+            )
+            return None
+        broken = criterion.malformed()
+        if broken:
+            self._near_refuse(
+                entry, f"rebound criterion malformed: {'; '.join(broken)}"
+            )
+            return None
+        report = attack(criterion, task)
+        if not report.survived:
+            self._near_refuse(
+                entry, f"rebound criterion failed re-attack: {report.summary()}"
+            )
+            return None
+
+        frozen_hash = criterion.content_hash()
+        frozen = FrozenCriterion(
+            criterion=criterion,
+            hash=frozen_hash,
+            attempts=0,
+            agreement=1.0,
+            attack_report=report,
+            history=(f"rebound from run {entry.run_id} (near match)",),
+        )
+        self._memo_credit(
+            "criterion", entry, hash=frozen_hash, tier="near",
+            task_fingerprint=entry.task_fingerprint,
+        )
+        self._emit(
+            "criterion_memo_revalidated",
+            hash=frozen.hash,
+            checks=len(criterion.checks),
+            task_key=entry.task_key,
+            task_fingerprint=entry.task_fingerprint,
+            provenance_run_id=entry.run_id,
+            calls_avoided=self.profile.proposers,
+            attack=report.summary(),
+        )
+        # Persisted exactly as a synthesised or exact-hit criterion is, so a
+        # resume of THIS run reads its criterion from its own document rather
+        # than depending on the memo still being there.
+        self.state.criterion = criterion.to_dict()
+        self.state.criterion_hash = frozen.hash
+        self.persist()
+        return frozen
+
+    def _plan_from_near_memo(self, entry: TaskMemo, task: str) -> Plan | None:
+        """Rebind a same-shape memo's plan onto THIS task, or None.
+
+        A plan has no adversarial attack to re-run -- there is no fixed set of
+        degenerate decompositions the way `degenerate_candidates` exists for a
+        criterion. What protects a bad rebind here is the same thing that
+        protects every memo hit, near or exact: workers still run fresh and
+        the (already re-attacked) criterion grades what they actually
+        produced, never a stored answer.
+        """
+        from swarmd.swarm.planner import PlanError, validate
+
+        if not entry.plan:
+            metrics.record_memo_miss(reason="near_no_plan")
+            return None
+        mapping = literal_map(entry.task, task)
+        if mapping is None:
+            self._near_refuse(
+                entry, "task literals do not line up with the stored task"
+            )
+            return None
+        try:
+            rebound = json.loads(rebind(json.dumps(entry.plan), mapping))
+            nodes = [
+                PlanNode(
+                    name=str(n["name"]),
+                    instruction=str(n.get("instruction", "")),
+                    depends_on=tuple(n.get("depends_on") or ()),
+                )
+                for n in rebound.get("nodes", [])
+            ]
+            plan = validate(nodes)
+        except (PlanError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            self._near_refuse(entry, f"rebound plan will not run: {exc}")
+            return None
+
+        self._memo_credit(
+            "plan", entry, hash=plan.content_hash(), tier="near",
+            task_fingerprint=entry.task_fingerprint,
+        )
+        self._emit(
+            "plan_memo_revalidated",
+            hash=plan.content_hash(),
+            nodes=len(plan.nodes),
+            task_key=entry.task_key,
+            task_fingerprint=entry.task_fingerprint,
+            provenance_run_id=entry.run_id,
+            calls_avoided=self.profile.proposers,
+        )
+        self.state.plan = plan.to_dict()
+        self.persist()
+        return plan
 
     def _memo_reject(self, entry: TaskMemo, label: str, reason: str) -> None:
         """Refuse a memo AND drop it. A refusal that leaves it costs forever.
@@ -845,6 +1080,15 @@ class SwarmRun:
             # could straddle a concurrent write and pair one run's definition
             # of done with another run's decomposition.
             memo = self._memo_lookup(task)
+            # The near-match tier ONLY fires on an exact-tier miss: an exact
+            # hit that was found but refused is a property of that document
+            # (see `_memo_reject`), not evidence that no memo applies, so it
+            # is not retried against a looser key. Looked up here, alongside
+            # the exact one, for the same straddling reason: the near
+            # candidate the plan rebinds from has to be the one the criterion
+            # rebound from, not a second, independently-chosen one.
+            near_memo = self._near_memo_lookup(task) if memo is None else None
+            near_tier = False
 
             restored_criterion = self.restored_criterion()
             if restored_criterion is not None:
@@ -858,14 +1102,21 @@ class SwarmRun:
                 memoised = (
                     self._criterion_from_memo(memo, task) if memo else None
                 )
+                if memoised is None and near_memo is not None:
+                    memoised = self._criterion_from_near_memo(near_memo, task)
+                    near_tier = memoised is not None
                 if memoised is not None:
                     result.criterion = memoised
-                    result.served_from = f"memo:{memo.run_id}" if memo else ""
+                    source = near_memo if near_tier else memo
+                    result.served_from = f"memo:{source.run_id}" if source else ""
                 else:
-                    # The memo was absent or refused; the entry is already gone
-                    # if it was refused, so this run's own synthesis becomes the
-                    # memo for the next one.
+                    # Every tier missed or was refused; a refused exact entry
+                    # is already gone, and a refused near candidate is left in
+                    # place (see `_near_refuse`) but not retried here, so this
+                    # run's own synthesis becomes the memo the next one --
+                    # exact or near -- can reuse.
                     memo = None
+                    near_memo = None
                     result.criterion = await self._synthesize_criterion(task)
 
             restored_plan = self.restored_plan()
@@ -877,7 +1128,12 @@ class SwarmRun:
                     nodes=len(restored_plan.nodes),
                 )
             else:
-                memoised_plan = self._plan_from_memo(memo) if memo else None
+                if near_tier and near_memo is not None:
+                    memoised_plan = self._plan_from_near_memo(near_memo, task)
+                elif memo is not None:
+                    memoised_plan = self._plan_from_memo(memo)
+                else:
+                    memoised_plan = None
                 if memoised_plan is not None:
                     result.plan = memoised_plan
                 else:

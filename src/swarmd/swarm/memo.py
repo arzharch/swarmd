@@ -34,6 +34,20 @@ passed its own gate. A criterion frozen by a run that then failed, aborted or
 was interrupted is exactly the criterion not to inherit: it is unproven at
 best, and at worst it is the reason the run failed.
 
+THE NEAR-MATCH TIER. The exact key above only fires on a repeat of the same
+question, which leaves "a SIMILAR task fires instantly" unmet -- pencils at a
+different price still pay for six proposer calls. `task_fingerprint` is a
+second, deliberately coarser key: `generalise.abstract_fingerprint`, the same
+SHAPE-not-subject fingerprint that lets a skill transfer from pens to pencils
+(see `generalise.py`'s own module docstring). `by_fingerprint` is the lookup
+over it. This is NOT the similarity `router/cache.py` warns against -- it is
+not a threshold on a continuous score, it is an equality test on a
+deterministic, discrete shape -- and nothing here serves an answer on a
+fingerprint match alone: a near hit still has to have its literals rebound
+onto the NEW task and its criterion re-attacked against the NEW task text
+before `swarm/run.py` may trust either. See `_criterion_from_near_memo` there
+for the half of the invariant this module cannot enforce by itself.
+
 FORMAT: one JSON document per task key, replaced atomically, under the RunStore
 root. Same write discipline as `RunStore.save` (temp file in the same
 directory, fsync, `os.replace`) and the same filename sanitiser. Content-hash
@@ -54,6 +68,7 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
+from swarmd.swarm.generalise import abstract_fingerprint
 from swarmd.swarm.runstore import RunStore
 
 logger = logging.getLogger(__name__)
@@ -61,7 +76,13 @@ logger = logging.getLogger(__name__)
 # Bumped when the stored shape changes incompatibly. A memo read under the
 # wrong shape would hand a run a criterion it cannot verify, which is worse
 # than paying for a new one.
-MEMO_SCHEMA_VERSION = 1
+#
+# 2: added `task_fingerprint`, the near-match tier's secondary key. A memo
+# written under version 1 has no fingerprint to index by, and reading it as
+# though it did would either mismatch every lookup or, worse, match one by
+# coincidence (an unset field reads as "" on both sides). Bumping means those
+# entries age out and are re-earned rather than silently misindexed.
+MEMO_SCHEMA_VERSION = 2
 
 # Directory under the RunStore root. Beside the run documents deliberately: a
 # memo is derived from a run, ages with the same working set, and an operator
@@ -118,6 +139,12 @@ class TaskMemo:
     # anything. It is what lets an operator see which question a memo came from.
     task: str
     run_id: str
+    # The near-match tier's secondary key: `generalise.abstract_fingerprint`
+    # of `task`. Stored rather than recomputed on every read so a fingerprint
+    # rule change is visible per-entry (an old entry keeps the fingerprint it
+    # was written with until it is re-earned) instead of silently reindexing
+    # the whole store the moment the code changes.
+    task_fingerprint: str = ""
     criterion: dict[str, Any] | None = None
     criterion_hash: str = ""
     plan: dict[str, Any] | None = None
@@ -136,6 +163,7 @@ class TaskMemo:
             "task_key": self.task_key,
             "task": self.task,
             "run_id": self.run_id,
+            "task_fingerprint": self.task_fingerprint,
             "criterion": self.criterion,
             "criterion_hash": self.criterion_hash,
             "plan": self.plan,
@@ -165,6 +193,7 @@ class TaskMemo:
             task_key=str(data["task_key"]),
             task=str(data.get("task", "")),
             run_id=str(data.get("run_id", "")),
+            task_fingerprint=str(data.get("task_fingerprint", "")),
             criterion=data.get("criterion"),
             criterion_hash=str(data.get("criterion_hash", "")),
             plan=data.get("plan"),
@@ -268,6 +297,39 @@ class MemoStore:
             return None
         return memo
 
+    def by_fingerprint(
+        self, fingerprint: str, *, exclude_key: str = ""
+    ) -> list[TaskMemo]:
+        """Every stored memo sharing this task SHAPE, most recently proven first.
+
+        The near-match tier's lookup: the caller has already missed on the
+        exact key and is asking "has ANY task of this shape been solved
+        before". Returns candidates, not an answer -- every one of them still
+        has to pass `get`'s own hash and provenance checks (folded in via
+        `entries`) and then be rebound and re-attacked by the caller before it
+        may be trusted; see `swarm/run.py`.
+
+        ANATOMY: a scan over `entries()`, not a separate index file
+          `entries()` already walks every document in the store to prune and
+          to verify each one's content hash, so a memo store is small enough
+          to read in full on every call -- the same reasoning `SkillLibrary`
+          gives for staying JSON-file backed rather than a database. A second
+          on-disk structure mapping fingerprint to task keys would need its
+          own atomic-write discipline and could itself drift out of sync with
+          the documents it claims to index (a memo deleted without its index
+          row updated would serve a candidate `get` immediately quarantines
+          on read). A query over `entries()` cannot drift, because it has
+          nothing of its own to drift from.
+        """
+        if not fingerprint:
+            return []
+        matches = [
+            m for m in self.entries()
+            if m.task_fingerprint == fingerprint and m.task_key != exclude_key
+        ]
+        matches.sort(key=lambda m: -m.updated_ts)
+        return matches
+
     # -- writing ------------------------------------------------------------
 
     def put(self, memo: TaskMemo) -> None:
@@ -324,6 +386,7 @@ class MemoStore:
                 task_key=key,
                 task=task,
                 run_id=run_id,
+                task_fingerprint=abstract_fingerprint(task),
                 created_ts=now,
             )
         if criterion is not None:
