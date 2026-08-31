@@ -191,6 +191,12 @@ class Pacer:
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     _ticker: asyncio.Task[None] | None = None
     _last_resumed_at: float = 0.0
+    # Counter for anonymous parks, incremented under `_lock` so two agents
+    # that park in the same tick (the common case: pool.py reads agent_id
+    # from request metadata, and synthesis calls carry none) get distinct
+    # keys instead of colliding on `len(self.waiting)` -- which two
+    # concurrent parks can both read as the same value before either adds.
+    _anon_seq: int = 0
 
     # -- the pause ------------------------------------------------------
 
@@ -207,7 +213,12 @@ class Pacer:
             raise Paced(cause)
 
         async with self._lock:
-            self.waiting.add(agent_id or f"anon-{len(self.waiting)}")
+            if agent_id:
+                key = agent_id
+            else:
+                self._anon_seq += 1
+                key = f"anon-{self._anon_seq}"
+            self.waiting.add(key)
             if not self.paused:
                 self._begin(cause)
             elif cause.resumes_at and cause.resumes_at < self.resumes_at:
@@ -223,7 +234,7 @@ class Pacer:
         await event.wait()
 
         async with self._lock:
-            self.waiting.discard(agent_id or "")
+            self.waiting.discard(key)
 
     def _begin(self, cause: PauseCause) -> None:
         now = time.time()

@@ -105,6 +105,31 @@ async def test_every_agent_waits_on_one_pause_not_one_each(pacer):
     assert pacer.pauses == 1
 
 
+async def test_concurrent_anonymous_parks_do_not_leak_or_collide(pacer):
+    """pool.py reads agent_id from request metadata, so every synthesis call
+    parks with agent_id="" -- anonymous is the common case, not an edge one.
+    The key added to `waiting` must be the same key removed, and two parks
+    landing in the same tick must not collide on a shared placeholder."""
+    peak = 0
+
+    async def watch():
+        nonlocal peak
+        while not task.done():
+            peak = max(peak, len(pacer.waiting))
+            await asyncio.sleep(0)
+
+    async def park():
+        await pacer.park(cause(seconds=0.05))
+
+    task = asyncio.gather(*(park() for _ in range(8)))
+    watcher = asyncio.create_task(watch())
+    await asyncio.wait_for(task, timeout=2.0)
+    await watcher
+
+    assert peak == 8
+    assert not pacer.waiting
+
+
 async def test_every_parked_agent_is_released(pacer):
     """One agent left parked after the wake is a run that never finishes."""
     released = []
