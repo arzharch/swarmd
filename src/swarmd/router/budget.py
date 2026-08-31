@@ -1105,16 +1105,28 @@ class BudgetTracker:
         which change.
         """
         now = now if now is not None else time.time()
+        # EVERY row of the meter, not only the ones carrying a request count.
+        # A call is journalled as several rows that only make sense summed: the
+        # ration reserves +1 request and a token ESTIMATE, then settles the
+        # difference between the estimate and what the call really cost on a row
+        # carrying no request at all. Filtering to `row.requests` kept the
+        # estimate and dropped the correction, so this returned the estimate it
+        # had itself produced -- a measurement that could never move off its own
+        # default no matter what the provider actually charged.
         rows = [
             row
             for row in self.journal.rows_since(now - WEEK)
-            if row.provider == provider and row.requests
+            if row.provider == provider and row.kind != "exhausted"
         ]
         if not rows:
             return default
         requests = sum(row.requests for row in rows)
         tokens = sum(row.tokens for row in rows)
-        return max(1, tokens // max(1, requests)) if tokens else default
+        if requests <= 0 or tokens <= 0:
+            # Only in-flight reservations, or none at all. Nothing has settled
+            # into a figure worth believing over the default.
+            return default
+        return max(1, tokens // requests)
 
     def daily_capacity(self, provider: str) -> tuple[int, str]:
         """Requests per day this provider can supply, and on what evidence.

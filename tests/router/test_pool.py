@@ -601,3 +601,21 @@ async def test_one_call_costs_the_day_one_request(tmp_path):
     day = track.window_state("groq", "day")
     assert day.used_requests == 1
     assert day.used_tokens == resp.tokens_in + resp.tokens_out
+
+
+async def test_the_token_estimate_is_measured_from_settled_calls_not_itself(tmp_path):
+    """`observed_tokens_per_request` skipped rows with no request count, which
+    is exactly the row the ration writes to CORRECT its estimate. It therefore
+    averaged the estimate and never the outcome: the figure sat at its default
+    forever, and every ration reserved that default no matter what the provider
+    really charged. A pool sending 15-token calls kept reserving 1,250.
+    """
+    track, ration = _day_rationed(tmp_path, "groq")
+    slot = _slot("groq", ["m"])
+    slot.credential_id = "groq#0"
+    pool = ProviderPool([slot], budget=track, ration=ration)
+
+    resp = await pool.complete(_req())
+    assert track.observed_tokens_per_request("groq") == (
+        resp.tokens_in + resp.tokens_out
+    )
