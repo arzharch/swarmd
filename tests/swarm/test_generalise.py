@@ -536,20 +536,27 @@ def test_the_fallback_leaves_a_narrower_residual_and_this_is_it():
     """What the fix costs, pinned so it cannot widen unnoticed.
 
     The fallback keeps every content word, and it cannot tell a verb it does
-    not recognise from a noun. So in a sentence with NO determiner anywhere,
-    a verb outside `METHOD_LEXICON` is read as part of the subject matter, and
-    the same task phrased with a recognised verb gets a different signature.
+    not recognise from a noun. So whenever the head-of-phrase pass leaves no
+    subject -- always true with no determiner anywhere, but also true for a
+    determiner-introduced phrase whose head word is itself in
+    `METHOD_LEXICON` -- a verb outside `METHOD_LEXICON` is read as part of
+    the subject matter, and the same task phrased with a recognised verb gets
+    a different signature.
 
-    That is strictly narrower than what it replaced: it needs BOTH a
-    determiner-less sentence AND an unrecognised verb, where the old residual
-    fired on any fronted phrase. The honest fix is to widen METHOD_LEXICON when
-    such a verb turns up, not to widen this fallback -- so this test failing
-    means a word needs adding to the lexicon.
+    That is strictly narrower than what it replaced: it needs BOTH an
+    unrecognised verb AND a sentence where the head-of-phrase pass finds no
+    subject, where the old residual fired on any fronted phrase. The honest
+    fix is to widen METHOD_LEXICON when such a verb turns up, not to widen
+    this fallback -- so this test failing means a word needs adding to the
+    lexicon.
     """
     assert task_signature("tally widgets") != task_signature("count widgets")
 
-    # A determiner is enough to avoid it entirely, because the head-of-phrase
-    # rule then applies and the fallback never runs.
+    # A determiner on a head word outside METHOD_LEXICON is enough to avoid
+    # it, because the head-of-phrase rule then finds a subject and the
+    # fallback never runs. (A determiner alone is not enough -- "count the
+    # count" still hits the fallback, because "count" heads its own phrase
+    # and is itself in METHOD_LEXICON.)
     assert task_signature("tally the widgets") == task_signature(
         "count the widgets"
     )

@@ -736,15 +736,29 @@ def task_shape(task: str) -> TaskShape:
       because no suffix rule resolves it without a lexicon this module
       deliberately does not keep.
 
-      Otherwise toward collapsing, deliberately, exactly as before. A determiner-less
-      fronted noun phrase ("Pens: compute the total cost of 3 at 1.25 each")
-      contributes no subject, so it does NOT collapse onto the ordinary
-      phrasing -- that is the one residual split this rule still has, and it
-      costs a promotion that does not happen rather than a bar that can be
-      farmed by rewording. A clause-initial run is not read as a phrase because
-      an unknown VERB starts one too ("determine the total cost..."), and
-      reading those as subjects would let a synonym for "compute" mint the
-      second shape -- the cheapest farm of all.
+      Otherwise toward collapsing, deliberately, exactly as before. A
+      determiner-less fronted noun phrase ("Pens: compute the total cost of 3
+      at 1.25 each") contributes no subject from the head-of-phrase pass --
+      a clause-initial run is not read as a phrase, because an unknown VERB
+      starts one too ("determine the total cost...") and reading those as
+      subjects would let a synonym for "compute" mint a second shape, the
+      cheapest farm of all -- but the `if not subjects` fallback below then
+      reads the whole template for content words, so the fronted phrasing
+      still collapses onto the ordinary one instead of splitting from it.
+
+      The fallback's own residual is narrower: it keeps every content word
+      and cannot tell a verb it does not recognise from a noun. It runs
+      whenever the head-of-phrase pass leaves `subjects` empty -- which is
+      not only "no determiner anywhere": a determiner-introduced phrase whose
+      head word is itself in `METHOD_LEXICON` contributes nothing either
+      (`flush` filters it), so "count the count" hits the fallback too even
+      though it has a determiner. Either way, once the fallback runs, a verb
+      outside `METHOD_LEXICON` is read as subject matter and a synonymous
+      verb mints a second shape
+      (`task_signature("tally widgets") != task_signature("count widgets")`).
+      Pinned by `test_the_fallback_leaves_a_narrower_residual_and_this_is_it`;
+      a failure there means a word needs adding to `METHOD_LEXICON`, not a
+      widening of the fallback.
     """
     # Whitespace and case folded HERE rather than by importing `memo.normalise`
     # -- this module deliberately imports nothing from swarmd, and borrowing
@@ -785,11 +799,15 @@ def task_shape(task: str) -> TaskShape:
             run.append(token)
     flush()
     if not subjects:
-        # NOTHING WAS INTRODUCED, so the sentence never offered a phrase to
-        # take a head from. Rather than return no subject -- which merges every
-        # such task onto one signature and splits each from its own ordinary
-        # phrasing -- fall back to the content words: whatever is left once the
-        # method vocabulary, the function words and the slots are removed.
+        # No phrase contributed a head: either nothing was introduced (no
+        # determiner, preposition or literal anywhere), or every phrase that
+        # was introduced had a head word that `flush` filtered because it is
+        # itself in METHOD_LEXICON ("the count" heads on "count"). Either way
+        # there is no subject to return. Rather than return none -- which
+        # merges every such task onto one signature and splits each from its
+        # own ordinary phrasing -- fall back to the content words: whatever is
+        # left once the method vocabulary, the function words and the slots
+        # are removed.
         #
         # Deliberately a FALLBACK and not the primary rule. Head-of-phrase is
         # the better signal when it is available, because it ignores the
