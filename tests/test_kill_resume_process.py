@@ -117,8 +117,14 @@ def test_a_kill_mid_execution_resumes_without_re_buying_the_work(tmp_path):
     # finished. Parking during synthesis proves the pause works but stores
     # almost nothing, so it cannot show that a resume avoids re-buying.
     ej, er = tmp_path / "e.jsonl", tmp_path / "e-runs"
+    # 35, halved from 70 when the pool stopped charging each call to the day
+    # TWICE (a ration reserve/settle pair AND a second full-cost usage row, both
+    # in the same journal). The number is "small enough that this task parks
+    # partway through", so a fix that made every call cost half as much had to
+    # move it or the run would finish without ever parking -- which is exactly
+    # how this test failed, and it failed LOUDLY rather than passing vacuously.
     child.write_text(
-        CHILD.format(repo=REPO.as_posix(), day_limit=70), encoding="utf-8"
+        CHILD.format(repo=REPO.as_posix(), day_limit=35), encoding="utf-8"
     )
     first = subprocess.Popen(
         [sys.executable, str(child), "start", "run-drop"], cwd=str(REPO),

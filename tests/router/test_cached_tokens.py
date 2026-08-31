@@ -281,11 +281,18 @@ async def test_the_usage_journal_carries_cached_tokens_beside_the_total(tmp_path
     finally:
         await pool.aclose()
 
-    rows = [r for r in tracker.journal.rows_since(0.0) if r.requests]
-    settled = [r for r in rows if r.tokens]
-    assert settled, "nothing was journalled"
-    assert any(r.cached_tokens == 900 for r in settled)
-    assert all(r.tokens >= r.cached_tokens for r in settled)
+    # Selected by what the row REPORTS, not by what it charges. A rationed
+    # call's observation row now carries zero cost -- the ration's own
+    # reserve/settle pair is the charge, and a second charging row billed the
+    # day twice -- so filtering on `r.requests` would drop the very row this
+    # test is about while the property it asserts still holds.
+    rows = tracker.journal.rows_since(0.0)
+    observed = [r for r in rows if r.cached_tokens]
+    assert observed, "nothing was journalled"
+    assert any(r.cached_tokens == 900 for r in observed)
+    # Beside the total, never subtracted from it: the ration reads this back.
+    charged = [r for r in rows if r.tokens > 0]
+    assert charged and all(r.tokens >= r.cached_tokens for r in charged)
 
 
 async def test_a_cached_call_lands_in_the_ledger_with_its_cached_count(tmp_path):

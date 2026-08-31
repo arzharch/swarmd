@@ -800,206 +800,272 @@ class ProviderPool(Provider):
                     quota_waits.append(resets_in)
                     continue
 
-                # RATION gate. The budget gate above asks whether the DAY has
-                # anything left; this asks whether this six-hour session does.
-                # Without it a single run empties a day in an afternoon and the
-                # next session has nothing -- which is exactly what happened on
-                # 2026-08-28, when one eval sweep took the NVIDIA grant from
-                # 1,000 to 0 and left groq token-blocked for the rest of the
-                # day.
-                #
-                # A refusal here is NOT an error and must not be appended to
-                # `errors`: the capacity exists, it is simply not this
-                # session's to spend yet. It is collected as a pause candidate
-                # so that if EVERY provider refuses, the run waits rather than
-                # failing.
-                grant = await self.ration.reserve(
-                    provider=slot.spec.name,
-                    credential=slot.credential_id,
-                    model=slot.provider.models[0],
-                )
-                if not grant.admitted:
-                    ration_waits.append(
-                        PauseCause(
-                            reason=grant.decision.reason,
-                            provider=slot.spec.name,
-                            credential=slot.credential_id,
-                            dimension=grant.decision.dimension,
-                            used=grant.decision.used,
-                            envelope=grant.decision.envelope,
-                            resumes_at=grant.decision.resumes_at,
-                        )
-                    )
-                    continue
-
-                # Quota gate. Asking permission before sending is what keeps N
-                # pods sharing a credential from collectively exceeding the
-                # account limit -- each pod's own backoff cannot see the others.
-                # Both dimensions, taken together or not at all. Spending a
-                # request permit and then finding the token bucket dry would
-                # drain the request allowance at the token bucket's refill rate
-                # and throttle the pool on a dimension with capacity to spare.
-                #
-                # The token figure is the ration's own estimate, measured from
-                # the usage journal rather than assumed: it moves with prompt
-                # size, which moves with schema hints and retrieved skills.
-                wait = await self.quota.acquire(
-                    slot.quota_key,
-                    tokens=self.ration.estimate_tokens(slot.spec.name),
-                )
-                if wait > 0:
-                    quota_waits.append(wait)
-                    continue
-
                 for model in slot.provider.models:
-                    if self.account is not None:
-                        # Refuse before spending, not after.
-                        self.account.precheck(
-                            slot.spec.name, model, request.max_tokens
-                        )
-                    try:
-                        resp = await slot.provider.complete_with(model, request)
-                    except RateLimited as exc:
-                        # The request stands against the ration even though it
-                        # failed: several providers count a 429 toward the
-                        # daily allowance, so releasing it here would let a
-                        # throttled run spend its day discovering that.
-                        await self.ration.settle(
-                            grant, tokens=0, outcome="rate_limited"
-                        )
-                        slot.state.record_429(exc.retry_after_s)
-                        metrics.record_rate_limited(
-                            provider=slot.spec.name, model=model
-                        )
-                        if exc.daily:
-                            # A wait measured in hours is the account saying the
-                            # DAY is spent, not the minute. Journalled so it
-                            # outlives this process and is believed over the
-                            # declared table until the instant the provider
-                            # itself named (ADR-008). Halving the per-minute
-                            # bucket instead, as the single branch below used
-                            # to, answers a spent day by retrying it slightly
-                            # more slowly -- and every retry earns another
-                            # rejection charged to the day already gone.
-                            until = time.time() + (
-                                exc.retry_after_s or LONG_WINDOW_S
-                            )
-                            self.budget.observe_day_limit(
-                                slot.spec.name,
-                                credential=slot.credential_id,
-                                model=model,
-                                until=until,
-                                source=f"429 retry_after={exc.retry_after_s}",
-                            )
-                            self.pacer.limit_corrected(
-                                provider=slot.spec.name,
-                                credential=slot.credential_id,
-                                declared=self._declared_day(slot.spec.name),
-                                until=until,
-                                source="429",
-                            )
-                        else:
-                            # A minute-window rejection: our rate estimate was
-                            # too high. Tighten the bucket so the correction
-                            # outlives this backoff window instead of being
-                            # relearned every time.
-                            await self.quota.configure(
-                                slot.quota_key,
-                                rate_per_min=max(1.0, slot.spec.hint_rpm * 0.5),
-                                burst=1,
-                                tokens_per_min=max(
-                                    1.0, slot.spec.hint_tpm * 0.5
-                                ),
-                            )
-                        errors.append(f"{slot.spec.name}: 429")
-                        break  # whole provider is throttled, not just this model
-                    except ProviderError as exc:
-                        await self.ration.settle(grant, tokens=0, outcome="error")
-                        slot.state.record_error()
-                        metrics.record_llm_error(
-                            provider=slot.spec.name,
-                            model=model,
-                            reason=type(exc).__name__,
-                        )
-                        errors.append(str(exc))
-                        continue  # try the next model on the same provider
-
-                    # The estimate becomes the measurement. Until this
-                    # call the ration held a forecast; leaving it there would
-                    # ration the rest of the session against a guess.
+                    # ONE ATTEMPT, ONE UNIT OF ACCOUNTING. Both cost gates sit
+                    # INSIDE this loop because every iteration sends a real
+                    # request: a slot whose first model errors and whose second
+                    # succeeds put two calls on the wire, and a gate above the
+                    # loop charged the account for one of them.
                     #
-                    # CACHED PROMPT TOKENS ARE NOT SUBTRACTED HERE, and that
-                    # is deliberate. A free tier's daily well generally counts
-                    # cached prompt tokens in full -- the discount, where one
-                    # exists at all, is on price, not on quota. Crediting the
-                    # ration for them would convert a latency win into an
-                    # afternoon of unexpected 429s, which is exactly the
-                    # failure the ration exists to prevent. Cached tokens are
-                    # a cost and latency signal, never quota headroom, until a
-                    # measurement on the live account says otherwise.
-                    await self.ration.settle(
-                        grant, tokens=resp.tokens_in + resp.tokens_out
+                    # QUOTA. Asking permission before sending is what keeps N
+                    # pods sharing a credential from collectively exceeding the
+                    # account limit -- each pod's own backoff cannot see the
+                    # others. Both dimensions, taken together or not at all:
+                    # spending a request permit and then finding the token
+                    # bucket dry would drain the request allowance at the token
+                    # bucket's refill rate and throttle the pool on a dimension
+                    # with capacity to spare.
+                    #
+                    # The token figure is the ration's own estimate, measured
+                    # from the usage journal rather than assumed: it moves with
+                    # prompt size, which moves with schema hints and retrieved
+                    # skills.
+                    wait = await self.quota.acquire(
+                        slot.quota_key,
+                        tokens=self.ration.estimate_tokens(slot.spec.name),
                     )
-                    slot.state.record_success()
-                    # Recorded per CREDENTIAL, because that is the unit every
-                    # provider meters. Two Google keys are two budgets, and a
-                    # tracker that summed them would report the pair as one
-                    # exhausted account.
-                    self.budget.record(
+                    if wait > 0:
+                        # `break`, not `continue`: the bucket is keyed on the
+                        # CREDENTIAL, so no other model on this slot will find
+                        # it any fuller.
+                        quota_waits.append(wait)
+                        break
+
+                    # RATION gate. The budget gate above asks whether the DAY
+                    # has anything left; this asks whether this six-hour session
+                    # does. Without it a single run empties a day in an
+                    # afternoon and the next session has nothing -- which is
+                    # exactly what happened on 2026-08-28, when one eval sweep
+                    # took the NVIDIA grant from 1,000 to 0 and left groq
+                    # token-blocked for the rest of the day.
+                    #
+                    # Reserved against `model`, not `models[0]`. A `per_model`
+                    # budget (groq's 200,000 tokens is per model, CAPACITY.md
+                    # §7) keys the ration on the model name, so reserving every
+                    # attempt against the first model rationed the whole slot
+                    # out of one model's share while the rest of the account sat
+                    # untouched -- and mis-attributed the usage it did record.
+                    #
+                    # A refusal here is NOT an error and must not be appended to
+                    # `errors`: the capacity exists, it is simply not this
+                    # session's to spend yet. It is collected as a pause
+                    # candidate so that if EVERY provider refuses, the run waits
+                    # rather than failing.
+                    grant = await self.ration.reserve(
                         provider=slot.spec.name,
                         credential=slot.credential_id,
-                        model=resp.model,
-                        requests=1,
-                        tokens=resp.tokens_in + resp.tokens_out,
-                        # Carried alongside `tokens`, never deducted from it:
-                        # the journal is what the ration reads back, and the
-                        # quota counts a cached prompt token like any other.
-                        cached_tokens=resp.cached_tokens,
+                        model=model,
                     )
-                    if isinstance(resp.rate_headers, RateHeaders):
-                        # The cheapest limit is the one the provider
-                        # volunteered on a response already paid for. Believing
-                        # it here is what lets the pool stop BEFORE the 429
-                        # rather than one rejection after it.
-                        self.budget.observe_headers(
-                            resp.rate_headers,
+                    if not grant.admitted:
+                        ration_waits.append(
+                            PauseCause(
+                                reason=grant.decision.reason,
+                                provider=slot.spec.name,
+                                credential=slot.credential_id,
+                                dimension=grant.decision.dimension,
+                                used=grant.decision.used,
+                                envelope=grant.decision.envelope,
+                                resumes_at=grant.decision.resumes_at,
+                            )
+                        )
+                        # `continue`, not `break`: a per-model ration that
+                        # refuses one model says nothing about the next one's
+                        # share. On a spec that is not per-model the next
+                        # iteration simply refuses again, which costs a
+                        # journal read and no call.
+                        continue
+
+                    # try/finally, not a release() at each refusal site: a gate
+                    # added between here and the call in a future edit would
+                    # otherwise need to remember the release too, and the one
+                    # time it forgets is the one that silently burns the day's
+                    # ration. The `finally` cannot be forgotten the same way --
+                    # it releases unless something downstream marked the grant
+                    # settled.
+                    #
+                    # It also bounds the grant to ONE attempt. When this lived
+                    # outside the loop, the `continue` on the ProviderError path
+                    # below carried the same grant into the next model, and the
+                    # two settle rows that followed netted the served call to
+                    # zero requests and (actual - estimate) tokens -- negative
+                    # whenever the response came in under the estimate, so a
+                    # provider that failed over from one model to another was
+                    # CREDITED for the work it went on to do.
+                    grant_settled = False
+                    try:
+                        if self.account is not None:
+                            # Refuse before spending, not after.
+                            self.account.precheck(
+                                slot.spec.name, model, request.max_tokens
+                            )
+                        try:
+                            resp = await slot.provider.complete_with(model, request)
+                        except RateLimited as exc:
+                            # The request stands against the ration even though it
+                            # failed: several providers count a 429 toward the
+                            # daily allowance, so releasing it here would let a
+                            # throttled run spend its day discovering that.
+                            grant_settled = True
+                            await self.ration.settle(
+                                grant, tokens=0, outcome="rate_limited"
+                            )
+                            slot.state.record_429(exc.retry_after_s)
+                            metrics.record_rate_limited(
+                                provider=slot.spec.name, model=model
+                            )
+                            if exc.daily:
+                                # A wait measured in hours is the account saying the
+                                # DAY is spent, not the minute. Journalled so it
+                                # outlives this process and is believed over the
+                                # declared table until the instant the provider
+                                # itself named (ADR-008). Halving the per-minute
+                                # bucket instead, as the single branch below used
+                                # to, answers a spent day by retrying it slightly
+                                # more slowly -- and every retry earns another
+                                # rejection charged to the day already gone.
+                                until = time.time() + (
+                                    exc.retry_after_s or LONG_WINDOW_S
+                                )
+                                self.budget.observe_day_limit(
+                                    slot.spec.name,
+                                    credential=slot.credential_id,
+                                    model=model,
+                                    until=until,
+                                    source=f"429 retry_after={exc.retry_after_s}",
+                                )
+                                self.pacer.limit_corrected(
+                                    provider=slot.spec.name,
+                                    credential=slot.credential_id,
+                                    declared=self._declared_day(slot.spec.name),
+                                    until=until,
+                                    source="429",
+                                )
+                            else:
+                                # A minute-window rejection: our rate estimate was
+                                # too high. Tighten the bucket so the correction
+                                # outlives this backoff window instead of being
+                                # relearned every time.
+                                await self.quota.configure(
+                                    slot.quota_key,
+                                    rate_per_min=max(1.0, slot.spec.hint_rpm * 0.5),
+                                    burst=1,
+                                    tokens_per_min=max(
+                                        1.0, slot.spec.hint_tpm * 0.5
+                                    ),
+                                )
+                            errors.append(f"{slot.spec.name}: 429")
+                            break  # whole provider is throttled, not just this model
+                        except ProviderError as exc:
+                            grant_settled = True
+                            await self.ration.settle(grant, tokens=0, outcome="error")
+                            slot.state.record_error()
+                            metrics.record_llm_error(
+                                provider=slot.spec.name,
+                                model=model,
+                                reason=type(exc).__name__,
+                            )
+                            errors.append(str(exc))
+                            continue  # try the next model on the same provider
+
+                        # The estimate becomes the measurement. Until this
+                        # call the ration held a forecast; leaving it there would
+                        # ration the rest of the session against a guess.
+                        #
+                        # CACHED PROMPT TOKENS ARE NOT SUBTRACTED HERE, and that
+                        # is deliberate. A free tier's daily well generally counts
+                        # cached prompt tokens in full -- the discount, where one
+                        # exists at all, is on price, not on quota. Crediting the
+                        # ration for them would convert a latency win into an
+                        # afternoon of unexpected 429s, which is exactly the
+                        # failure the ration exists to prevent. Cached tokens are
+                        # a cost and latency signal, never quota headroom, until a
+                        # measurement on the live account says otherwise.
+                        grant_settled = True
+                        await self.ration.settle(
+                            grant, tokens=resp.tokens_in + resp.tokens_out
+                        )
+                        slot.state.record_success()
+                        # Recorded per CREDENTIAL, because that is the unit every
+                        # provider meters. Two Google keys are two budgets, and a
+                        # tracker that summed them would report the pair as one
+                        # exhausted account.
+                        #
+                        # CHARGED HERE ONLY WHEN THE CALL WAS NOT RATIONED. The
+                        # ration writes to THIS SAME JOURNAL, and its
+                        # reserve/settle pair already nets to one request and the
+                        # real token count (+1/+estimate, then 0/actual-estimate).
+                        # A second charging row made every rationed call cost the
+                        # day twice: `providers budget` read 2 requests and 2x the
+                        # tokens for one call, so a free tier was declared spent at
+                        # half its real capacity and the session envelope handed
+                        # out half the slice it had. An unrationed provider gets no
+                        # reserve row at all, so for it this IS the charge -- hence
+                        # a condition rather than a deletion.
+                        #
+                        # The row is still written when rationed, at zero cost: it
+                        # carries `cached_tokens` and the RESOLVED model name,
+                        # which the reservation could not know before the call.
+                        charged = not grant.rid
+                        self.budget.record(
                             provider=slot.spec.name,
                             credential=slot.credential_id,
                             model=resp.model,
+                            requests=1 if charged else 0,
+                            tokens=(
+                                resp.tokens_in + resp.tokens_out if charged else 0
+                            ),
+                            # Carried alongside `tokens`, never deducted from it:
+                            # the journal is what the ration reads back, and the
+                            # quota counts a cached prompt token like any other.
+                            cached_tokens=resp.cached_tokens,
                         )
-                    cost = 0.0
-                    if self.account is not None:
-                        cost = self.account.charge_call(
+                        if isinstance(resp.rate_headers, RateHeaders):
+                            # The cheapest limit is the one the provider
+                            # volunteered on a response already paid for. Believing
+                            # it here is what lets the pool stop BEFORE the 429
+                            # rather than one rejection after it.
+                            self.budget.observe_headers(
+                                resp.rate_headers,
+                                provider=slot.spec.name,
+                                credential=slot.credential_id,
+                                model=resp.model,
+                            )
+                        cost = 0.0
+                        if self.account is not None:
+                            cost = self.account.charge_call(
+                                provider=resp.provider,
+                                model=resp.model,
+                                tokens_in=resp.tokens_in,
+                                tokens_out=resp.tokens_out,
+                                cached_tokens=resp.cached_tokens,
+                                cached_tokens_reported=resp.cached_tokens_reported,
+                                agent_id=agent_id,
+                                stage=stage,
+                                simulated=slot.simulated,
+                                detail={
+                                    "latency_s": round(resp.latency_s, 4),
+                                    "credential": slot.credential_id,
+                                },
+                            )
+                        metrics.record_llm_call(
                             provider=resp.provider,
                             model=resp.model,
-                            tokens_in=resp.tokens_in,
-                            tokens_out=resp.tokens_out,
-                            cached_tokens=resp.cached_tokens,
-                            cached_tokens_reported=resp.cached_tokens_reported,
-                            agent_id=agent_id,
-                            stage=stage,
-                            simulated=slot.simulated,
-                            detail={
-                                "latency_s": round(resp.latency_s, 4),
-                                "credential": slot.credential_id,
-                            },
+                            latency_s=resp.latency_s,
+                            cost_usd=cost,
                         )
-                    metrics.record_llm_call(
-                        provider=resp.provider,
-                        model=resp.model,
-                        latency_s=resp.latency_s,
-                        cost_usd=cost,
-                    )
-                    # Two counters, never a ratio: the ratio is derived at
-                    # read time from numbers the provider stated, so a stored
-                    # hit rate cannot drift from the tokens it summarises.
-                    metrics.record_prompt_tokens(
-                        provider=resp.provider,
-                        stage=stage,
-                        prompt_tokens=resp.tokens_in,
-                        cached_tokens=resp.cached_tokens,
-                    )
-                    return resp
+                        # Two counters, never a ratio: the ratio is derived at
+                        # read time from numbers the provider stated, so a stored
+                        # hit rate cannot drift from the tokens it summarises.
+                        metrics.record_prompt_tokens(
+                            provider=resp.provider,
+                            stage=stage,
+                            prompt_tokens=resp.tokens_in,
+                            cached_tokens=resp.cached_tokens,
+                        )
+                        return resp
+                    finally:
+                        if not grant_settled:
+                            await self.ration.release(grant)
 
             # Reaching here means nothing served this pass. There are three
             # kinds of wait available and they differ by ORDERS OF MAGNITUDE, so

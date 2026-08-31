@@ -242,6 +242,103 @@ async def test_free_calls_are_never_blocked_by_the_ceiling():
     assert resp.provider == "groq"
 
 
+# --- ration release on abandonment ------------------------------------------
+#
+# The ration admits a call (reserving its slice of the day) before the minute
+# bucket or the cost ceiling get a say. When one of THOSE refuses, the call was
+# never sent, and the reservation must be handed back immediately -- not left
+# for the reaper, which only writes off reservations that are minutes old and
+# would otherwise let a run's minute-bucket waits or ceiling refusals quietly
+# spend the day for calls that never happened.
+
+
+def _day_rationed(tmp_path, provider: str, *, requests: int = 1000):
+    """A BudgetTracker + Ration pair with a real daily allowance for `provider`,
+    so `ration.reserve()` actually admits and writes a reservation row -- the
+    thing that must be given back, not the no-op grant an unrationed provider
+    gets."""
+    from swarmd.router.budget import BudgetSpec, BudgetTracker, Limit, UsageJournal
+    from swarmd.router.ration import Ration
+
+    track = BudgetTracker(
+        journal=UsageJournal(str(tmp_path / "usage.jsonl")),
+        budgets={
+            provider: BudgetSpec(
+                provider=provider,
+                kind="quota",
+                limits=(Limit("day", requests=requests),),
+                reset="rolling",
+                source="test",
+                checked="test",
+            )
+        },
+    )
+    return track, Ration(track)
+
+
+async def test_a_minute_bucket_refusal_releases_the_ration_grant(tmp_path):
+    """The ration admits before the minute bucket is even asked, so a bucket
+    refusal must give the slice back. Without release(), every busy minute
+    would burn a slice of the day's allowance for a request that was never
+    sent -- charged against the day forever."""
+    import time
+
+    from swarmd.router.quota import InProcessQuota
+
+    track, ration = _day_rationed(tmp_path, "groq")
+    quota = InProcessQuota()
+
+    throttled = _slot("groq", ["m"])
+    throttled.credential_id = "groq#0"
+    healthy = _slot("cerebras", ["m"])
+    healthy.credential_id = "cerebras#0"
+
+    pool = ProviderPool([throttled, healthy], quota=quota, budget=track, ration=ration)
+    await pool._ensure_quota_configured()
+    await quota.configure("groq#0", rate_per_min=1, burst=1)
+    await quota.acquire("groq#0")  # drain groq's minute bucket
+
+    resp = await pool.complete(_req())
+    assert resp.provider == "cerebras"
+    assert throttled.provider.calls == []  # groq was never actually sent to
+
+    rows = track.journal.rows_for(provider="groq", credential="groq#0", since=0.0)
+    assert sum(r.requests for r in rows) == 0
+    assert sum(r.tokens for r in rows) == 0
+    # The release must be immediate, not something the reaper cleans up later:
+    # reaping a long time past even the reap threshold finds nothing stranded,
+    # because the reservation was already settled the moment the bucket
+    # refused it.
+    assert ration.reap(now=time.time() + 100_000) == 0
+
+
+async def test_a_ceiling_refusal_releases_the_ration_grant(tmp_path):
+    """`account.precheck` can raise straight out of `complete()` with the
+    ration grant still outstanding. The slice must come back even though the
+    call site never reaches a `settle()`."""
+    import time
+
+    track, ration = _day_rationed(tmp_path, "openrouter-paid")
+    acct = CostAccount(InMemoryLedger("r"), "r", ceiling_usd=0.0000001)
+    slot = _slot("openrouter-paid", [PAID_MODEL], tier="paid")
+    slot.credential_id = "openrouter-paid#0"
+    pool = ProviderPool(
+        [slot], account=acct, allow_paid=True, budget=track, ration=ration
+    )
+
+    with pytest.raises(CeilingExceeded):
+        await pool.complete(_req(max_tokens=1_000_000))
+    assert slot.provider.calls == []  # never issued
+
+    rows = track.journal.rows_for(
+        provider="openrouter-paid", credential="openrouter-paid#0", since=0.0
+    )
+    assert sum(r.requests for r in rows) == 0
+    assert sum(r.tokens for r in rows) == 0
+    # Immediate, not reaper-recovered.
+    assert ration.reap(now=time.time() + 100_000) == 0
+
+
 # --- construction ----------------------------------------------------------
 
 
@@ -420,3 +517,87 @@ async def test_quota_is_keyed_per_credential_not_per_provider():
     resp = await pool.complete(_req())
     assert resp.provider == "groq"
     assert b.provider.calls  # the second credential served it
+
+
+async def test_failing_over_to_a_second_model_charges_the_ration_for_both(tmp_path):
+    """Two calls on the wire must cost two attempts, not one grant settled twice.
+
+    The grant used to be taken once per SLOT and settled once per ATTEMPT, so a
+    model that errored and a model that then succeeded wrote two settle rows
+    under one rid: the error row returned the request and the whole estimate,
+    and the success row wrote only `actual - estimate` on top of that. The
+    served call therefore landed in the journal as ZERO requests and, whenever
+    the response came in under the estimate, a NEGATIVE token count -- the
+    ration crediting the day for work the account had actually done.
+    """
+    track, ration = _day_rationed(tmp_path, "groq")
+    slot = _slot("groq", ["m-a", "m-b"], script=[ProviderError("m-a is down")])
+    slot.credential_id = "groq#0"
+
+    pool = ProviderPool([slot], budget=track, ration=ration)
+    resp = await pool.complete(_req())
+
+    assert resp.model == "m-b"
+    assert [m for m, _ in slot.provider.calls] == ["m-a", "m-b"]
+
+    rows = track.journal.rows_for(provider="groq", credential="groq#0", since=0.0)
+    # One request served, priced at what the response actually cost. Not the
+    # estimate, and emphatically not less than zero.
+    assert sum(r.requests for r in rows) == 1
+    assert sum(r.tokens for r in rows) == resp.tokens_in + resp.tokens_out
+    # Two rids, because two calls were sent. One rid here is the bug itself.
+    assert len({r.rid for r in rows if r.rid}) == 2
+
+
+async def test_the_ration_is_reserved_against_the_model_that_serves(tmp_path):
+    """`per_model` budgets meter per model, so reserving against `models[0]`
+    rationed the whole slot out of one model's share while the rest of the
+    account sat untouched -- and filed the usage under a model that never ran.
+    Groq is the live case: 200,000 tokens per MODEL per day (CAPACITY.md §7).
+    """
+    from dataclasses import replace
+
+    track, ration = _day_rationed(tmp_path, "groq")
+    track.budgets["groq"] = replace(track.budgets["groq"], per_model=True)
+    slot = _slot("groq", ["m-a", "m-b"], script=[ProviderError("m-a is down")])
+    slot.credential_id = "groq#0"
+
+    pool = ProviderPool([slot], budget=track, ration=ration)
+    resp = await pool.complete(_req())
+    assert resp.model == "m-b"
+
+    served = track.journal.rows_for(
+        provider="groq", credential="groq#0", model="m-b", since=0.0
+    )
+    assert sum(r.requests for r in served) == 1
+    # And nothing was billed to the model that only failed.
+    failed = track.journal.rows_for(
+        provider="groq", credential="groq#0", model="m-a", since=0.0
+    )
+    assert sum(r.requests for r in failed) == 0
+    assert sum(r.tokens for r in failed) == 0
+
+
+async def test_one_call_costs_the_day_one_request(tmp_path):
+    """The ration and the budget tracker share a journal, so the pool must not
+    charge both.
+
+    `ration.reserve` wrote +1 request and the token ESTIMATE, `ration.settle`
+    corrected the tokens to the actual figure, and then the success path wrote a
+    SECOND row of +1 request and the actual tokens. Every rationed call
+    therefore cost the day two requests and twice its tokens: `providers budget`
+    declared a free tier spent at half its real capacity, and the session
+    envelope -- computed from the same rows -- handed out half the slice it had.
+    On the numbers this project actually runs on that is the difference between
+    ~2,200 and ~1,100 requests a day.
+    """
+    track, ration = _day_rationed(tmp_path, "groq")
+    slot = _slot("groq", ["m"])
+    slot.credential_id = "groq#0"
+
+    pool = ProviderPool([slot], budget=track, ration=ration)
+    resp = await pool.complete(_req())
+
+    day = track.window_state("groq", "day")
+    assert day.used_requests == 1
+    assert day.used_tokens == resp.tokens_in + resp.tokens_out
