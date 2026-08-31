@@ -58,7 +58,7 @@ quota, which is why ADR-011 exists and why Redis is in this diagram at all.
                 │
        ┌────────┴────────┐
        │  Provider APIs  │  Groq · Google AI Studio ·
-       │   (egress 443)  │  Cerebras · OpenRouter
+       │   (egress 443)  │  OpenRouter · Mistral · NVIDIA NIM
        └─────────────────┘
 ```
 

@@ -22,7 +22,7 @@ a review with no partials has usually been graded generously.
 
 | Item | State | Evidence / gap |
 |---|---|---|
-| Bottleneck identified and measured | PASS | [CAPACITY.md](CAPACITY.md): provider RPM, not CPU. RPM binds before TPM with 3.8× token headroom |
+| Bottleneck identified and measured | PASS | [CAPACITY.md](CAPACITY.md) §1: provider limits, not CPU. For Groq specifically it is TPM that binds before RPM — the 200,000-token/model/day cap is spent around 200 requests while the 1,000-request cap is still four-fifths unspent, so a plan that counts requests and ignores tokens overstates Groq fivefold |
 | Load model derived, not guessed | PASS | Fixed + variable call budget per run profile |
 | Saturation behaviour designed | PASS | Cache → reroute → backpressure → paid overflow → clean abort. Never silent truncation |
 | Headroom triggers defined | PASS | CAPACITY §6: rate-limit ratio >10% ⇒ add a provider |
@@ -108,7 +108,7 @@ a review with no partials has usually been graded generously.
 
 | Item | State | Evidence / gap |
 |---|---|---|
-| Architecture decisions recorded, including reversals | PASS | 12 ADRs; ADR-001 superseded, ADR-004 and ADR-006 amended |
+| Architecture decisions recorded, including reversals | PASS | 13 ADRs; ADR-001 superseded, ADR-004 and ADR-006 amended |
 | Runbook per alert | PASS | [RUNBOOK.md](RUNBOOK.md) |
 | Capacity plan with dated measurements | PASS | [CAPACITY.md](CAPACITY.md) |
 | Decision log with alternatives and follow-ups | PASS | [flow.md](flow.md) |

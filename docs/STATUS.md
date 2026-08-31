@@ -165,6 +165,17 @@ their sources and check dates, and `docs/CAPACITY.md` §7 records the
 correction. The lesson is not "the providers were stingy", it is that a limit
 written down without provenance is indistinguishable from one that is wrong.
 
+**And a third block was self-inflicted in a way neither of those explains.**
+The `101,522 / 100,000` reading above came from a meter that counted every call
+twice: the ration's reservation and the pool's own usage row both charged the
+same journal in full, so one call cost the day two requests and twice its
+tokens. The real spend behind that line was around 50,000 tokens against a cap
+that is really 200,000 per model — the run stopped with roughly three quarters
+of the day untouched. Fixed 2026-08-31 with the two faults beside it (a grant
+settled twice across a model failover, and a token estimate measured from
+itself); the derivation and the tests are in
+[CAPACITY.md](CAPACITY.md) §7, "The meter was reading double".
+
 ---
 
 ## 5a. Sign-off status
@@ -209,8 +220,11 @@ eval resumes rather than losing a sweep to an interruption. The blockers are
 measurements that need quota, not features that need building.
 
 The profiles were resized as part of this: `standard` was 500 agents and ~600
-calls against a measured budget of ~1,146 requests/day -- half a day of total
-capacity for one run. It is now 24 agents and ~90 calls, so a dozen fit a day.
+calls against a plannable budget of ~2,200 requests/day (docs/CAPACITY.md §7,
+which §1 declares authoritative; `swarmd providers budget` currently prints
+`plannable 2,195` -- the ~1,146 this line once carried was the pre-recount
+figure) -- more than a quarter of total capacity for one run. It is now 24
+agents and ~90 calls, so a dozen fit a day.
 An operator can still ask for 500 or 1000; the count is honoured exactly, and
 `preflight` prices the run against the remaining budget before it starts.
 

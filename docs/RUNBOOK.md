@@ -52,9 +52,11 @@ kubectl -n swarmd get externalsecret swarmd-provider-keys -o yaml | grep -A5 sta
 4. **Egress blocked.** `probe` reports transport errors on everything. A
    NetworkPolicy change or a NAT gateway problem. Verify from inside a pod.
 
-**Prevent:** add Cerebras and OpenRouter to the pool. Two providers is a single
-point of correlated failure; the capacity plan's trigger for adding one is a
-sustained rate-limit ratio over 10%, which is a separate, earlier alert.
+**Prevent:** the pool already carries five providers (Groq, Google AI Studio,
+OpenRouter, Mistral, NVIDIA NIM — CAPACITY.md §1); Cerebras is not a candidate
+to add back, its free tier now needs a card on file (§7). The capacity plan's
+trigger for adding another provider is a sustained rate-limit ratio over 10%,
+which is a separate, earlier alert.
 
 ---
 
@@ -73,8 +75,9 @@ spread means demand genuinely exceeds supply.
 `smoke` profile — throughput per run drops but the run completes.
 
 **Prevent:** this is the capacity plan's documented trigger for adding a
-provider. Cerebras first: largest free daily quota, no card, different company
-(so not a correlated failure with the existing two).
+provider. Not Cerebras — its free tier now needs a card on file, every call
+returns 402 (CAPACITY.md §7) — so evaluate a genuinely free candidate before
+adding one.
 
 ---
 

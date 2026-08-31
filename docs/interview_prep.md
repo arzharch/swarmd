@@ -38,9 +38,13 @@ synthesis. All three are statistically meaningless at N=20. Population size is l
 now, so the cap had to go.
 
 **Q: Isn't a thousand agents just fake parallelism?**
-A: It would be if I claimed a thousand simultaneous model calls. I measured the ceiling:
-pooling Groq, Cerebras, Google AI Studio, Mistral and OpenRouter free tiers gives about
-86,000 TPM, roughly 34 LLM calls a minute. So the honest claim is a thousand agents of
+A: It would be if I claimed a thousand simultaneous model calls. I measured the ceiling.
+Quote the current number, not the first one: `swarmd providers budget` prints
+`plannable 2,195 requests/day` from published daily allowances, which is about 1.5 calls
+a minute sustained over a day. (The "~86,000 TPM, roughly 34 LLM calls a minute" figure
+in `flow.md` is the 2026-08-27 pooled reading. It predates the 2026-08-29 recount and
+predates Cerebras leaving the pool — its key now returns 402 — so it is history, not the
+ceiling today.) So the honest claim is a thousand agents of
 which very few are mid-call at any instant. Skill retrieval, sandboxed execution,
 verification, ledger writes and red-team monitoring are all pure computation. The LLM is
 the scarce resource and the runtime's actual job is rationing it. Every agent-count figure
@@ -710,9 +714,14 @@ to be wrong, and the wall-clock budget depends on it)
 
 **Q: Your capacity plan claims a 500-agent run fits fifteen minutes. Does it?**
 A: The two levers doing the heavy lifting exist now and are verified by counted
-provider calls: a 32-agent run over a four-node plan issues 8 calls, and a second
-identical run issues 4. For a while neither existed while the document counted
-both, and the pool was capped at 16 to hide the consequence.
+provider calls: a 32-agent run over a four-node plan issues 10 calls — 6 of
+synthesis plus one batched generation call per node — and a second identical run
+issues 4, because the memo serves the criterion and the plan. (This line said 8
+for the cold figure until it was re-counted; the always-paid synthesis head is 6
+on every shipped profile and does not shrink with the plan. The repeat figure of
+4 was right.)
+For a while neither lever existed while the document counted both, and the pool
+was capped at 16 to hide the consequence.
 
 What I would not claim yet is the hit rate on real workloads. Exact keying means
 genuinely novel tasks hit near zero - identical prompts are what hit, and unknown
@@ -813,3 +822,1359 @@ The structural work I would do is unify the kernel `Runtime` and the swarm
 executor. They share the `Checkpoint` contract but not the loop, which is a real
 duplication with a real cost, and I would rather name it than let it read as an
 oversight.
+
+## Section 13: Not paying twice — idempotency, the memo, the prompt prefix (answerable NOW)
+
+### Idempotency
+
+**Q: I double-click submit. What happens?**
+A: Nothing, if you sent an `Idempotency-Key`. Same key with the same body
+returns 200 with the ORIGINAL run_id and `Idempotent-Replay: true`, and no
+`SwarmRun` is constructed at all — that last part is what a test asserts,
+because returning the right id while quietly starting a second population would
+look identical from outside. Without the header you get two runs, deliberately.
+`POST /api/runs` answers 202 and starts a background task, so a dropped
+response, a proxy timeout or a retrying CI job otherwise buys two populations,
+two criteria, two plans and twice the quota for one question. On the ~2,200
+plannable requests/day in `docs/CAPACITY.md` section 7 — which section 1
+declares authoritative over its own supply table, and which `swarmd providers
+budget` currently prints as `plannable 2,195 requests/day` — a duplicated
+`standard` run at ~90 calls is a meaningful bite out of the day. (`~1,146` is
+the pre-recount figure; grepped, it survives in comments in `router/budget.py`,
+`server/app.py`, `server/idempotency.py` and `swarm/run.py`, and in the dated
+entries in `flow.md`, and it is not the current budget.)
+
+**Q: Why not just hash the body and dedupe automatically?**
+A: Because re-running an identical task on purpose is a normal operation here —
+an A/B arm, a flake hunt, a chaos comparison — and a body-hash fallback would
+hand an operator who forgot the header yesterday's run id instead of the run
+they asked for. "No header means a new run" is unconditional, with no
+environment flag to weaken it. The cost is that clients must opt in; the
+alternative silently breaks the one workflow this project runs most.
+
+**Q: Same key, different body?**
+A: 422, no run started, and the response never contains the first run's id.
+That last constraint is deliberate: a conflict is a client bug, and leaking the
+id of a run the caller did not create turns a bug report into an information
+disclosure. A malformed key is 400 — the key must be 8–200 characters of
+`[A-Za-z0-9_.:-]`, and the eight-character floor is not cosmetic, because a
+client that "just picks something" collides across unrelated requests and a
+collision here hands one caller another caller's run.
+
+**Q: What is the scope of a key, and how long does it live?**
+A: Global to the pod's store, 24 hours, and it also expires early if the run it
+points at is gone from the RunStore — whichever comes first. The sweep runs at
+startup beside `run_store.prune()`. Twenty-four hours covers every retry anyone
+actually makes (an HTTP retry budget is seconds, a CI re-run is minutes, an
+operator re-issuing a curl is hours) and is short enough that the same key
+reused next week for a different question is treated as new rather than
+replaying something unrelated.
+
+**Q: Does it survive a restart?**
+A: Yes, and that is the case it exists for. Records are one file per key under
+the RunStore root, written with RunStore's exact discipline — temp file in the
+same directory, fsync, `os.replace`. The retry that arrives after a deploy is
+precisely the retry worth deduplicating, so an in-memory dict would have
+covered only the cases that did not matter. One detail worth mentioning because
+it was a real bug in waiting: RunStore's filename sanitiser drops `.` and `:`,
+which `KEY_RE` allows, so two distinct keys would have shared a file. A sha256
+suffix on the filename fixes it.
+
+**Q: What about the race between two simultaneous requests with the same key?**
+A: A per-key asyncio lock closes the check-then-create window, and a
+construction that fails calls `release()` so a retry is never stuck behind a
+phantom "pending" reservation. A pending record older than 120 seconds is
+disbelieved, because that can only come from a process that died mid-construction
+and holding a key hostage forever after a crash is worse than the small chance
+of a duplicate.
+
+**Q: Three pods behind one ingress?**
+A: It can still double-accept, and I would rather say so than imply otherwise.
+The lock and the file store are per-pod; a stat and a write are not atomic
+across machines. It is stated in the module docstring rather than buried, and
+`IdempotencyStore` is a deliberately narrow surface —
+lock/get/reserve/complete/release/prune — so a Redis or Postgres backend drops
+in behind it. NOT DONE, listed as a follow-up.
+
+### The run memo
+
+**Q: The owner said "if it learns a task, the next time a similar one comes in
+it should fire instantaneously." Does it?**
+A: Partly, and "instantaneously" is the word to take away first. A memo hit
+skips SYNTHESIS ONLY. The workers still run, every node is still executed
+against the real current task, and every candidate is still graded — so the
+wall clock of a memo-served run is dominated by exactly the work a cold run
+does, minus a serial head.
+
+The precise version. Every run opens with a serial, always-paid head:
+`profile.proposers` calls to author a criterion, the same number again to
+author a plan, and nothing else may start until both freeze. `proposers` is 3
+on every shipped profile, so that head is 6 calls. Measured with the
+call-counting provider in `tests/swarm/test_memo.py`, a cold `smoke` run of its
+two-node fixture issues 8 provider calls in total (6 synthesis, 2 batched
+generation) and the repeat issues 2; swapping in a three-node plan gives 9 and
+3. Batched generation issues one call per plan node, not one per agent, so the
+pool size does not multiply it, and a repair round adds calls on top. So the
+honest headline is "6 calls, out of 8 or 9 plus repairs" — the numerator is
+fixed by the profile and the denominator is set by the plan, which is why I do
+not quote a single percentage.
+
+A memo carries a criterion and a plan. It does not carry candidates, outputs,
+artifacts or a verdict — by construction there is no stored answer in it to
+serve.
+
+**Q: So a memo hit could still fail the run?**
+A: Yes, and that is the point. The worst case of a bad memo is a run graded
+against a criterion it would probably have written itself. The worst case of an
+answer cache is a run that reports success without doing anything, which is why
+this is not one.
+
+**Q: How similar is "similar"? Where is the threshold?**
+A: There is no threshold, and that is a decision rather than an omission. The
+key is exact: strip, collapse internal whitespace, casefold, hash. No embedding,
+no token overlap, no cosine. This repo already has the counter-example in
+`router/cache.py` — three genuinely different plan nodes measured 0.97 similar
+against a 0.95 threshold, so one node's answer was served to another and the run
+reported a high hit rate while being wrong. Similarity on machine-assembled text
+is dominated by shared boilerplate and rises with template length rather than
+with sameness. A paraphrase therefore MISSES the EXACT key, which is cheap next
+to grading one task by another task's definition of done.
+
+What happens to it next is the near tier, and it is worth being exact rather
+than saying "and then it pays six calls". Measured end to end, running the
+`smoke` fixture twice over a shared memo store and counting synthesis calls:
+`"Compute the total cost of 3 pens at 1.25 dollars each"` followed by
+`"please compute the total cost of 3 pens at 1.25 dollars each for me"` gives
+different exact keys, the same `abstract_fingerprint`, and a second run that
+pays **0 synthesis calls** with `criterion_memo_revalidated` emitted and
+`served_from` naming the first run. `"summarise the paper"` and `"give me a
+summary of the paper"` have different fingerprints, because `summarise` and
+`summary` are different action tokens, so that one really does pay in full.
+
+Now the asymmetry that example is one capital letter away from, because I had
+it wrong here and the honest version is more interesting than the tidy one.
+Capitalise the politeness word — `"Please compute the total cost of 3 pens at
+1.25 dollars each for me"` — and the same run pays all **6** synthesis calls
+and emits `memo_refused` with `"task literals do not line up with the stored
+task"`. The fingerprints still match. What does not match is
+`literal_map(stored_task, this_task)`, which scans the RAW task text, where
+`TERM` is a literal kind matching a capitalised word. `task_shape` casefolds
+before abstracting, deliberately, so TERM never fires on a task and a re-typed
+capital cannot mint a second shape. `literal_map` does not casefold, so
+`_scan("Please compute ... ")` returns `[TERM 'Please', NUMBER '3', MONEY
+'1.25 dollars']` against `[NUMBER, MONEY]` for the stored task, the kind
+sequences differ, and it returns `None`. Sentence-initial `Compute` escapes
+because `_is_method_phrase` excludes method vocabulary from TERM; `Please` is
+not method vocabulary.
+
+That is a refusal, not a wrong answer — the run pays for its own criterion —
+but it means the near tier's reach is narrower than "casefolding makes
+paraphrases match", and a doc that claimed the capitalised example worked was
+claiming something that does not execute.
+
+The near tier is still a discrete equality on task SHAPE, never a continuous
+score, so it does not reopen the door this answer just closed — it adds a
+second exact key, not a threshold on the first.
+
+**Q: What about the near-match tier?**
+A: It is shipped, and its notion of "match" is worth being precise about,
+because it is neither the exact tier's `normalise`/hash nor the skill gate's
+signature.
+
+The key is `generalise.abstract_fingerprint` — `TaskShape.fingerprint`, which
+hashes three things: the ORDERED sequence of literal kinds, the sorted set of
+method vocabulary, and the COUNT of distinct subject nouns. Note what is
+absent: the subject nouns themselves. That is exactly the difference from
+`task_signature`, the skill gate's key, which hashes the sorted set of literal
+KINDS plus the sorted set of SUBJECTS. Pens and pencils are two signatures
+(two pieces of evidence, because they are two questions) and one fingerprint
+(one shape of work, rebindable from either onto the other). Both are discrete
+equality tests on a sha256, never a continuous score, so neither can repeat the
+0.97-above-0.95 mistake `router/cache.py` documents. Two consequences worth
+knowing: reordering the literals changes the fingerprint (the sequence is
+ordered, deliberately, because positional rebinding is only well defined when
+the kinds line up in order), and a synonym swap in the method verb changes it
+too.
+
+`MemoStore.by_fingerprint` is a scan over `entries()` filtered to that
+fingerprint, sorted by `updated_ts` descending, excluding this task's own key.
+Nothing is served on the match alone. `_criterion_from_near_memo` runs
+`literal_map(stored_task, this_task)` — positional and kind-checked, `None` if
+the two do not line up — then `rebind`s the stored criterion's literals, then
+runs the subject-leak guard, then `malformed()`, then RE-ATTACKS the rebound
+criterion against the new task's text before trusting it, exactly like the
+exact tier. `_plan_from_near_memo` rebinds and revalidates through
+`planner.validate()`.
+
+The subject-leak guard, stated as it actually is rather than
+unconditionally. `rebind` rewrites URL/PATH/DATE/MONEY/PERCENT/QUOTED/NUMBER
+and deliberately not TERM, so an ordinary subject noun survives verbatim. That
+is fine in plan text a human reads and wrong in a check PARAMETER a grader
+compares byte-for-byte. So `leaked_subject_terms(rebound_text, source, target)`
+first computes the SOURCE's subject stems minus the TARGET's; if that set is
+empty it reports nothing at all, which is correct — a criterion rebound from
+"3 pens" onto "1 pen" keeps the word "pens" and should be allowed through,
+because pen and pens are the same subject. Only when the source has a subject
+the target lacks does the guard look, and it compares STEMS, so a pens-derived
+criterion rebound onto a pencils task is caught whether the surviving parameter
+spells it "pens" or "pen". Verified by calling the function on that pair
+directly: `['pens']` and `['pen']` for the two spellings, and `[]` for the
+same-subject pair, for a method word like "cost", and for a word that belongs
+to the target task.
+
+A rebind that fails any of this is REFUSED (`_near_refuse`), not deleted — the
+failure is a property of the PAIRING of two tasks, not of the stored entry,
+which stays exactly as good for its own task or the next one that rebinds
+cleanly.
+
+**Q: An exact memo is refused. Does the near tier get a turn?**
+A: Only if the refusal happened at ADMISSION. This is a real boundary, it is
+not written down anywhere else, and I had the general version of it in this
+document without the exception.
+
+`run()` computes both lookups up front, in this order:
+
+```python
+memo = self._memo_lookup(task)
+near_memo = self._near_memo_lookup(task) if memo is None else None
+```
+
+`_memo_lookup` returns None for a miss and for an ADMISSION refusal — the
+provenance run never completed, the entry is past `MEMO_MAX_AGE_S`, or the run
+store's own document disowns it. In those cases `near_memo` is looked up and a
+different entry of the same shape serves the run. Measured: refuse a pencils
+memo by marking its provenance run `interrupted`, with a valid pens memo of the
+same fingerprint in the store, and the run pays **0** synthesis calls,
+`criterion_memo_revalidated` fires, and `served_from` names the pens run.
+
+But when admission PASSES, `_memo_lookup` returns the entry, `near_memo` is
+already None, and the deep revalidation that follows — `_criterion_from_memo`
+re-parsing, re-hashing, calling `malformed()`, and re-attacking — has no near
+attempt to fall back to. Measured on the same fixture: store a pencils memo
+whose criterion now loses to `attack` (only degenerate checks), keep the valid
+pens memo alongside it, and the run pays all **6** synthesis calls. One
+`memo_refused` on the exact tier, no `criterion_memo_revalidated`, and the pens
+memo — which would have rebound cleanly — is never consulted.
+
+I do not think that ordering is obviously right; the pens memo was there and
+was good. It is what the code does, and the reason is the comment above those
+two lines: both lookups are taken at one instant so the criterion and the plan
+a run reuses come from the SAME provenance entry, and re-running the near
+lookup after a deep refusal would reopen that. Naming the cost is better than
+implying the fallback is universal.
+
+What is excluded from the near lookup is only the refused DOCUMENT, via
+`by_fingerprint(fingerprint, exclude_key=key_for(task))` — never the near
+mechanism itself.
+
+Still not built, and to be clear this is a design of mine and not a written
+requirement -- `docs/SPEC.md` has no memo section: a fuller replay tier — stored worker results, an
+environment closure over system/skills/grader/sandbox digests, hermeticity and
+volatility gates. Nothing here replays a candidate, so those gates would guard
+a path that does not exist.
+
+**Q: How do you stop a stale memo from poisoning a run?**
+A: A chain of gates in three places, and a miss is always cheaper than a wrong
+hit. In load order, with what each one does to the entry:
+
+`MemoStore.get` — (1) a document written by an older schema raises
+`IncompatibleMemo` and is IGNORED, neither quarantined nor deleted, because
+version skew is not tampering and it is the reader that is new. (2) The entry's
+own `entry_hash` must equal `content_hash()` of its payload, and (3) the stored
+criterion must still hash to its recorded `criterion_hash`. Either mismatch is
+QUARANTINED into `memos/quarantine/` — moved aside, never deleted, because a
+document that does not hash to its own contents is evidence that something
+which is not this code changed it.
+
+`TaskMemo.reusable` — (4) `status` must be `completed`, (5) a criterion and its
+hash must both be present, (6) the entry must be younger than
+`MEMO_MAX_AGE_S` (30 days). Each returns a REASON STRING rather than a bool,
+because a memo that is never reused is otherwise indistinguishable from one
+that never existed, and `memo_miss_reason` is the number to watch rather than
+`memo_hit_rate`.
+
+`SwarmRun._memo_admission` — (7) a second opinion from the run store: if the
+run document for `entry.run_id` still exists and its status is not `completed`,
+the entry is refused AND DELETED.
+
+`SwarmRun._criterion_from_memo` / `_plan_from_memo` — (8) the criterion must
+re-parse, (9) re-hash, (10) pass `malformed()`, and (11) be RE-ATTACKED against
+THIS run's task text under today's attack set — not trusted because it survived
+an attack last month, and the attack is pure code so it costs no provider call.
+(12) The plan must revalidate through `planner.validate()` and (13) hash-check.
+Anything failing here is DELETED unconditionally; none of them get better on a
+second read. (Gate 9 is defensive in practice: `get` has already quarantined a
+criterion whose hash does not match, so a run reaching the delete branch for
+that reason would mean the entry arrived from somewhere other than the store.)
+
+The one that took a bug to get right is (7), and it is the only gate that
+deletes on a PROVENANCE fact rather than a document fact. A memo whose OWN
+`status` field still says `completed` but whose run-store document disagrees —
+a control-plane shutdown marking it `interrupted` after the fact, say — is
+deleted rather than quarantined, specifically because
+`MemoStore.remember()` refuses to overwrite an entry that still looks reusable
+to its own check, which would otherwise refuse this task's memo forever with
+nothing able to write a replacement. A memo that is merely stale, or whose own
+status already says something other than `completed`, needs no deletion:
+`remember()` already treats those as safe to overwrite the next time this
+task's criterion freezes.
+
+**Q: Why does an unfinished run not get to leave a memo?**
+A: The entry is written when each stage freezes but stays unusable until the
+originating run reaches `completed` — until that criterion actually graded real
+work and the run passed its own gate. A criterion frozen by a run that then
+failed is exactly the criterion not to inherit: unproven at best, and at worst
+the reason the run failed.
+
+**Q: Can an eval use it?**
+A: No — `SwarmRun(profile="eval", memo=...)` raises, mirroring the existing
+cache ban. An eval measures variance across repeats; serving repeat 2 from
+repeat 1 does not bias the bootstrap interval, it collapses it toward zero
+width, and a zero-width interval reads as a strong result. It is a raise rather
+than a note because this is precisely the shortcut someone takes while trying to
+speed up a slow eval.
+
+**Q: What does the memo save, in numbers?**
+A: `calls_avoided`, and deliberately not dollars. A memo hit writes a
+`memo_hit` ledger row the same way a cache hit writes a zero-cost row, so "what
+did the memo save" is a query rather than an estimate. But `would_have_cost`
+stays 0.0 with the reason stated: the avoided proposer call never chose a
+provider or a model, so pricing it would mean inventing a route it was never
+given — and on a pooled free tier the scarce resource is requests anyway.
+Reporting an invented dollar saving is exactly the dishonesty the ledger exists
+to prevent. NOT DONE: if a dollar figure is ever wanted, it has to be priced at
+the pool's default model at charge time and labelled as such.
+
+**Q: What is not wired into the memo?**
+A: `swarm session` (it cycles repeated tasks to build a learning curve, and
+removing synthesis from repeats 2..N would flatten the very curve it measures),
+`eval`, and the CLI `runs resume` path — so a CLI-resumed run cannot settle the
+memo its earlier process wrote, and that entry simply ages out. A resume always
+beats a memo inside the run too: lookup is skipped when `state.criterion` or
+`state.results` is set, because swapping a criterion in mid-flight would grade
+existing results against something that did not produce them. And, like
+idempotency, the store is per-pod: two replicas can double-write a memo.
+
+**Q: The widest thing your "exact" key forgives, and where that choice came
+from.**
+A: Case. `normalise` does three things -- strip, collapse internal whitespace,
+casefold -- so `"Summarise X"` and `"summarise x"` share a memo, and
+`test_normalisation_forgives_only_layout` pins that as a HIT, not a miss. On
+where it came from, I want to be straight rather than impressive: `docs/SPEC.md`
+has no memo section and no clause about this key, so this is an implementation
+decision, not a divergence from a written requirement I can show you. The
+argument for it is that the three operations cannot change what is being asked
+-- a heredoc newline, a doubled space from a paste, a capitalised first word --
+while punctuation and word order are left alone, so `"Compare A to B"` and
+`"Compare B to A"` stay different keys. The safety net is that no answer is
+replayed and the criterion is re-attacked against the new task text on every
+hit. It is one line to reverse if you would rather case were significant.
+
+### The prompt prefix
+
+**Q: Why does the ORDER of a prompt cost money?**
+A: Because every provider in this pool is OpenAI-compatible, and Groq/OpenAI
+automatic prefix caching keys on a byte-identical LEADING prefix of the rendered
+conversation. The old layout sent one user message ordered TASK, STEP, REQUIRED,
+checks, skills, failures — so the first thing differing between two agents was
+STEP, on the second line, and everything after it, including the criterion block
+and the skills block (by far the largest part of the prompt), fell outside the
+shared prefix and was re-read cold on every worker call. A `smoke` run makes
+far fewer calls than its `target_calls` label of 30 suggests — measured, 8 on a
+two-node plan and 9 on a three-node one, because batched generation issues one
+call per plan node rather than one per agent — so the absolute saving here is
+small; what makes it worth doing is that it is the same defect at every profile
+size, and `deep` is 280. Only `WORKER_SYSTEM`, 640 characters, was ever shared.
+
+**Q: What exactly is cached now?**
+A: Three layers, split by how often they change. Run-stable — the base prompt,
+`TASK:`, and the frozen criterion — computed once per run by `build_run_system`.
+Node-stable — the skills retrieved for that plan node — appended by
+`build_node_system`. Both ride in the system message, which renders first. The
+user message carries only the volatile tail: `STEP:`, `REQUIRED:`, the previous
+attempt's failures, and — on a batch call — the "produce K separate candidates"
+instruction.
+
+Say what changed carefully, because the loose version of this sentence is
+wrong. No block is added, dropped or reworded. But two blocks move AHEAD of two
+others as well as into a different role: legacy renders TASK, STEP, REQUIRED,
+GRADED; hoisted renders TASK, GRADED, then STEP, REQUIRED. So "the same bytes
+under a different role" understates it — it is the same blocks, reordered and
+re-split. Measured by capturing `len(request.system)` and `len(request.prompt)`
+on every worker call of a `smoke` run under each arm. The run makes two, one
+batched generation call per plan node:
+
+```
+                          legacy                 hoisted
+node gather         640 sys + 525 user     871 sys + 294 user   = 1,165
+node verify         640 sys + 526 user     871 sys + 295 user   = 1,166
+```
+
+Same total on each row, so the reorder moved bytes and added none. Say the
+numbers exactly: the hoisted system message is 871 characters, not 872, and the
+526 user turn is `verify`'s, which pairs with 295 — `verify`'s instruction is
+`produce report.json` against `gather`'s `produce notes.json`, one character
+longer. The legacy 640 is `WORKER_SYSTEM` on its own. And `system + prompt`
+concatenated is NOT byte-equal across the two arms, because the join between
+two adjacent blocks is a blank line inside one message and a role boundary
+between two.
+
+**Q: So what exactly is proven identical, and what is not?**
+A: PROVEN. Against `ScriptedProvider` — a stub that returns one fixed worker
+output regardless of what it is sent — a hoisted run and a legacy run of the
+same task produce the same criterion hash, byte-identical `Candidate.output`
+for every node, and the same integrity hash
+(`test_moving_prompt_bytes_between_roles_does_not_change_the_result`). That is
+proof the reorder does not drop a field, duplicate one, or otherwise corrupt
+what the pipeline grades. It is guarded against being a tautology by
+`test_the_two_prompt_layouts_are_genuinely_different_prompts`, which asserts
+every legacy worker prompt contains `TASK:` and no hoisted one does — so the
+two arms really did send different bytes.
+
+NOT PROVEN, and measurably false the moment the responder reads its input.
+`SimulatedProvider` seeds its synthetic text on
+`sha256(f"{system}|{prompt}|{temperature}")`, and hoisting moves bytes across
+that `|`, which changes the digest and therefore the generated wording. Checked
+directly: hand it `LLMRequest(prompt=S + "\n" + U, system="")` and
+`LLMRequest(prompt=U, system=S)` — the same information, split differently —
+and the two responses differ, while `tokens_in` is the same because both roles
+are now counted. So the equality claim holds for a content-insensitive test
+double and nothing stronger. What a real model does with the same information
+reordered is the NODE PASS RATE parity gate below, and that gate HAS NOT BEEN
+RUN.
+
+**Q: How do you know two agents send identical bytes?**
+A: You cannot get it from retrieval alone, and that was the subtle part.
+`SkillLibrary.retrieve` scores by success rate and `record_use` moves success
+rates DURING a run, so agent 1 and agent 12 querying the same library with the
+same text can be offered a different ordering — and a reordered skills block is
+a different prefix. So the run resolves one `NodePrefix` per node and hands the
+same frozen object to both `worker.execute` and `_batch_generate`. A test drives
+a full smoke run and asserts every worker AND batch request carries a system
+message that starts with `WORKER_SYSTEM` and is strictly longer than it, which
+no fallback can produce. Negative control executed: under
+`SWARMD_PREFIX_ORDER=legacy` that test fails with "sent the bare base prompt:
+its node prefix was dropped", so it is sensitive to the exact failure it names.
+A hand-counted grep would not have caught it: the failure is a second call site
+that forgets the prefix, and the grep would still have found the first one.
+
+**Q: Is the saving measured or estimated?**
+A: Measured or absent, never inferred. `LLMResponse` carries `cached_tokens` AND
+`cached_tokens_reported` — two fields rather than one nullable count, because
+"this provider does not report cached tokens" and "this provider reports that
+nothing was cached" are different facts, and reading the first as the second
+turns a working prefix cache into an apparent no-op or the reverse. A negative
+or non-numeric value is read as "not reported" rather than clamped to zero,
+because a provider sending nonsense has told us nothing and recording nothing as
+a measurement is how a fabricated saving gets into a report. The count lands on
+the ledger row and the `prefix_cache` report block; nothing is derived from
+prompt length.
+
+**Q: A run reports cached_tokens=0. Is that a bug?**
+A: That question is exactly why `ProviderSpec.prefix_cache` now rides on every
+`pool.probe()` row and prints in `swarmd providers`. A zero from
+`google-aistudio`, labelled `explicit`, is expected — it needs an explicit cache
+handle we do not create. A zero from Groq, labelled `auto`, means the shared
+prefix is not being hit and something has broken it. The label is the only thing
+that separates the two.
+
+**Q: What did hoisting nearly break?**
+A: Three things, and each one made a number look BETTER, which is the dangerous
+direction. The simulated provider seeded its output hash on `prompt` only, so
+after the hoist two runs of different tasks against different criteria would
+have produced identical synthetic output and every offline integrity hash would
+have been blind to the task and the criterion. Both offline providers counted
+`tokens_in` from `request.prompt` alone — hoisting MOVED prompt bytes into
+`system`, it did not delete them, so the reorder would have appeared to cut
+prompt tokens by roughly the size of the hoisted block while the real bill was
+unchanged, a fabricated saving landing straight in the capacity forecast.
+Re-measured on the `smoke` fixture in `tests/swarm/test_run.py` (task
+`summarise the source records`, node `gather`, no skills retrieved), the user
+turn falls from 525 characters to 294 on a batched generation call and from 273
+to 42 on a plain worker call, while `system + prompt` is 1,165 and 913
+respectively under BOTH arms — identical totals, which is the whole point. Both
+now count `system + prompt`. (The plain-call row needs the batch call to return
+nothing, because an ordinary run batches generation and makes no plain worker
+call; the batched row is what a run really sends.)
+
+**Q: Why is similarity-based reuse unsafe here in general?**
+A: Same argument in three places, which is why I trust it. The response cache
+learned it by serving one plan node's answer to another at 0.97 cosine. The
+memo inherits the conclusion in the strongest available form: it HAS a
+near-match tier, and that tier is still a discrete sha256 equality on task
+shape rather than a score with a threshold, because the lesson was not "do not
+generalise" but "do not generalise on a continuous similarity of
+machine-assembled text". And skill retrieval hit the same class of error from
+the other side: with a pen-price skill approved, "Compute the average rainfall
+in millimetres for 12 cities" retrieved it on the strength of the word
+"compute" and the presence of a number; that too is fixed with a subset test
+over literal kinds, not a threshold. The general statement: semantic matching
+assumes the varying part of a prompt is most of the prompt. That is true of
+human paraphrases and false of machine-assembled text.
+
+**Q: What is NOT proven about the prefix change?**
+A: Quality. Moving the criterion into the system role changes how a model
+WEIGHTS it, and a cheaper run that grades worse is a regression however good the
+cache numbers look. The acceptance gate is NODE PASS RATE parity on the `eval`
+profile at fixed seeds — never `cached_tokens`, which measures the mechanism
+rather than the outcome — and that gate HAS NOT BEEN RUN, because it needs live
+providers and a task corpus. `hoisted` is the default on the byte-equivalence
+argument alone (identical integrity hash under a scripted provider), the exact
+two-command procedure is in `worker.py`'s module comment, and
+`SWARMD_PREFIX_ORDER=legacy` is the rollback if the gate later fails. Also not
+built: Gemini explicit context caching, which is unreachable through the
+OpenAI-compatible shim this pool talks to and needs its own create/TTL/delete
+handle lifecycle; and the optional `prefix_group` model-affinity routing hint.
+
+### The learning loop
+
+**Q: Memorisation or transfer — which is this?**
+A: Both, in two separate mechanisms, and conflating them is how "self-learning"
+gets over-claimed. The memo is MEMORISATION, explicitly: an exact key, one task,
+no generalisation, and it reuses only how to grade and how to decompose. The
+skill library is the transfer claim, and it is the one that has to be defended,
+because a skill is offered to tasks it has never seen.
+
+**Q: What stopped the library learning the answer instead of the method?**
+A: It did learn the answer, once — distillation stored the longest successful
+output, `{"accuracy": 94.3, "baseline": 82.1}`, as a skill instruction, so a
+later run on different numbers would have been handed those and told they
+worked. The system was reliably generating exactly what its `library_poisoning`
+detector exists to reject. Now `abstract()` replaces literals with typed
+placeholders in one ordered pass, `strip_source_terms()` removes the
+subject-matter nouns a step shares with its own task (which shape-abstraction
+structurally cannot see), and `validate_instruction()` RAISES rather than
+repairs when an instruction still shares a whole literal with its source task.
+Raising matters: a repair would have produced a quietly weakened skill.
+
+**Q: Two verified successes used to promote a skill. What changed?**
+A: The bar counts distinct task SHAPES, not successes. Two agents passing the
+same node of the same run satisfy "two successes" — but they share a task, a
+criterion and a prompt, so that is one observation counted twice, and the
+library ends up offering advice proven on exactly one question. Two distinct
+shapes is the smallest number that can distinguish "this worked" from "this
+works on more than the thing it came from".
+
+**Q: What counts as a distinct shape, and how do you stop me farming it?**
+A: `generalise.task_signature`: the HEAD NOUNS of the task's noun phrases,
+minus method vocabulary and function words and folded to singular, plus the
+sorted KINDS of literal it carries — both as sorted sets, so word order does
+not enter. The first version was keyed on the abstracted SENTENCE, which
+inherits `memo.normalise`'s deliberate "a paraphrase MISSES" property — correct
+for an exact-match cache, exactly wrong here, because a miss MANUFACTURES the
+second piece of evidence. One request reworded with "please" and "for me"
+pushed a candidate to promotable. That was found in review, not by me. Method
+verbs are excluded for the same reason, so compute → calculate cannot mint a
+second shape.
+
+What I can actually show, by running `task_signature` over the restatements a
+farmer would reach for first. Base: `"Compute the total cost of 3 pens at 1.25
+dollars each"` → `bac37e579ae7c1e7`. Politeness padding (`"Please compute ...
+for me"`), swapped digits (`"9 pens at 4.75 dollars each"`), a number spelled
+out (`"three pens at 1.25 dollars each"`), the whole sentence uppercased, the
+whole sentence lowercased, and the literals fronted (`"AT 1.25 DOLLARS EACH, 3
+PENS -- COMPUTE THE TOTAL COST"`) all return that same `bac37e579ae7c1e7`. Six
+restatements, one signature, closed by measurement rather than by assertion.
+The spelled-out one was the most recent to close: matching only digits made
+`"three pens"` and `"3 pens"` two shapes until `_digits_for_shape` folded the
+cardinals inside `task_shape`.
+
+**Q: Where does that still leak?**
+A: A restatement that introduces genuinely new subject matter. "Compute the
+total cost of 3 pens at 1.25 dollars each for the invoice" scores a second shape
+because "invoice" is a content noun no lexicon can rule out. I claim that is the
+defensible boundary — a task mentioning something new is somewhat new — not that
+it is airtight. The signature is only as good as two fixed, human-authored lists
+(the method lexicon and the function words), which is deliberate: a
+corpus-derived stoplist would move the signature week to week.
+
+**Q: Which way does it fail?**
+A: Toward collapsing. "count the pens" and "list the pens" share a signature and
+count as one shape, so the cost is a promotion that does not happen. Splitting
+one task into two shapes is the poisoning channel, so that is the error to
+avoid. Separating them would need either method verbs in the signature
+(re-opening synonym farming) or per-token hashes of the task's own words — a
+dictionary-attackable leak of exactly the text this feature refuses to store.
+Two disclosed exceptions sit on the wrong side anyway, and both are SPLITS —
+which is the dangerous direction, because the bar counts distinct signatures,
+so a split hands a promotion its second piece of evidence for free.
+
+The first is `_stem`. Its bare-`s`-before-`es` tie-break folds the common `-se`
+subject class correctly — measured, `cases` → `case`, `niches` → `nich` and
+`niche` → `nich`, `queries` → `query`, `boxes` → `box`, `pens` → `pen` — at the
+cost of words whose singular already ends in a bare `s`. Measured on that same
+run: `bus` → `bus` but `buses` → `buse`; `gas`/`gases`; `lens` → `len` but
+`lenses` → `lense`; `virus` → `viru` vs `viruses` → `viruse`; `campus` →
+`campu`. Each of those mints two signatures across singular and plural. It is
+NOT fixed, deliberately: `lens` and `pens` end in the identical two letters, so
+no suffix rule separates "already singular" from "needs stripping" without a
+lexicon, and `generalise.py`'s whole claim is that it keeps no lexicon and
+makes no model call.
+
+The second is structural, and it is much narrower than it was. It used to be
+the fronted noun phrase: `"Pens: compute the total cost of 3 at 1.25 each"`
+contributed no subject at all and split from the ordinary phrasing. That is
+CLOSED — `task_shape` now falls back to content words when nothing was
+introduced, and measured, the fronted sentence and `"compute the total cost of
+3 pens at 1.25 each"` both score `64f9e0ced633ac1f`. What is left is the
+fallback's own blind spot: it keeps every content word and cannot tell an
+unrecognised verb from a noun, so in a sentence with NO determiner anywhere a
+verb outside `METHOD_LEXICON` is read as subject matter. Measured,
+`task_signature("tally widgets")` is `343c262fa82dfce7` against
+`04d865fa68cef42b` for `"count widgets"`. It needs BOTH conditions where the
+old one needed only a fronted phrase, and one determiner removes it: `"tally
+the widgets"` and `"count the widgets"` both score `04d865fa68cef42b`. The
+answer when such a verb turns up is to add it to `METHOD_LEXICON`, not to widen
+the fallback.
+
+**Q: Does the bar actually gate approval?**
+A: It gates the HUMAN QUEUE (`SkillGate.submit`) and `SkillLibrary.approve()`
+itself. A candidate below the bar is still recorded, still unusable, still
+accruing evidence, and still appears in `result.proposed_skills`; what the
+queue controls is whether a reviewer is asked. `approve()` separately refuses
+a candidate whose recorded `evidence_tasks` is non-empty but short of
+`MIN_DISTINCT_TASKS`, unless the caller passes `force=True` — which the
+skill's own record then carries as `approval_note`, so a bypass is visible on
+the skill rather than only in whoever's log invoked it. `--auto-approve` still
+can approve a one-shape candidate, but explicitly now: it passes `force=True`,
+which is the documented "bypasses review, but visibly" behaviour, not a way
+around the check. The one place the check stays silent on purpose: a skill
+with NO recorded `evidence_tasks` at all — hand-authored, never proposed
+through `run.py`'s distillation path — skips it entirely, both because a rule
+about distinct task shapes has nothing to say about a candidate never counted
+against it, and because several tests construct skills via a bare `propose()`
+with no evidence as fixtures for unrelated features and then approve them
+without `force` — `test_skill_integrity.py` alone has six unforced `approve()`
+calls, most of them on evidence-free fixtures. I have not measured how many an
+unconditional check would break, and I would rather say that than quote a
+number I did not count. The vacuous case is not merely tolerated, either: it is
+pinned by its own test,
+`test_a_candidate_with_no_tracked_evidence_is_not_gated_by_the_bar`, so
+tightening it would be a deliberate change to a stated property rather than an
+accident.
+
+NOT COVERED, and it is the obvious attack: a caller that reaches `propose()`
+without an `evidence_task` gets a skill the bar cannot speak about. `run.py`'s
+distillation path always supplies one, so this is a hole for a hand-authored
+skill or a direct API caller, not for the learning loop — but it is a hole.
+
+**Q: You fixed retrieval too. What was wrong with it?**
+A: With the pen skill approved, "Compute the average rainfall in millimetres for
+12 cities" and "Compute the total distance of 5 marathons at 42.2 km each" both
+retrieved it, on the strength of "compute" and the presence of a number. Neither
+is a unit-price question, and a wrong skill actively misleads a worker where no
+skill merely leaves it to reason from the task. Retrieval now abstracts BOTH
+sides and, once a stored pattern names `MIN_SHAPE_SLOTS` (2) or more distinct
+literal kinds, requires the incoming task to carry ALL of them — a subset
+test, not a fraction. The pen skill's pattern is `{NUMBER, MONEY}`; rainfall
+and marathon-distance each carry only `NUMBER` and are refused outright rather
+than partially credited. A proper-noun kind is excluded from the count on both
+sides, because counting it let a capitalised word do a missing literal's job.
+The pattern's method vocabulary has to agree too, unless the task states no
+method at all — a bare noun phrase makes no claim to contradict.
+
+**Q: How strong is that precision claim? Where exactly is the boundary?**
+A: Tighter on the axis it actually checks than the project's first pass, and
+the honest gap moved rather than closed. Rather than assert it, here is the
+boundary probed: distil the pen skill, approve it, and run `library.retrieve`
+over a battery. Its stored pattern is `Compute the total cost of slot_number
+slot_term at slot_money each json_parses min_distinct_words`.
+
+```
+REFUSED   Compute the average rainfall in millimetres for 12 cities
+REFUSED   Compute the total distance of 5 marathons at 42.2 km each
+              -- both carry NUMBER only; the pattern needs {NUMBER, MONEY}
+REFUSED   List 5 refunds over 20.00 dollars
+REFUSED   Compute the total budget of 5 teams at 20.00 dollars each
+              -- both carry both kinds; the METHOD set disagrees
+                 ("cost" is in the pattern and not in the task)
+RETRIEVED Compute the total cost of 12 notebooks at 3.40 dollars each
+RETRIEVED 7 pencils at 40c each
+RETRIEVED 5 teams in the Boston office at 20.00 dollars
+```
+
+So the two probes a reviewer found are refused outright — missing even one of
+the pattern's literal kinds is disqualifying, not down-weighted below a
+threshold. And the boundary is genuinely two-sided: `"the total budget"` is a
+related question and is refused too, because the method check is a SUBSET test.
+Precision was bought with recall.
+
+The residual is the last row, and it is exactly the disclosed one. A task that
+states NO method vocabulary skips the method check entirely, by design, because
+refusing it would delete `"7 pencils at 40c each"` — the headline transfer case
+— along with it. So a task carrying every one of the pattern's literal kinds
+and no stated method still retrieves. `"5 teams in the Boston office"` was
+refused before only because it had no MONEY; add a price and it is offered a
+unit-cost method it never asked for. That is a design choice named in
+`_shapes_agree`'s own docstring, not a boundary measured against a corpus, and
+I would not claim it is the right cut — only that it is the cut, and which way
+it errs.
+
+**Q: So has learning improved anything, measurably?**
+A: Not yet, and the last real measurement went the wrong way — treatment 0/5
+against control 2/5, node pass rate 56.7% against 65.6% — which was traced to
+distillation anchoring skills on plan node names that are generated fresh every
+run. That is fixed; it has NOT been re-measured, because the daily quota is
+exhausted, and the same is true of this batch's changes. Everything in this
+section is a mechanism with a test, not a curve. The project still does not
+claim the system improves, and STATUS.md still says so.
+
+**Q: What else did you design for learning and not build?**
+A: The question used to be "what else in the learning spec is unbuilt", and
+that framing was false — there is no learning spec. I grepped: `Episode`,
+`ObservationStore`, `MIN_DISTINCT_CRITERIA` and `MIN_DISTINCT_RUNS` appear only
+in `docs/flow.md` and this file. No document in `docs/` defines them and no
+source file mentions them. They are my own sketch, so calling them unmet
+requirements would have borrowed authority from a document that does not exist.
+
+Named as my own unbuilt design, then: the `Episode` / `ObservationStore` /
+out-of-band corpus-wide promotion path (evidence lives on the Skill as a tuple
+of `task_signature` values instead), `MIN_DISTINCT_CRITERIA` and
+`MIN_DISTINCT_RUNS`, `Skill.transfers` and the transfer-rate term in the
+retrieval score, the never-transferred prune rule, `mark_retired` and the
+no-resurrection loop, the "(unproven: worked X of Y)" prompt annotation, and
+the families/skill_evidence endpoint. `merge_templates` is implemented and unit-tested but not yet wired
+into instruction construction, because a single-task distillation has no second
+template to merge against. No schema-version constant was added either: a new
+build reads an old file because the new fields default, and an old build refuses
+a new file through `SkillLibrary._load`'s existing unknown-field rejection, so a
+version integer would be a second, redundant mechanism.
+
+**Q: Why is shape and literal matching stdlib regex rather than a model call?**
+A: The same reason criteria are a declarative check language: everything in
+`generalise.py` runs on the distillation and retrieval paths, which are
+already model-adjacent output being fed back into this system's own inputs.
+Asking a model "is this the same shape?" would put a second untrusted author
+on the only write path into the library and would cost a provider call per
+node on a quota-bound system where the provider is the thing being rationed.
+`abstract`, `task_signature`, `literal_map` and `leaked_subject_terms` are
+pure functions of a string — no I/O, no swarmd imports at all, which is
+`generalise.py`'s own stated rule — so a chaos-integrity hash stays comparable
+across runs and a reviewer can say exactly why a token was classified as a
+literal or a subject. `skills.py`'s `_shapes_agree` follows the same
+deterministic-code-not-a-model-call discipline one layer up, over the
+primitives `generalise.py` exports. The cost is
+the one named throughout this section: a fixed, human-authored rule set misses
+what a model would catch (a synonym, an unlisted content word) and can only be
+widened by editing the rule, never by a model quietly generalising further on
+its own.
+
+**Q: If a run's provenance turns out bad after the fact, does anything it
+already taught the library get rolled back?**
+A: No, and this is a real gap rather than a designed-around one. The memo has
+exactly this rollback: `_memo_admission` deletes a memo whose own `status`
+says `completed` but whose run-store document disagrees, because leaving it
+would refuse that task forever. The skill library has no equivalent. `_distill`
+calls `SkillLibrary.propose()` for every node that passed, before the run's
+own final status is set, and `Skill.provenance_run` records which run produced
+each piece of evidence but nothing ever reads that field back against the
+run's later status. A run cancelled mid-distillation, or later marked
+`interrupted` by a control-plane shutdown, can leave evidence already banked
+on a skill with no path that retracts or re-checks it. It is bounded by the
+same human gate everything else is — a poisoned candidate still needs
+`MIN_DISTINCT_TASKS` shapes and a reviewer's approval before it does anything
+— but the bound is the ordinary evidence bar, not a provenance check built for
+this specific failure. Named here rather than left to be discovered the way
+the memo bug was.
+
+## Section 14: The version a senior engineer would actually ask
+
+> Section 13 explains the mechanisms. This section is the adversarial pass over
+> them — the follow-ups I would ask if someone showed me this work. Rule for
+> every answer here: it must name what is NOT covered, or it does not count as
+> an answer.
+
+### Idempotency
+
+**Q: What is the key scoped to?**
+A: The store, and nothing narrower — no per-operator, per-tenant or
+per-endpoint namespace on the record. `_entry_key` validates the header against
+`KEY_RE` (8–200 characters of `[A-Za-z0-9_.:-]`) and passes it straight through
+as the record's identity. What IS scoped is the body fingerprint:
+`fingerprint()` hashes `{"endpoint": ..., "payload": ...}` with
+`sort_keys=True`. Two consequences. Reusing one key across `POST /api/runs` and
+`POST /api/runs/{id}/resume` is a body conflict, not a replay, because
+`endpoint` is inside the hash. And two clients serialising the same request
+with different JSON field order are correctly treated as one request, because a
+body's field order is not meaningful.
+
+NOT COVERED: two unrelated callers who happen to pick the same key collide, and
+the loser is handed the winner's run. The eight-character floor exists to make
+that unlikely, not impossible — a client that "just picks something" is the
+failure mode it was sized against. Per-caller scoping would need caller
+identity inside the record key, which is a change to `IdempotencyStore`, not a
+config flag.
+
+**Q: Same key, different body. Why 422 and not 409?**
+A: Because 409 is already used, for a different state, and the two would
+otherwise be ambiguous. 409 means the key is RESERVED and another request is
+still constructing its run — a transient state that resolves. 422 means the key
+is settled and the pair (key, body) is unprocessable: well-formed key,
+well-formed body, incompatible together. A client can usefully retry a 409;
+retrying a 422 with the same body is pointless. 400 is reserved for a key that
+fails `KEY_RE`, because that is a header problem the client cannot fix by
+changing its payload. Three distinct failures, three codes.
+
+The conflict response deliberately does not name the first run's id. Leaking
+the id of a run this caller did not create turns a client bug into an
+information disclosure, and there is nothing the caller can legitimately do
+with it.
+
+NOT COVERED: a reservation is disbelieved after `PENDING_STALE_S` (120s), so a
+process that died mid-construction frees its key rather than holding it hostage
+forever. That trade admits a small duplicate window — a construction that takes
+longer than 120 seconds and then succeeds could coexist with a second
+acceptance. I took that over a crash making a key permanently unusable.
+
+**Q: Is it durable across a restart?**
+A: Yes, and that is the case it exists for. One file per key under the RunStore
+root, written with RunStore's discipline — temp file in the SAME directory (so
+`os.replace` is a rename rather than a cross-device copy), fsync, `os.replace`.
+The retry that arrives after a deploy is precisely the retry worth
+deduplicating, so an in-memory dict would have covered only the cases that did
+not matter. A test opens a fresh store over the same directory and finds the
+record.
+
+One detail worth mentioning because it was a bug in waiting: RunStore's
+filename sanitiser drops `.` and `:`, which `KEY_RE` allows, so two distinct
+keys would have shared a file. `path_for` appends a sha256 suffix, which is
+what makes the name unique.
+
+**Q: What breaks with two replicas?**
+A: It can double-accept, and I would rather say so than imply otherwise. The
+`asyncio.Lock` is per-process and the store is a per-pod filesystem; a stat and
+a write are not atomic across machines. Two pods handed the same key at the
+same instant can both see "no record", both reserve, and both start a run. It
+is in the module docstring rather than buried, and `IdempotencyStore` is a
+deliberately narrow surface — lock / get / reserve / complete / release / prune
+— so a Redis or Postgres backend drops in behind it. NOT BUILT. The same
+limitation applies to the memo store, for the same reason.
+
+**Q: Why no body-hash fallback when the header is absent?**
+A: Because re-running an identical task on purpose is a normal operation here —
+an A/B arm, a flake hunt, a chaos comparison, the control run every eval needs.
+A body-hash fallback would hand an operator who forgot the header yesterday's
+run id instead of the run they asked for, and it would do so silently. So "no
+header means a new run" is unconditional, with no environment flag to weaken
+it. The cost is real: clients must opt in, and a client that never sets the
+header gets no protection at all. I took that over silently breaking the
+workflow this project runs most.
+
+### Prefix caching
+
+**Q: Why does prompt ORDER matter for a provider cache?**
+A: Because automatic prefix caching keys on a byte-identical LEADING prefix of
+the rendered conversation, not on set membership. Everything from the first
+differing byte onward is a miss, whether or not those bytes were sent before.
+The old layout put `STEP:` on the second line, so the divergence point was two
+lines in, and the criterion block and the skills block — by far the largest
+part of the prompt — sat after it and were re-read cold on every worker call.
+Only `WORKER_SYSTEM`, 640 characters, was ever shared. Moving the run-stable
+and node-stable material ahead of the volatile tail is the whole mechanism.
+
+**Q: What exactly is proven identical after hoisting, and what is not?**
+A: PROVEN: against `ScriptedProvider`, a stub that returns one fixed worker
+output regardless of what it is sent, a legacy run and a hoisted run of the
+same task produce the same criterion hash, byte-identical `Candidate.output`
+per node, and the same integrity hash. Guarded against being a tautology by a
+second test asserting the two arms really did send different bytes — every
+legacy worker prompt contains `TASK:` and no hoisted one does.
+
+NOT PROVEN, and false the moment the responder reads its input.
+`SimulatedProvider` seeds on `sha256(f"{system}|{prompt}|{temperature}")`, and
+hoisting moves bytes across that `|`, so the same logical request returns
+different text under the two arms — checked directly. Nor is it literally the
+same string: measured on the `smoke` run's `verify` worker call, legacy is 640
+characters of system plus 526 of user and hoisted is 871 plus 295 — the same
+1,166 total and the same blocks, but REORDERED (legacy renders TASK, STEP, REQUIRED, GRADED;
+hoisted renders TASK, GRADED, then STEP, REQUIRED) and re-split, so `system +
+prompt` is not byte-equal across the arms. "The same bytes under a different
+role" is the sentence to avoid.
+
+NOT COVERED AT ALL: quality. Moving the criterion into the system role changes
+how a model WEIGHTS it, and a cheaper run that grades worse is a regression
+however good the cache numbers look. The acceptance gate is NODE PASS RATE
+parity on the `eval` profile at fixed seeds, and it HAS NOT BEEN RUN — it needs
+live providers and a task corpus. `hoisted` is the default on the
+scripted-provider equivalence alone; `SWARMD_PREFIX_ORDER=legacy` is the
+rollback.
+
+**Q: How is the saving measured rather than estimated?**
+A: `LLMResponse` carries two fields, not one nullable count: `cached_tokens`
+and `cached_tokens_reported`. "This provider does not report cached tokens" and
+"this provider reports that nothing was cached" are different facts, and
+reading the first as the second turns a working prefix cache into an apparent
+no-op, or the reverse. `parse_cached_tokens` reads
+`usage.prompt_tokens_details.cached_tokens` (and the Anthropic-shaped
+`cache_read_input_tokens`), treats a negative or non-numeric value as NOT
+REPORTED rather than clamping it to zero, and the pair lands on the ledger row
+and in the run report's `prefix_cache` block. Nothing is derived from prompt
+length.
+
+NOT MEASURED: under the offline providers the count is 0 with
+`reported=False`, and the report says not-measured rather than zero-saving. So
+there is no measured prefix-cache saving anywhere in this repo today — the
+mechanism is verified, the benefit is not. `ProviderSpec.prefix_cache` rides on
+every `pool.probe()` row and prints in `swarmd providers` precisely so a zero
+can be read correctly: a zero from a provider labelled `explicit` is expected,
+a zero from one labelled `auto` means the shared prefix is being broken.
+
+**Q: Why is similarity-based reuse unsafe here?**
+A: Because it was tried and measured. `router/cache.py` served one plan node's
+answer to another: worker prompts share a long template and differ in a step
+name, so cosine similarity between three genuinely different nodes measured
+0.97 against a 0.95 threshold. The symptom was a fast, cheap run at a high hit
+rate whose nodes all produced the same artifact. The fix is not a higher
+threshold — similarity here is dominated by shared boilerplate and RISES with
+template length, so a longer envelope pushes any two prompts above any
+threshold you pick. Semantic matching assumes the varying part of a prompt is
+most of the prompt; true of human paraphrases, false of machine-assembled text.
+The cache is exact-keyed now and the wrapper refuses a similarity cache rather
+than warning about it.
+
+Both later features inherit the conclusion. The memo's near tier is a discrete
+equality on a sha256 of task SHAPE, never a score. Skill retrieval is a subset
+test over literal kinds and method vocabulary, never a fraction.
+
+**Q: Why can Gemini explicit context caching not be used?**
+A: Because this pool talks to every provider through one OpenAI-compatible
+chat-completions adapter, and explicit caching is not expressible in that
+request shape: it needs its own create / TTL / delete handle lifecycle and a
+cache id carried on each call. It is deferred rather than forgotten — the
+registry labels `google-aistudio` as `prefix_cache="explicit"` and `swarmd
+providers` prints it, so a `cached_tokens=0` from that provider reads as "we do
+not create the handle" rather than "the cache is broken". NOT BUILT.
+
+### The memo
+
+**Q: What makes a near hit safe?**
+A: Four things in sequence, and the hit is refused if any of them fails.
+(1) `literal_map` is positional AND kind-checked: the Nth literal of the stored
+task becomes the Nth literal of the new one, and only when every kind matches
+in order. It returns `None` when they do not line up, which is the answer that
+makes the caller pay for its own synthesis rather than guess. (2) `rebind`
+matches whole tokens only, so the `2` inside `1.25` is never rewritten.
+(3) `leaked_subject_terms` catches a source-only subject noun surviving inside
+a check PARAMETER. (4) The rebound criterion is re-checked by `malformed()` and
+RE-ATTACKED against the new task's text.
+
+NOT COVERED: `rebind` deliberately does not rewrite TERM, so a plan node's
+human-facing instruction can still read as the source task's subject. That is
+correct for prose a worker reads for sense, and is exactly why gate (3) exists
+for the criterion, where the same surviving word is compared byte-for-byte by a
+grader. Separately, the fingerprint is order-sensitive on literal kinds and
+synonym-sensitive on the method verb, so plenty of genuinely similar tasks miss
+the near tier outright — a miss, which costs six calls and nothing else.
+
+**Q: Why re-run the adversarial attack instead of trusting the stored
+criterion?**
+A: Three reasons, and the first generalises. The attack is code that lives in
+THIS build: `degenerate_candidates` may have grown a case since the criterion
+froze, and a criterion today's attack set defeats must not be inherited on the
+strength of surviving last month's. Second, one of the degenerate candidates is
+built from the TASK STRING, so the attack is not task-independent — a criterion
+that survived attack against pens has not been attacked against pencils. Third,
+it is pure code: no provider call, no quota, no reason not to.
+
+NOT COVERED: attack only tries DEGENERATE candidates. It cannot notice a
+criterion that is well-formed, non-degenerate and simply about the wrong
+subject — which is the hole `leaked_subject_terms` was written to plug, and why
+that guard is a separate check rather than a stricter attack.
+
+**Q: Why is a result never replayed?**
+A: Because the failure modes are not comparable. The worst case of a bad memo
+is a run graded against a criterion it would probably have written itself — the
+workers still ran, the artifacts are real, the verdict is real. The worst case
+of an answer cache is a run reporting success without doing anything, and on a
+near hit it is worse still: pens' stored total is arithmetically wrong for
+pencils, so a replay would be confidently, silently incorrect. A memo carries a
+criterion and a plan. There is no stored candidate, output, artifact or verdict
+in it to serve, so this is a property of the data structure rather than a
+policy someone has to remember.
+
+**Q: What invalidates an entry, and why is tampering quarantined while an
+interrupted provenance run is deleted?**
+A: The full gate list is in Section 13; the difference between the two outcomes
+is the interesting part. A document whose `entry_hash` or `criterion_hash` does
+not match its own payload was changed by something that is not this code. That
+is evidence, and destroying evidence is the wrong response, so it is moved into
+`memos/quarantine/`. A provenance run marked `interrupted` after the fact is an
+ordinary operational event, not tampering — and there is a concrete reason
+deleting is REQUIRED rather than merely tolerable: `MemoStore.remember()`
+refuses to overwrite an entry that still looks reusable to its own check, and
+this entry's own `status` field still says `completed`. Left on disk it would
+refuse every future run of that task while no run could ever write a
+replacement. Deleting it is what lets the next successful run leave a fresh
+memo.
+
+NOT COVERED: nothing rolls back what an interrupted run already taught the
+SKILL LIBRARY. See the last question under Incentives.
+
+### Learning
+
+**Q: Memorisation or transfer — how do you know which you have?**
+A: They are two separate mechanisms and I keep the labels apart deliberately.
+The memo is MEMORISATION and is described as such: an exact key plus a
+same-shape near key, one question at a time, reusing only how to GRADE and how
+to DECOMPOSE. The skill library is the transfer claim, and it is the one that
+has to be defended, because a skill is offered to tasks it has never seen.
+
+How you tell them apart in this repo: the memo's evidence is a key hit, which
+proves only that the same question was asked. The library's evidence is
+`evidence_tasks` — a tuple of `generalise.task_signature` values from DIFFERENT
+task shapes. That is the whole design of the bar.
+
+Be exact about which hash that is, because the code's naming points the wrong
+way. `run.py` computes `task_key = task_signature(task)` and passes it as
+`evidence_task=`; `SkillLibrary.record_evidence` then calls the parameter
+`task_fingerprint` and `Skill`'s docstring says "abstract task FINGERPRINTS" in
+the loose sense of "a hash rather than the text". It is NOT
+`generalise.abstract_fingerprint`. Verified by running a `smoke` run over
+`"compute the total cost of 3 pens at 1.25 dollars each"` with a real
+`SkillLibrary` and reading the record back: `evidence_tasks` is
+`('bac37e579ae7c1e7',)`, which is `task_signature(task)`, while
+`abstract_fingerprint(task)` is `db1c9854b830f5a9` and appears nowhere on the
+skill. The distinction matters: the memo's near tier indexes on
+`abstract_fingerprint`, so pens and pencils are ONE memo shape and TWO pieces
+of skill evidence, which is exactly the behaviour each mechanism wants.
+
+NOT ESTABLISHED: whether transfer actually helps. The last real measurement
+went the wrong way (treatment 0/5 against control 2/5; node pass rate 56.7%
+against 65.6%), traced to distillation anchoring skills on plan node names
+generated fresh every run. That is fixed and has NOT been re-measured, because
+the daily provider quota is exhausted. Everything in this section is a
+mechanism with a test, not a curve.
+
+**Q: Why two DISTINCT task shapes rather than two successes?**
+A: Because two agents passing the same node of the same run satisfy "two
+successes" while sharing a task, a criterion and a prompt. That is one
+observation counted twice, and a library built on it offers advice proven on
+exactly one question. Two distinct shapes is the smallest number that can
+distinguish "this worked" from "this works on more than the thing it came
+from".
+
+**Q: How is that bar farmed, and what stops it now?**
+A: The farm is a MISS, not a hit — every restatement that fails to match
+MANUFACTURES a second piece of evidence. The first implementation was keyed on
+the abstracted SENTENCE, which inherits `memo.normalise`'s deliberate "a
+paraphrase MISSES" property: correct for an exact-match cache, exactly
+backwards here. One request reworded with "please" and "for me" pushed a
+candidate to promotable. Found in review, not by me.
+
+`task_signature` now hashes the head nouns of the task's noun phrases (minus
+method vocabulary and function words, stem-folded) plus the sorted KINDS of
+literal, both as sets. Measured against the base task `"Compute the total cost
+of 3 pens at 1.25 dollars each"` (`bac37e579ae7c1e7`), every one of these
+returns that same signature: politeness padding, swapped digits, the sentence
+uppercased, the sentence lowercased, and the literals fronted. Method verbs are
+excluded from the subject for the same reason, so `compute` → `calculate`
+cannot mint a shape.
+
+NOT COVERED: a restatement that introduces genuinely new subject matter.
+`"...for the invoice"` scores `64f93b39b25f93e2` — a second shape — because no
+lexicon can rule out a new content noun. I claim that is the defensible
+boundary, not that it is airtight. And the signature is only as good as two
+fixed, human-authored lists (the method lexicon and the function words), which
+is deliberate: a corpus-derived stoplist would move the bar week to week.
+
+**Q: What residual remains, and which way does each one fail?**
+A: Two. The direction is the part that is easy to state backwards, and in a
+document about a farming defence that is the worst single thing to get wrong,
+so here is the rule before the cases.
+
+`MIN_DISTINCT_TASKS` counts DISTINCT signatures. So a rule that SPLITS one task
+into two signatures hands a promotion its second piece of evidence for free —
+that is the farm, and it is the dangerous direction. A rule that MERGES two
+genuinely different tasks into one signature withholds evidence instead: the
+cost is a promotion that does not happen. The design errs toward merging on
+purpose. Saying "both residuals are on the splitting side, so they only cost a
+promotion" attaches merging's benign consequence to splitting's failure mode,
+and that is exactly inverted.
+
+**Residual one — `_stem`'s bare-`s`-before-`es` tie-break. It SPLITS, so it can
+manufacture evidence.** It folds the common `-se` subject class correctly
+(measured: `cases` → `case`, `queries` → `query`, `boxes` → `box`, `pens` →
+`pen`, and `niche` and `niches` both → `nich`) at the cost of words whose
+singular already ends in a bare `s`: `bus` → `bus` but `buses` → `buse`;
+`gas`/`gases` likewise; `lens` → `len` but `lenses` → `lense`; `virus` → `viru`
+against `viruses` → `viruse`; `campus` → `campu`. At signature level that is
+`"count the lens in the tray"` → `1d5513adf70035da` and `"count the lenses in
+the tray"` → `d74a788bf7d23bee`: one question, two signatures, where `"count
+the pen"` and `"count the pens"` correctly give one — computed just now,
+`520803586b95d146` for both.
+Ask about lenses twice, once in each number, and the bar is cleared. NOT FIXED,
+deliberately: `lens` and `pens` end in the identical two letters, so no suffix
+rule separates "already singular" from "needs stripping" without a lexicon, and
+this module's entire claim is that it keeps none and calls no model. It does
+not reach the near tier — subjects enter `abstract_fingerprint` only as a
+count, so both spellings fingerprint `2ebf0629e20c2e86`.
+
+**Residual two — the fallback's blind spot. It SPLITS too, and it replaced a
+wider residual that is now closed.** The old one was the fronted noun phrase: a
+determiner-less phrase at the front of a sentence contributed no subject, so
+`"Pens: compute the total cost of 3 at 1.25 each"` split from the ordinary
+phrasing AND merged with the fronted pencils sentence. Both halves are gone.
+`task_shape` now falls back to content words when nothing was introduced, and
+measured, the fronted pens sentence and `"compute the total cost of 3 pens at
+1.25 each"` both score `64f9e0ced633ac1f`, while the fronted pencils sentence
+scores `c1596a4da1991a26` — the same as ITS ordinary phrasing, so the two
+subjects stay two signatures.
+
+What the fallback costs instead, pinned by
+`test_the_fallback_leaves_a_narrower_residual_and_this_is_it`: it keeps every
+content word and cannot tell an unrecognised verb from a noun. So in a sentence
+with NO determiner anywhere, a verb outside `METHOD_LEXICON` is read as subject
+matter. Measured, `task_signature("tally widgets")` is `343c262fa82dfce7` — its
+subjects are `('tally', 'widget')` — against `04d865fa68cef42b` for `"count
+widgets"`. One question, two signatures, so it is farmable in principle. It is
+strictly narrower than what it replaced because it needs BOTH a determiner-less
+sentence AND an unrecognised verb, where the old one fired on any fronted
+phrase; adding a determiner avoids it entirely, and `"tally the widgets"` and
+`"count the widgets"` both score `04d865fa68cef42b`. If that test ever fails,
+the fix is to add the verb to `METHOD_LEXICON`, not to widen the fallback.
+
+If asked which residual is the one to worry about, the answer is residual ONE.
+`_stem` is unchanged by any of this, Latin/Greek bare-`s` singulars still split
+across singular and plural, and splitting is the direction that manufactures
+evidence. It is not harmless.
+
+**And one residual that is now closed.** `"three pens"` used to mint a second
+signature against `"3 pens"` — one task, written twice, clearing the bar with
+no second task solved. `_digits_for_shape` folds `zero`..`twenty` and
+`thirty`..`ninety` to digits inside `task_shape`, so both now score
+`bac37e579ae7c1e7`. Folded there and NOT inside `abstract()` generally, because
+`abstract()` also renders distilled skill instructions, where a small number is
+usually method guidance: `"write one paragraph"` means what it says. Verified
+in both directions — `abstract("write one paragraph")` comes back unchanged
+while `abstract("write 1 paragraph")` gives `"write <NUMBER> paragraph"`, and
+re-running the suite with `abstract()` wrapped to fold cardinals too fails
+exactly one test out of 1,241 (`1 failed, 1240 passed, 1 skipped, 1
+deselected`): `test_run.py::test_distillation_without_artifacts_describes_the_
+step_only`, on `'When a step calls for this: write <NUMBER> paragraph'`. A word
+list is defensible here for a reason it would not be for filler adverbs: the
+cardinals are a closed class and cannot go stale.
+
+**Q: What does the human gate actually protect?**
+A: It is the last thing between a proposed instruction and a string injected
+into future workers' prompts, and it is where a person sees the abstracted
+instruction and the retrieval pattern before either is used. The evidence bar
+is enforced in two places rather than one: `SkillGate.submit` decides whether a
+reviewer is ASKED, and `SkillLibrary.approve()` refuses a candidate whose
+recorded `evidence_tasks` is non-empty but short of `MIN_DISTINCT_TASKS`. The
+second matters because the first is a caller-side check, and anything reaching
+`approve()` by another route — a stale duplicate, `--auto-approve`, a direct
+call — used to bypass it. `force=True` is the audited escape: the bypass is
+written onto the SKILL'S OWN RECORD as `approval_note`, not only into whoever's
+log invoked it, so a later reader sees it. `--auto-approve` can still approve a
+one-shape candidate, but explicitly, by passing `force=True`.
+
+`SkillGate.submit` also dedupes on `skill_id`, because distillation re-proposes
+the same content-addressed skill from every task that produces it. Without the
+dedupe, a third shape queued a SECOND request for a skill the second shape had
+already queued, and deciding the stale one after the fresh one was approved
+silently un-approved and retired it — so the dedupe turns that into an audited
+no-op.
+
+NOT COVERED: a skill with NO recorded `evidence_tasks` at all — hand-authored,
+never proposed through the distillation path — skips the bar entirely. That is
+deliberate (a rule about distinct task shapes has nothing to say about a
+candidate never counted against it) and it is also a hole a determined operator
+can walk through. And the gate protects against a bad SKILL; it does nothing
+about a bad reviewer.
+
+### Determinism
+
+**Q: Why is shape matching deterministic code and not a model call?**
+A: Three reasons, in the order they actually bind. Trust first: everything in
+`generalise.py` runs on the distillation and retrieval paths, which are already
+model-adjacent output being fed back into this system's own inputs. Asking a
+model "is this the same shape?" would put a second untrusted author on the only
+write path into the library — and the agents producing that output are selected
+on passing checks. Cost second: a provider call per node, on a system whose
+scarce resource is provider calls. Legibility third: a reviewer can say exactly
+why a token was classified as a literal, a subject or method vocabulary, and
+can change it by editing a rule rather than by re-prompting.
+
+**Q: What would break if it were a model call?**
+A: The chaos-integrity guarantee first. SLO-2 asserts a run under kill-rate 0.9
+produces a byte-identical output hash to a clean run; a nondeterministic
+classifier on the distillation path makes that comparison meaningless. Then the
+evidence bar: "two distinct task shapes" would depend on a sampler, so the same
+two tasks could count as one or two on different days — and a bar that moves is
+a bar farmable by retrying. And the memo's near tier would be reusing a
+criterion on a model's say-so, which is exactly the "model grades its own
+homework" direction this project exists to avoid.
+
+**Q: How is determinism proven?**
+A: Three ways, and none of them is an assertion in a docstring.
+
+Structurally: `generalise.py` imports only `functools`, `hashlib`, `re` and
+`dataclasses` — no swarmd imports at all, which is the module's own stated
+rule, so no provider, no LLM, no async and no network can reach it. `skills.py`
+adds `generalise`; `memo.py` adds `generalise` and `RunStore`, which is
+filesystem only.
+
+By construction: every fingerprint is sha256, never the builtin `hash()`, which
+is salted per process.
+
+By running it: `task_signature`, `abstract_fingerprint` and `memo.key_for` over
+the same task under `PYTHONHASHSEED` 0, 1 and 42 return identical digests
+(`bac37e579ae7c1e7`, `db1c9854b830f5a9`, and a key beginning `5902dce6`). That
+is the check that would catch set or dict iteration order leaking into a hash
+payload.
+
+NOT COVERED: determinism is not correctness. Every one of these functions is a
+fixed, human-authored rule set. It will miss what a model would catch — a
+synonym, an unlisted content word — and it can only be widened by editing the
+rule, never by the system generalising further on its own.
+
+### Incentives
+
+**Q: What does a clone actually INHERIT?**
+A: This is the question I would ask, and the honest answer is uncomfortable.
+`Economy.reproduce` clones agents whose profit clears `clone_threshold` with at
+least two successes, and the parent pays `starting_balance` out of its own
+balance, so reproduction is not free — free reproduction would let one lucky
+agent flood the population, which is drift rather than selection. The child
+inherits `lineage`, an incremented `generation`, and a copy of the parent's
+`traits`.
+
+And `traits` is `{"node": name}`. That is the only value passed at either spawn
+site in `run.py`, and nothing anywhere reads `traits` back to change how an
+agent behaves — not its prompt, not its temperature, not its retrieval. So a
+clone is behaviourally identical to a fresh agent on the same node. The market
+is real — payment on verified success, bankruptcy, cloning at a cost — and what
+it selects over is nearly uniform, so selection currently has almost no
+heritable material to act on. NOT BUILT: heritable traits carrying actual
+behavioural variation.
+
+**Q: Can you incentivise a stateless LLM call at all?**
+A: Not in the sense the word usually means, and pretending otherwise is where
+this class of system starts lying. You cannot change how a model thinks by
+paying it: there is no gradient, no memory across calls, and the agent has no
+representation of its own balance to reason about. What an economy CAN do is
+change the POPULATION — who keeps running, who multiplies, and whose output
+becomes a skill other agents are shown. That is selection over a population of
+identical samplers, not incentive to an individual. Stated that way it is a
+defensible mechanism; stated as "agents are motivated to succeed" it is a
+category error.
+
+**Q: Why would harsher failure penalties make the population worse?**
+A: Because the cheapest way to avoid a penalty is to avoid attempting. Today an
+agent is charged for every attempt through `Economy.spend` and paid
+`success_reward` only when the frozen criterion passes, so failure costs the
+attempt and nothing more. Add a penalty on top and the dominant strategy shifts
+toward producing nothing rather than producing something that might be graded —
+and a population selected for abstention has a beautiful pass rate and does no
+work. The measurable symptom would be attempts falling while pass RATE climbs,
+which is one reason pass rate alone is never the thing to select on.
+
+I have to be precise about the status of that argument: it is reasoning about a
+change that has NOT been made, not a measured result. There is no code path
+today by which an agent CHOOSES not to attempt — the worker calls the provider
+unless it cannot afford to — so abstention is not currently an available
+strategy at all. The argument is about why I have not added the penalty.
+
+**Q: Where does credit assignment break across nodes?**
+A: At the node boundary, and it is a real gap. `settle` is called by the worker
+that produced a candidate, against the criterion for THAT node. An agent whose
+plausible-but-wrong artifact passes its own node and then breaks a downstream
+node is still paid in full, and the downstream agent that fails on bad input
+still loses its attempt. Nothing propagates a downstream verdict backward. So
+the market rewards local pass rate, not contribution to the run.
+
+NOT BUILT, and named rather than implied: ESCROW SETTLEMENT — hold a node's
+payment until the nodes depending on it have settled, then release or claw
+back. That is the designed fix and it does not exist.
+
+**Q: What else is designed but not built?**
+A: Four things, each labelled as such wherever it appears.
+ESCROW SETTLEMENT — the credit-assignment fix above.
+HERITABLE TRAITS — clone-to-clone behavioural variation for selection to act
+on; today `traits` carries `{"node": name}` and nothing reads it back.
+EFFICIENCY-WEIGHTED DISTILLATION — `Account.efficiency` is computed and
+reported, but distillation does not weight a candidate skill by the credits its
+source spent, so a wasteful success teaches exactly as strongly as a cheap one.
+PROVENANCE ROLLBACK for the skill library — below.
+
+**Q: If a run's provenance turns out bad after the fact, is what it taught
+rolled back?**
+A: No, and this is a gap rather than something designed around. The memo has
+exactly this rollback: `_memo_admission` deletes an entry whose own `status`
+says `completed` but whose run-store document disagrees. The library has no
+equivalent. `_distill` calls `SkillLibrary.propose()` for every node that
+passed, BEFORE the run's final status is set; `Skill.provenance_run` records
+which run produced each piece of evidence, and nothing ever reads that field
+back against the run's later status. A run cancelled mid-distillation, or later
+marked `interrupted` by a control-plane shutdown, leaves evidence banked on a
+skill with no path that retracts or re-checks it. It is bounded by the ordinary
+evidence bar and the human gate — not by a provenance check built for this
+failure.
+
+### Operations
+
+**Q: What happens when every provider is spent?**
+A: The run PAUSES; it does not fail. That was a deliberate change. The pool
+used to raise `NoCapacity` after thirty seconds of finding nothing available,
+which is right for a per-minute bucket and wrong for a spent daily ration: the
+capacity is back in four hours and the run would be throwing away a criterion,
+a plan and half a level of finished work over a limit behaving exactly as
+documented. So a wait longer than the pool can absorb becomes ONE run-level
+pause: every in-flight agent parks on a single Event inside `pool.complete` —
+before any step is committed, so a parked agent holds a consistent checkpoint —
+the run state is flushed to disk, and a ticker wakes them when the ration
+frees. `NoCapacity` still exists, for "every provider is backed off or
+unavailable", which is a different statement from "capacity returns at a stated
+time".
+
+`--no-wait` is the escape hatch and raises `Paced` instead of parking, because
+CI does not want to sit for four hours in a pipeline. It is opt-in rather than
+the default, because the default has to be the thing that finishes.
+
+**Q: What does a paused run look like to monitoring?**
+A: This is the reason the pause is one object rather than N sleeps. Sixty-four
+agents each sleeping four hours is the same wall clock and a completely
+different operational picture: nothing says the run is waiting, nothing says
+why, nothing says when it returns — and a parked run emits nothing, finishes
+nothing and errors on nothing, which is indistinguishable from a hang to
+everything watching.
+
+So: `run_paused` is a gauge set to 1 while parked and back to 0 on resume;
+`pauses` is a counter labelled by provider and DIMENSION (which window bound);
+`pause_seconds_total` is a counter labelled by provider and REASON; one event
+carries the binding provider and dimension; and a heartbeat
+re-states "still waiting, ETA X" every 60 seconds, so a dashboard connecting
+mid-pause is not blank for hours. A pause that re-forms inside
+`EXTENSION_WINDOW_S` is reported as an EXTENSION of the same pause rather than
+a fresh one, so an operator sees a moving ETA instead of a stutter that reads
+as a crash loop; three extensions marks it stalled — still not a failure, by
+decision. On the run document, `status` becomes `paused` with `paused_reason`
+and `resumes_at`, and that is persisted, so the pause survives the process.
+
+**Q: What is not measured yet?**
+A: The list I would want a reviewer to hold me to.
+- Prefix-cache saving. `cached_tokens` is 0 with `reported=False` under every
+  offline provider, so there is no measured saving anywhere in this repo yet.
+- Hoisted-versus-legacy node pass rate. The parity gate needs live providers
+  and a corpus; it has not been run.
+- Whether learning helps. The last measurement went the wrong way, the cause
+  was fixed, and re-measurement is blocked on the daily quota.
+- The real cache hit rate on unknown tasks. CAPACITY.md assumes 60% and names
+  this as the assumption most likely to be wrong.
+- Retrieval precision against a corpus. The boundary in Section 13 is a handful
+  of probes I ran, not a precision figure.
+- Anything at 500 agents against live providers.
+
+There was also a flaky test here, and it is fixed rather than still open.
+`tests/test_kill_resume_process.py` spawns three real processes and waits for
+the first to park; it was written against a 120-second deadline, and the test's
+own comment records that a loaded machine overran that often enough to fail it
+about half the time. The fix was to raise the deadline to
+600 seconds. That number is a CEILING ON PATIENCE, not an expected duration —
+nothing waits longer than it needs to, and the test polls for the parked run
+document and returns as soon as it appears. Timed three consecutive runs on an
+idle box just now: **2.44s, 2.40s, 2.39s** of call time. It is not a flaky test
+any more. Raising a deadline is not
+always a fix, but here the assertion was about behaviour and the timeout was
+only there to stop a hang, so a deadline tight enough to fire on scheduling
+noise was measuring the machine rather than the product.

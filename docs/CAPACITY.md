@@ -98,7 +98,15 @@ saving available: it removes half of all calls before any optimisation starts.
 
 *Implemented: `swarm/batch.py`. Verified by counted provider calls, not by
 estimate — `tests/swarm/test_batch.py` asserts a pool of N makes fewer than N
-calls, and a 32-agent run over a 4-node plan issues 8 calls total.*
+calls. Re-counted 2026-08-30 against a 4-node plan at 32 agents: a cold run
+issues **10 calls total** (the fixed 6-call synthesis head — 3 criterion
+proposers + 3 plan proposers — plus one batched generation call per node), and
+a repeat of the same task issues **4**, because the run memo (`swarm/memo.py`)
+serves the frozen criterion and plan without re-buying synthesis; the 4
+per-node generation calls still happen, since a memo never supplies an answer.
+The synthesis head does not shrink with the plan — a wider or deeper plan only
+moves the generation term. See `docs/flow.md`'s 2026-08-30 entry and
+`docs/interview_prep.md` §12 for the full derivation.*
 
 One call returns K candidate variants rather than one. Population search wants
 many candidates for the same step, which is exactly the shape a single prompt
@@ -248,7 +256,7 @@ is worse than no result.
 
 | Signal | Threshold | Action |
 |---|---|---|
-| `swarmd_rate_limited_total` rate | > 10% of calls | Add a provider (Cerebras first — largest free daily quota) |
+| `swarmd_rate_limited_total` rate | > 10% of calls | Add a provider. Cerebras is not a candidate — §7: its free tier now needs a card, 402 on every model as of 2026-08-28 |
 | Cache hit rate | < 40% sustained | Investigate prompt normalisation before buying capacity |
 | Daily request usage | > 80% of 15,900 | Add providers, or move `eval` to a multi-day schedule |
 | `standard` profile wall clock | > 20 min | Re-derive this document; a lever has stopped working |
@@ -300,6 +308,51 @@ tiers despite also costing nothing.
 
 Its catalogue also lies: `/v1/models` lists 83 entries and this account can
 call four. The rest return `404 Not found for account`.
+
+### The meter was reading double (found and fixed 2026-08-31)
+
+Every figure in this document that came from *observed usage* rather than from
+a provider's published allowance was overstated, and the cause was in this
+repository rather than at any provider.
+
+The ration and the budget tracker share one journal. A successful call wrote
+three rows to it: the ration's reservation (`+1 request`, `+estimate tokens`),
+the ration's settlement (`0 requests`, `actual - estimate`), and then a third
+row from the pool's success path carrying the full cost again (`+1 request`,
+`+actual tokens`). Summed — which is exactly what `window_state`, `grant_state`
+and the session envelope all do — **one call cost the day two requests and
+twice its tokens**.
+
+The consequences were all in the direction of stopping early, which is why it
+survived: a free tier was declared spent at half its real capacity, the session
+envelope handed out half the slice it had, and the "groq 101,522 / 100,000
+tokens BLOCKED" reading in [STATUS.md](STATUS.md) §5 was a doubled meter
+reporting roughly 50,000 real tokens against a cap that was itself wrong by
+half. Two independent errors pointing the same way is what made that day's
+budget look four times tighter than it was.
+
+A second fault sat on top of it. `observed_tokens_per_request` — the figure the
+ration reserves against — filtered the journal to rows carrying a request
+count, which kept the *reservation* row (the estimate) and dropped the
+*settlement* row (the correction). It therefore averaged its own estimate and
+could never converge on what the provider actually charged; it returned roughly
+the midpoint of the 1,250-token default and the truth, forever.
+
+Both are fixed and pinned by tests that fail against the previous code
+(`tests/router/test_pool.py::test_one_call_costs_the_day_one_request`,
+`::test_the_token_estimate_is_measured_from_settled_calls_not_itself`). Two
+related faults in the same path were fixed with them: the ration grant was
+taken once per *slot* but settled once per *attempt*, so a provider that failed
+over from one model to the next settled one reservation twice and left the
+served call charged zero requests; and the reservation was keyed on
+`models[0]` rather than on the model that actually ran, which on a `per_model`
+budget — groq's, the one that matters — rationed the whole account out of one
+model's share.
+
+**What this does NOT change.** The plannable total is computed from published
+daily allowances, not from usage, so `~2,200 requests/day` stands. What changes
+is how much of that a run may actually spend before the meter says stop: it was
+half, and it is now all of it.
 
 ### What this sustains
 
@@ -453,9 +506,19 @@ are the same answer to `fits` and only one of them is a reason not to start.
    does, population diversity drops without the call count dropping back, and
    the honest response is a lower K rather than a louder prompt. Untested
    against a live model.
-3. **1,500 tokens per average call.** If agents carrying many retrieved skills
-   push this past ~5,000, TPM becomes the binding constraint instead of RPM and
-   this entire document inverts.
+3. **~1,000 tokens per average call**, matching sections 1 and 7 and the
+   `observed_tokens_per_request` journal (`router/budget.py`). The live reading
+   of ~1,026 taken on 2026-08-30 — which priced groq's 200,000-token cap at 195
+   requests for the day — **is withdrawn**: it was an average over a meter that
+   counted each call's token ESTIMATE as well as its outcome, so it reported
+   roughly the midpoint of the two and could not move off the 1,250-token
+   default that fed it. Both faults are fixed (§7, 2026-08-31), and the figure
+   is now measured from settled calls only. Until enough live calls have
+   accumulated under the corrected meter, ~1,000 is the declared default and
+   not a measurement — treat any per-provider request count derived from it as
+   provisional. If agents carrying many retrieved skills push this past ~5,000,
+   TPM becomes the binding constraint instead of RPM and this entire document
+   inverts.
 4. **Published per-account limits are per-account, not per-key.** Discovered
    empirically by the pool; if a provider meters differently, `providers probe`
    reports it.

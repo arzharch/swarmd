@@ -50,8 +50,10 @@ that stops later features from being unfalsifiable.
   computed cost, agent id, stage, cache-hit flag. Run cost is a `SUM`, never a counter.
   Hard ceiling enforced at the harness boundary; breach raises and aborts cleanly with a
   report. This is the only source metrics may be computed from.
-- **Provider pool router.** Groq, Cerebras, Google AI Studio, OpenRouter `:free`, optional
-  Mistral (behind `--allow-data-training`, off by default), paid overflow GLM 5.3 Flash.
+- **Provider pool router.** Groq, Google AI Studio, OpenRouter `:free`, NVIDIA NIM (a
+  grant, not a tier), optional Mistral (behind `--allow-data-training`, off by default),
+  paid overflow GLM 5.3 Flash. Cerebras was in this pool at Phase-5 write-up time and is
+  not now: its free tier began requiring a card, every call returns 402 (CAPACITY.md §7).
   Empirical rate-limit discovery: a 429 records the observed limit and reschedules rather
   than trusting a hardcoded constant. Health scoring extended from latency/error to include
   rate-limit rejections.

@@ -42,10 +42,17 @@ The estimate here was ~86,000 TPM across five providers. What the keys actually 
 (docs/CAPACITY.md section 7, measured 2026-08-28):
 
 - **Cerebras is gone.** Its free tier now requires a card; every call returns 402.
-- **Groq's binding limit is tokens, not requests**: 100,000/day, which at the ~1,035
-  tokens this system sends per call is **98 requests a day**, not the 1,000 its request
+- **Groq's binding limit is tokens, not requests**: 200,000/model/day, which at the ~1,000
+  tokens this system sends per call is **~200 requests a day**, not the 1,000 its request
   quota advertises.
-- Plannable capacity across everything configured: **~1,146 requests/day.**
+- Plannable capacity across everything configured: **~2,200 requests/day**
+  (docs/CAPACITY.md §7, which §1 declares authoritative over its own supply
+  table; live-checked 2026-08-30, `swarmd providers budget` currently prints
+  `plannable 2,195 requests/day` — the total moves a little day to day because
+  groq's share is a token cap divided by observed tokens per call, not a fixed
+  request cap). The ~1,146 this line used to carry was the pre-recount figure,
+  superseded once Groq's 200,000-tokens-per-*model* cap and OpenRouter's funded
+  1,000/day were corrected (docs/CAPACITY.md §7).
 
 A thousand agents each calling a model per step is not merely expensive, it is a
 day's entire budget for one run. That is not a reason to abandon population size; it is
@@ -212,9 +219,13 @@ Provider pool, health-scored by observed rate-limit rejections and latency:
 
 | Tier | Members | Role |
 |---|---|---|
-| Free | Groq, Cerebras, Google AI Studio, OpenRouter `:free` | bulk of all calls |
+| Free, quota | Groq, Google AI Studio, OpenRouter `:free` | bulk of all calls |
+| Free, grant | NVIDIA NIM (~1,000 credits, expires 30 days after issue, never refills) | burst only — spent once, then gone |
 | Free, opt-in | Mistral Experiment tier | **requires consenting to data training — explicit flag, off by default** |
 | Paid overflow | GLM 5.3 Flash ($0.075/M in, $0.25/M out, 1.31M context) | roughly 180 calls within the ceiling |
+
+Cerebras is not in this pool: its free tier now requires a card on file and
+every call returns 402 (docs/CAPACITY.md §7, checked 2026-08-28).
 
 Published limits are treated as hints — sources disagree on OpenRouter's daily cap — so the
 router discovers real limits empirically and adapts. Free tiers train on submitted prompts;
