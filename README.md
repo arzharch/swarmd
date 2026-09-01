@@ -32,6 +32,7 @@ PLAN         competing DAG decompositions proposed
              structurally validated → handed to the existing executor
   │
 RETRIEVE     skill library queried (cold start: empty, and the run shows it)
+             a skill is retrievable only after two DIFFERENT task shapes
   │
 EXECUTE      one generic worker type, chaos killing them throughout
              each spending from a budget, paid on VERIFIED success only
@@ -237,10 +238,24 @@ counting provider calls rather than by comparing output, because identical
 output only proves the work was deterministic — not that it was recovered
 instead of repeated.
 
-Not yet done: anything measured against a real provider. A learning curve
-needs volume — 50–200 tasks — and until those numbers exist with their control
-arm, this README does not claim the system improves. Two more numbers are
-unmeasured for the same reason and worth naming, because both could come back
+Measured against real providers: runs end to end at $0.00 on free tiers, both
+held-out tasks taken from prompt to graded artifact with no code change, and
+training sessions that fill a skill library.
+
+**Not claimed: that the system improves.** For most of this project's life that
+was pending quota. It was not. A skill becomes reviewable only once it has
+worked on two *distinct* task shapes — the bar that makes "does this transfer?"
+answerable — and a suite of twelve tasks with twelve disjoint output shapes can
+never supply the second one, at any sample size. Nothing was ever queued, so
+nothing was approved, so the treatment arm of every ablation retrieved from an
+empty library and reported *"no measured improvement"* for a reason that had
+nothing to do with skills. That is fixed — there is a training arm of task
+families, and two phrasings of one approach are now one record — and the first
+skills to clear the bar on their own evidence exist. Whether retrieving them
+helps is a question this repo can now ask, and has not yet answered.
+([ADR-014](docs/adr/ADR-014.md))
+
+Two more numbers are unmeasured and worth naming, because both could come back
 worse than hoped: the cache hit rate on genuinely novel tasks (exact keying
 means novel work hits near zero), and whether a real model asked for eight
 distinct approaches returns eight rather than three and five rewordings.
