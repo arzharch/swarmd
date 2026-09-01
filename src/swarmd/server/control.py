@@ -65,6 +65,16 @@ class EvalRequest(BaseModel):
 
 
 class SessionRequest(BaseModel):
+    # WHICH TASKS THE LIBRARY IS BUILT FROM, and it is not a cosmetic choice.
+    # A session that trains on the same tasks an eval then measures is not
+    # measuring learning: a skill distilled from `pub-extract-1` and retrieved
+    # while solving `pub-extract-1` again is memorisation, and it moves the
+    # treatment arm for a reason that will not survive a task the library has
+    # never seen. `public` and `custom` are disjoint, so training on one and
+    # evaluating on the other is a real split using sets that already exist.
+    # The default stays "both" because a session is also just a way to build a
+    # library for use, and that is the honest default for that purpose.
+    arms: str = Field(default="both", pattern="^(both|public|custom)$")
     tasks: int = Field(default=10, ge=1, le=200)
     profile: str = "smoke"
     consolidate_every: int = Field(default=5, ge=1, le=50)
@@ -260,7 +270,7 @@ def register(
 
         job = registry.submit(
             JobKind.SESSION,
-            f"session · {request.tasks} tasks · "
+            f"session · {request.arms} · {request.tasks} tasks · "
             f"{'treatment' if request.use_skills else 'control'}",
             _session_runner(app, request, registry),
             params=request.model_dump(),
@@ -474,7 +484,7 @@ def _session_runner(app: FastAPI, request: SessionRequest, registry: JobRegistry
             registry.progress(job, completed)
             return result, run.report(result)
 
-        prompts = [t.prompt for t in suite(arms="both")]
+        prompts = [t.prompt for t in suite(arms=request.arms)]
         # Cycle rather than silently running fewer: a session of 40 that ran 10
         # would report a curve over a quarter of the requested evidence.
         tasks = [prompts[i % len(prompts)] for i in range(request.tasks)]

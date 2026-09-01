@@ -15,7 +15,12 @@ import pytest
 from fastapi.testclient import TestClient
 
 from swarmd.server.app import create_app
-from swarmd.server.control import CEILING_MAX, ConfigPatch, HarnessConfig
+from swarmd.server.control import (
+    CEILING_MAX,
+    ConfigPatch,
+    HarnessConfig,
+    SessionRequest,
+)
 from swarmd.server.jobs import JobKind, JobRegistry, JobState
 from tests.server.test_app import FakeProvider
 
@@ -425,3 +430,24 @@ def test_readiness_is_red_when_the_approval_store_cannot_be_reached(
 
     assert response.status_code == 503
     assert response.json()["status"] == "approval_store_unreachable"
+
+
+def test_a_session_can_train_on_a_task_set_disjoint_from_the_one_evaluated():
+    """Without this the learning claim cannot be made honestly.
+
+    The session drew its curriculum from `suite(arms="both")` -- the same ten
+    tasks `swarmd eval` then measures. A skill distilled from `pub-extract-1`
+    and retrieved while solving `pub-extract-1` again is memorisation of the
+    eval set, and it moves the treatment arm for a reason that will not
+    survive a task the library has never seen. `public` and `custom` are
+    disjoint, so one can train and the other measure.
+    """
+    from examples.tasks.suite import suite
+
+    public = {t.task_id for t in suite(arms="public")}
+    custom = {t.task_id for t in suite(arms="custom")}
+
+    assert public and custom
+    assert public.isdisjoint(custom), "the split has to actually be a split"
+    assert SessionRequest(arms="public").arms == "public"
+    assert SessionRequest().arms == "both", "unchanged for building a library to use"
