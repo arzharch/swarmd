@@ -639,6 +639,10 @@ class UsageJournal:
         self._lock = threading.Lock()
         self._rows: list[UsageRow] = []
         self._loaded = False
+        # Torn rows reported so far, so a permanent one is announced once
+        # rather than on every budget check. -1, not 0: a journal that loads
+        # cleanly must not be indistinguishable from one already reported.
+        self._torn_reported = -1
         # Size and mtime as of the last load. The cache used to be
         # load-once-forever, which is wrong the moment a second process shares
         # the journal -- and that is the normal case here: a long-lived
@@ -678,6 +682,7 @@ class UsageJournal:
             # problem on a journal must not be the thing that stops one.
             logger.warning("usage journal unreadable (%s): %s", self.path, exc)
             raw = ""
+        torn = 0
         if raw:
             for line in raw.splitlines():
                 line = line.strip()
@@ -689,7 +694,23 @@ class UsageJournal:
                     # A partial final line after a crash costs one row of
                     # history. Refusing to start over it would turn a cosmetic
                     # problem into an outage.
-                    logger.warning("skipping unreadable usage row in %s", self.path)
+                    torn += 1
+        if torn:
+            # ONE line per load, not one per torn row, and only when the count
+            # changes. A torn row is permanent -- two processes appending to
+            # this journal at once left exactly one, and it will be re-read on
+            # every budget check for the life of the file. Logged per row, a
+            # single byte of damage buried the pacer's own output under
+            # hundreds of identical warnings while a session was running.
+            if torn != self._torn_reported:
+                logger.warning(
+                    "skipping %d unreadable usage row(s) in %s", torn, self.path
+                )
+                self._torn_reported = torn
+        else:
+            # A journal that has come back clean must be able to report damage
+            # again if it is damaged again.
+            self._torn_reported = 0
         self._rows = rows
         self._loaded = True
         self._stat = self._fingerprint()
