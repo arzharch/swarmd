@@ -2371,3 +2371,90 @@ size.
 `limit = 3` is a prompt-budget decision, unchanged: skills are injected into a
 worker prompt, and prompt length is token cost on a quota-bound system.
 
+
+### Design fault or model fault? (answerable NOW)
+
+**Q: Your distilled skills scored 5 successes in 53 uses, and three of four
+candidates carried their source task. Is that the model being bad at writing
+advice?**
+
+No, and the distinction decides whether the problem is fixable. Each class was
+traced to the line that let it through (ADR-015), and none of them was the
+model.
+
+`stock_count` reached a skill because `strip_source_terms` compared WORDS
+against the task's vocabulary, and that token is not in it -- "stock" and
+"count" are. The abstraction tokenised prose and never considered that a writer
+packs two words into one identifier.
+
+`<NUMBER>! = 6` survived because the NUMBER pattern ended `(?![\w.])`. That
+guard exists so `1.25` is not split in half; it also rejected the period that
+ends a sentence, which made a number in final position invisible.
+`"the answer is 42."` yielded no literals at all -- and the end of a sentence is
+where an answer gets stated.
+
+Advice about synthetic probes survived because distillation abstracts the PLAN
+STEP, which is prose written for one task by a planner that knows the domain.
+Abstraction removes literals and words the task used. It cannot remove domain
+knowledge the planner introduced, because "domain" is not a structural
+property: `probes` looks exactly like `parse` to a rule that does not already
+know the subject.
+
+In all three the model did what it was asked and the pipeline failed to enforce
+the property it needed. Two are now fixed. The third is not deterministically
+detectable, and saying so is more useful than shipping a filter that pretends
+otherwise.
+
+**Q: You built a detector for the third class and did not ship it. Why?**
+
+It did not separate the cases. The signal was the share of an instruction's
+content words appearing in neither the task nor the method lexicon -- the
+symmetric partner to `strip_source_terms`, catching what the planner INVENTED
+rather than what it borrowed. Scored against the four candidates already judged
+by hand it read 0.41, 0.52 and 0.35 for the three rejects and 0.33 for the one
+approval.
+
+0.35 against 0.33 is not a threshold. Shipping it would have meant tuning a
+float on four samples until it reproduced a judgement already made, which is
+how a metric turns into a rationalisation for a decision taken on other
+grounds. The measurement is recorded so the next person does not rebuild it.
+
+**Q: So what stops a contaminated skill now?**
+
+The control that already caught these: scoring and pruning. It worked -- both
+skills were retired automatically with the reason on the record. It was slow,
+because `prune` runs at consolidation, every N tasks, while a skill can be
+retrieved by every node of every task in between. That is how one reached 26
+uses at 0%.
+
+Retrieval now applies the same rule against the same constants, so a skill past
+`PRUNE_MIN_USES` with a success rate under `PRUNE_MIN_SUCCESS_RATE` is not
+offered even before consolidation formalises the retirement. The exposure is
+capped at the evidence threshold rather than at the consolidation interval.
+
+**Q: Isn't the real answer to stop embedding the plan step's prose at all?**
+
+It is *an* answer, and it would eliminate the class by construction: build the
+instruction from the artifact shape, the check kinds and the method verbs, and
+never from prose. No prose, no leaks.
+
+It is not taken yet because the prose is what tells a worker HOW, and trading
+all of it for cleanliness is a bet about which loses more -- contaminated advice
+or uninformative advice. That is settleable by an ablation between the two
+distillers, and this project's rule is that a bet of that shape gets measured
+rather than argued. It needs a library large enough for the ablation to
+discriminate, which is the same precondition G-4 is waiting on.
+
+**Q: `generality` scored 1.00 on the worst candidate. What is it actually
+measuring?**
+
+Method-vocabulary density in the originating step -- how much of it was method
+rather than the task restated. Contamination does not reduce that: an
+instruction naming `stock_count` and `ledger_count` is still mostly method
+words, so it scores high while being unusable.
+
+That makes it a genuine signal about one thing and no signal at all about
+another, which is worth knowing before trusting it in review. A reviewer
+reading the instruction catches these; a reviewer reading the score does not,
+and anything that automated approval on it would have admitted all three
+rejects.
