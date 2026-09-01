@@ -117,6 +117,27 @@ cd frontend && npm install && npm run dev     # http://localhost:3001
 The dashboard renders the websocket stream or an empty state. There is no
 fixture path anywhere in it, and CI fails the build if one appears.
 
+Everything the CLI does, it does: start a run, watch the agents work, read the
+artifacts it produced, run an eval or a learning session, probe providers and
+read the day's remaining budget, approve a skill, resume a run parked on a
+spent ration.
+
+Two things to know when running it locally:
+
+* **If `SWARMD_API_TOKEN` is set, the dashboard asks for it.** Reads are
+  ungated, so the page fills with real data either way; the token is what lets
+  you act. Paste it into the field in the top bar -- it is kept in that
+  browser and sent as `X-Swarmd-Token`. This is the operator credential, not a
+  login: swarmd has one principal and no accounts (ADR-013).
+* **If the control plane is not on port 8000, tell the dashboard.**
+  `SWARMD_API=http://127.0.0.1:8123 npm run dev`. Next.js bakes the rewrite in
+  at build time, which is why the destination is an environment variable here
+  and absent in deployment, where the Ingress serves both from one origin.
+  Windows in particular reserves blocks of ports for Hyper-V, and 8000 is
+  often inside one -- `netsh int ipv4 show excludedportrange protocol=tcp`
+  lists them. The symptom is uvicorn logging `[Errno 13] ... [winerror 10013]`
+  at bind and exiting.
+
 ### With real providers
 
 Copy `.env.example` to `.env` and add at least one key. Groq (14,400 req/day)

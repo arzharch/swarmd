@@ -314,6 +314,32 @@ inherit it. Approving in bulk to clear the queue defeats the control.
 
 ---
 
+## DashboardReadsButCannotAct
+
+**Severity:** ticket · every button in the dashboard answers 401, the stream
+shows "No token"
+
+**What it means.** The control plane has `SWARMD_API_TOKEN` set and the browser
+is not sending it. Reads are ungated, so the page still fills with live
+provider and run data -- which is what makes this confusing: the dashboard
+looks connected and healthy while nothing it offers works.
+
+**Confirm:** `curl -s $API/api/auth` -- `{"token_required":true,
+"token_ok":false}` means the door is locked and this browser does not have the
+key. Adding `-H "X-Swarmd-Token: $TOKEN"` should flip `token_ok` to true; if it
+does not, the value is wrong, not missing.
+
+**Do now:** paste the token into the field in the dashboard's top bar. It is
+stored in that browser and sent on every request, and the event stream
+reconnects with it. If the field is not shown, the page believes no token is
+required -- check that the control plane it is talking to is the one you think
+(`SWARMD_API` at build time locally, the Ingress in deployment).
+
+**Not a login.** One operator, one credential, no accounts (ADR-013). Rotating
+the token is a restart of the control plane and a re-paste in the browser.
+
+---
+
 ## Deploy and rollback
 
 ```bash
