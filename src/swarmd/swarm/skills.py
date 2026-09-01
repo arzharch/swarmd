@@ -692,6 +692,94 @@ class SkillLibrary:
     def approved(self) -> list[Skill]:
         return [s for s in self._skills.values() if s.usable]
 
+    def merge_identity(self, path: str | Path) -> tuple[SkillLibrary, dict[str, int]]:
+        """Rebuild this library at `path` with one record per approach.
+
+        A library written before ADR-014 holds one record per PHRASING, each
+        carrying evidence from a single task shape, so `promotable` was
+        unreachable. This collapses them.
+
+        DECISIONS SURVIVE, and that is most of the work. Replaying through
+        `propose` alone mints candidates, so it silently un-approves the
+        library, drops every retired record, and resets the use counts pruning
+        reads -- a migration that destroys the reviews it exists to preserve.
+        Found by running it twice: the second time it erased two pruning
+        verdicts that had cost 53 retrievals to earn.
+
+        The rules, in the conservative direction each time:
+
+          retired    carried at the APPROACH level. Under this identity two
+                     phrasings ARE one approach, so a rejection of one is a
+                     rejection of it. Never resurrected, and a retired approach
+                     with no surviving phrasing is kept as its own record so
+                     the decision does not vanish with the row.
+          approved   carried only when the SURVIVING instruction is the one
+                     that was approved -- matched on `skill_id`, the hash of
+                     that text. Which phrasing survives depends on stored
+                     order, so an approval that cannot be matched is dropped
+                     and COUNTED rather than transferred to text nobody read.
+          uses       summed across the phrasings. They are one approach now, so
+                     the record of how it performed is one record too.
+
+        Returns the new library and a tally for the caller to report.
+        """
+        tally = {"records_in": 0, "approaches_out": 0,
+                 "approvals_kept": 0, "approvals_dropped": 0,
+                 "retirements_kept": 0}
+        records = self.all()
+        tally["records_in"] = len(records)
+
+        library = SkillLibrary(str(path))
+        for record in records:
+            if record.retired:
+                continue
+            for shape in record.evidence_tasks or ("",):
+                library.propose(
+                    name=record.name,
+                    task_pattern=record.task_pattern,
+                    instruction=record.instruction,
+                    run_id=record.provenance_run,
+                    criterion_hash=record.provenance_criterion,
+                    evidence_task=shape,
+                    generality=record.generality,
+                )
+
+        surviving = {
+            approach_key(skill.name, skill.task_pattern): skill
+            for skill in library.all()
+        }
+        for record in records:
+            key = approach_key(record.name, record.task_pattern)
+            target = surviving.get(key)
+
+            if record.retired and target is None:
+                # Nothing of this approach survived the replay. Keep the
+                # rejection itself, or the next session re-proposes it as new.
+                library._skills[record.skill_id] = record
+                tally["retirements_kept"] += 1
+                continue
+            if target is None:
+                continue
+
+            target.uses += record.uses
+            target.successes += record.successes
+            if record.retired:
+                target.retired = True
+                target.retired_reason = record.retired_reason
+                tally["retirements_kept"] += 1
+            elif record.approved:
+                if target.skill_id == record.skill_id:
+                    target.approved = True
+                    target.approved_by = record.approved_by
+                    target.approval_note = record.approval_note
+                    tally["approvals_kept"] += 1
+                else:
+                    tally["approvals_dropped"] += 1
+
+        library.save()
+        tally["approaches_out"] = len(library.all())
+        return library, tally
+
     def all(self) -> list[Skill]:
         return list(self._skills.values())
 

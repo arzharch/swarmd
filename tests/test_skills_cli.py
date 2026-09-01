@@ -138,3 +138,43 @@ def test_merge_does_not_silently_un_approve_the_library(tmp_path):
     assert merged[0].approved_by == "reviewer"
     assert merged[0].uses == 1, "and so did the history pruning reads"
     assert merged[0].successes == 1
+
+
+def test_merge_keeps_a_pruning_verdict(tmp_path, capsys):
+    """The one that cost 53 retrievals to learn and was erased twice.
+
+    A skill retrieved during training and pruned for failing carries a verdict
+    the economy paid for. The merge dropped every retired record outright, so
+    the next session re-proposed the approach as new and it went round again.
+    """
+    path = _write_pre_merge_library(tmp_path / "skills.json")
+    library = SkillLibrary(str(path))
+    doomed = library.all()[0]
+    for _ in range(6):
+        library.record_use(doomed.skill_id, success=False)
+    library.reject(doomed.skill_id, actor="consolidator", reason="pruned: 0/6")
+
+    main(["skills", "merge", "--skills", str(path), "--apply"])
+
+    merged = SkillLibrary(str(path)).all()
+    assert len(merged) == 1
+    assert merged[0].retired, "a rejection of one phrasing rejects the approach"
+    assert "pruned" in merged[0].retired_reason
+    assert merged[0].uses >= 6, "and the record of how it performed survives"
+
+
+def test_merge_says_when_an_approval_could_not_be_carried(tmp_path, capsys):
+    """Approval is granted for specific text. When a different phrasing of the
+    same approach survives, there is nothing a human read to carry it to -- so
+    it is dropped and said out loud rather than transferred silently."""
+    path = _write_pre_merge_library(tmp_path / "skills.json")
+    library = SkillLibrary(str(path))
+    # Approve the SECOND phrasing; the first is the one the merge keeps.
+    second = library.all()[1]
+    library.approve(second.skill_id, actor="reviewer", force=True)
+
+    main(["skills", "merge", "--skills", str(path), "--apply"])
+
+    out = capsys.readouterr().out
+    assert "approvals LOST : 1" in out
+    assert not SkillLibrary(str(path)).all()[0].approved

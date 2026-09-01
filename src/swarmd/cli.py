@@ -1191,12 +1191,22 @@ def _skills_command(args: argparse.Namespace) -> int:
     # the run reports success having changed nothing.
     with tempfile.TemporaryDirectory() as tmp:
         staged = Path(tmp) / "skills.json"
-        merged = _replay(records, str(staged))
-        promotable = [s for s in merged.all() if s.promotable]
+        merged, tally = source.merge_identity(staged)
+        promotable = [s for s in merged.all() if s.promotable and not s.retired]
 
-        print(f"records in     : {len(records)}")
-        print(f"approaches out : {len(merged.all())}")
+        print(f"records in     : {tally['records_in']}")
+        print(f"approaches out : {tally['approaches_out']}")
         print(f"promotable     : {len(promotable)}")
+        print(f"approvals kept : {tally['approvals_kept']}")
+        print(f"retirements    : {tally['retirements_kept']} kept")
+        if tally["approvals_dropped"]:
+            # Never silent. An approval was granted for specific text, and when
+            # a different phrasing of the same approach survives the merge
+            # there is nothing a human has actually read to carry it to.
+            print(
+                f"approvals LOST : {tally['approvals_dropped']} -- the wording "
+                f"that was approved is not the wording kept; re-review them"
+            )
         for skill in promotable:
             print(
                 f"  {skill.skill_id}  {len(skill.evidence_tasks)} shapes  "
@@ -1225,56 +1235,6 @@ def _skills_command(args: argparse.Namespace) -> int:
             "submitted the next time a run proposes that approach."
         )
     return 0
-
-
-def _replay(records: list[Any], path: str) -> Any:
-    """Propose every stored record into a fresh library, in stored order.
-
-    Order matters and is preserved: when two phrasings merge, the instruction
-    kept is the one proposed first, so replaying in a different order would
-    keep different advice.
-    """
-    from swarmd.swarm.skills import SkillLibrary
-
-    library = SkillLibrary(path)
-    for record in records:
-        if record.retired:
-            # Carried across as-is. A retired record is a decision, and
-            # re-proposing it would revive it.
-            continue
-        for shape in record.evidence_tasks or ("",):
-            library.propose(
-                name=record.name,
-                task_pattern=record.task_pattern,
-                instruction=record.instruction,
-                run_id=record.provenance_run,
-                criterion_hash=record.provenance_criterion,
-                evidence_task=shape,
-                generality=record.generality,
-            )
-
-    # DECISIONS AND HISTORY SURVIVE THE MERGE. `propose` mints candidates, so a
-    # replay alone silently un-approves every skill in the library and resets
-    # the use counts that pruning reads -- a migration that destroys the
-    # reviews it was supposed to preserve. Found by running it: two skills
-    # approved on their own evidence came back pending.
-    #
-    # Matched on `skill_id`, which is the hash of the surviving instruction, so
-    # this carries the decision to the record a human actually looked at. When
-    # two phrasings merge, the loser's approval does not transfer: it was
-    # granted for text that is no longer stored.
-    by_id = {record.skill_id: record for record in records}
-    for skill in library.all():
-        source = by_id.get(skill.skill_id)
-        if source is None:
-            continue
-        skill.approved = source.approved
-        skill.approved_by = source.approved_by
-        skill.approval_note = source.approval_note
-        skill.uses = source.uses
-        skill.successes = source.successes
-    library.save()
-    return library
 
 
 def _serve_command(args: argparse.Namespace) -> int:
