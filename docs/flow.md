@@ -3200,6 +3200,35 @@ offered, even before consolidation formalises the retirement. Damage capped at
 the evidence threshold instead of at the consolidation interval. Consolidation
 still does the retiring; this only stops the bleeding.
 
+### A fourth channel, larger than the three above
+
+Auditing the library for the two closed classes turned up one the analysis had
+missed. `_distil_instruction` wrote the artifact KEY NAMES into the advice --
+`Produce a JSON object with these fields: most_users (bool),
+preference_threshold (int)` -- and those keys were chosen by one worker for one
+criterion. **17 of 31 live records carried them, against 8 for the identifier
+leak.** The skill's NAME is derived from the same keys, and `skills_block` was
+printing it into the prompt beside the instruction, so the channel was open
+twice.
+
+What settles it is that they are redundant. The worker is shown its own frozen
+criterion's exact requirements -- added because withholding them was the
+largest single cause of live runs failing -- so it already knows which keys it
+must produce. A retrieved skill naming a different set can only agree by
+accident, and disagreeing produces correct data under keys nothing is looking
+for: the exact failure the criterion block exists to prevent.
+
+Removed from both places. The instruction records the KINDS of value the work
+produced and says to take key names from the reader's own criterion; the name
+stays as the library's identity and is no longer shown to workers.
+
+The first attempt replaced the names with a field COUNT and lasted about an
+hour. `validate_instruction` compares whole literals against the source task,
+so a skill saying "3 fields" distilled from a task about "3 pens" was refused
+as a leak -- and every skill from that run was lost. The old comment in
+`_distil_instruction` warns about exactly this for the success count; I walked
+into it from the other side. The shape is spelled in words now.
+
 ### What is still exposed
 
 Domain-as-method still reaches the library. It now costs at most five
