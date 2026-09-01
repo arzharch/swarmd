@@ -23,6 +23,7 @@ from __future__ import annotations
 
 from swarmd.swarm.generalise import (
     MIN_GENERALITY,
+    _identifier_parts,
     _stem,
     abstract,
     content_tokens,
@@ -771,3 +772,51 @@ def test_the_fallback_does_not_disturb_ordinary_phrasing():
     assert task_signature(ordinary) != task_signature(
         "compute the total cost of 3 pencils at 1.25 dollars each"
     )
+
+
+# --- subject matter welded into an identifier ------------------------------
+
+
+def test_an_identifier_naming_the_task_is_stripped_like_the_words_would_be():
+    """The leak that reached an approved skill.
+
+    A step naming `stock_count` names its own task exactly as plainly as one
+    saying "stock count", but the whole token was not in the source vocabulary
+    and survived untouched. The distilled skill then told every later run to
+    emit `stock_count` and `ledger_count`, so a reconciliation of an invoice
+    against a payment inherited the wrong keys -- one task's answer wearing a
+    method's grammar, which is the exact failure `strip_source_terms` exists to
+    prevent.
+    """
+    source = (
+        "A stock count records 87 units while the ledger shows 92. Determine "
+        "which figures disagree and produce the reconciliation.",
+    )
+    stripped = strip_source_terms(
+        "produce a JSON object with keys stock_count, ledger_count and discrepancy",
+        source,
+    )
+    assert "stock_count" not in stripped
+    assert "ledger_count" not in stripped
+    # Not from the task, so it stays: the point is to drop the subject, not to
+    # reduce the step to placeholders.
+    assert "discrepancy" in stripped
+
+
+def test_an_identifier_made_only_of_method_words_survives():
+    """`sort_by_price` describes the work, not the thing worked on. Collapsing
+    it would leave a step that teaches nothing, which is the failure mode on
+    the other side of this rule."""
+    stripped = strip_source_terms(
+        "sort_by_price the rows", ("sort the rows by price",)
+    )
+    assert "sort_by_price" in stripped
+
+
+def test_a_word_is_not_split_where_the_writer_put_no_boundary():
+    """Splitting happens on `_`, `-` and case changes only. Inventing divisions
+    inside an ordinary word would strip tokens that share no vocabulary with
+    the task at all."""
+    assert _identifier_parts("counterpart") == ["counterpart"]
+    assert _identifier_parts("stock_count") == ["stock", "count"]
+    assert _identifier_parts("nextCursor") == ["next", "cursor"]

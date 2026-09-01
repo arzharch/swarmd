@@ -417,6 +417,18 @@ def shared_literals(instruction: str, source: str) -> set[str]:
     return literals(instruction) & literals(source)
 
 
+def _identifier_parts(token: str) -> list[str]:
+    """`stock_count` -> ["stock", "count"]; `nextCursor` -> ["next", "cursor"].
+
+    Deterministic and stdlib-only, like everything else on this path. Splits
+    only where the writer put a boundary -- an underscore, a hyphen, or a case
+    change -- so it never invents divisions inside an ordinary word.
+    """
+    spaced = re.sub(r"[_-]+", " ", token)
+    spaced = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", spaced)
+    return [part for part in spaced.lower().split() if part]
+
+
 def strip_source_terms(text: str, source_texts: tuple[str, ...]) -> str:
     """Replace the subject-matter words a step shares with its own task.
 
@@ -442,7 +454,32 @@ def strip_source_terms(text: str, source_texts: tuple[str, ...]) -> str:
         lowered = token.lower()
         if lowered in METHOD_LEXICON or lowered in FUNCTION_WORDS:
             return token
-        return "<TERM>" if lowered in vocabulary else token
+        if lowered in vocabulary:
+            return "<TERM>"
+        # IDENTIFIERS, which is how subject matter got through. A step naming
+        # `stock_count` is naming the task it came from just as plainly as one
+        # naming "stock count", but the whole token is not in the vocabulary
+        # and survived untouched -- so a skill distilled from the stock task
+        # told every later run to emit `stock_count`, and a reconciliation of
+        # an invoice against a payment inherited the wrong keys.
+        #
+        # Split only on separators the writer chose (`_`, `-`, camelCase). A
+        # token is subject matter when EVERY part came from the task and at
+        # least one part is not method vocabulary. So `stock_count` collapses
+        # -- "stock" is the task's subject, "count" is the method -- while
+        # `sort_by_price` survives, because sort/by/price are all method or
+        # function words and an identifier made only of those is describing the
+        # work rather than the thing worked on.
+        parts = _identifier_parts(lowered)
+        if (
+            len(parts) > 1
+            and all(part in vocabulary for part in parts)
+            and not all(
+                part in METHOD_LEXICON or part in FUNCTION_WORDS for part in parts
+            )
+        ):
+            return "<TERM>"
+        return token
 
     stripped = _PLACEHOLDER_OR_WORD.sub(replace, text)
     # A run of placeholders is one unknown, not several. Collapsing keeps the
