@@ -236,34 +236,43 @@ def approach_key(name: str, task_pattern: str) -> str:
     proposals from one task, four distinct step texts, and no cross-task match
     available at any sample size.
 
-    What does recur is the kind of work: the artifact shape the step produced
-    and the kinds of check that graded it. Both are already in `name` and in
-    the tail of `task_pattern`, both are abstracted, and neither carries a
-    literal. That is the identity here.
+    What does recur is the kind of work: the artifact shape the step produced.
+    That is what `name` records, abstracted and carrying no literal, and it is
+    the whole identity.
+
+    AND THE CHECK KINDS ARE NOT IN IT EITHER, which reverses an earlier version
+    of this function on evidence. The criterion is authored fresh for every run
+    (ADR-009), so its set of checks varies between two runs of the same work:
+    one run grades a diagnosis with `artifact_exists + contains_all +
+    json_parses + output_nonempty`, the next with three of those. Keying on
+    them reintroduced the exact fragmentation this function exists to remove,
+    one level up -- the same approach from two runs landed on two keys.
+
+    Measured on a 38-record library rather than argued: keying on name and
+    check kinds gave 38 approaches and 3 that cleared the evidence bar; keying
+    on the name alone gave 34 and 5. Fewer records, more of them answerable.
 
     THE COST, stated because it is real: two different steps of one task merge
-    when they produce the same artifact shape under the same checks, and the
-    instruction kept is the one proposed first. Those two records were already
-    competing for the same retrieval slot -- `_terms` indexes on the same name
-    -- so the library was not distinguishing them either. The human gate and
-    success-rate pruning are what choose between approaches; this only decides
-    what counts as one.
+    when they produce the same artifact shape, and the instruction kept is the
+    one proposed first. Those records were already competing for the same
+    retrieval slot -- `_terms` indexes on the same name -- so the library was
+    not distinguishing them either. The human gate and success-rate pruning are
+    what choose between approaches; this only decides what counts as one.
 
-    Deterministic: sha256 over sorted unique terms and a closed check-kind
-    vocabulary. No threshold, no model in the path.
+    Deterministic: sha256 over sorted unique terms. No threshold, no model in
+    the path.
 
     Necessary and NOT sufficient. Evidence only accumulates when two DIFFERENT
     tasks propose the same approach, which needs a corpus whose tasks share
     output shapes -- the `train` arm. See ADR-014.
     """
-    from swarmd.swarm.criteria import CHECK_KINDS
+    # `task_pattern` is accepted and deliberately unused. See below; the
+    # signature keeps it so a future key can take it back without touching
+    # every call site.
+    del task_pattern
 
     shape = sorted(set(tokenize(index_text(name))))
-    # The closed vocabulary, taken from wherever it appears in the pattern.
-    # Everything else in the pattern is the per-task step, deliberately dropped.
-    graded_by = sorted({t for t in tokenize(task_pattern) if t in CHECK_KINDS})
-    payload = f"{' '.join(shape)}|{' '.join(graded_by)}"
-    return hashlib.sha256(payload.encode()).hexdigest()[:12]
+    return hashlib.sha256(" ".join(shape).encode()).hexdigest()[:12]
 
 
 # A distilled instruction has to be an INSTRUCTION. The distiller reads model

@@ -639,27 +639,39 @@ def test_two_steps_with_the_same_shape_and_checks_are_one_approach(tmp_path):
     assert library.all()[0].instruction.startswith("Scan in document order")
 
 
-def test_work_graded_a_different_way_is_a_different_approach(tmp_path):
-    """What still discriminates once the step text is out of the key.
+def test_the_same_work_graded_differently_is_still_one_approach(tmp_path):
+    """This reverses an earlier version of this test, on measured evidence.
 
-    Producing an artifact that must parse as JSON is not the same approach as
-    producing one checked only for being non-empty, even under the same name.
+    The old rule put the criterion's check kinds in the identity, reasoning
+    that an artifact which must parse as JSON is not the same approach as one
+    checked for being non-empty. That is true in principle and wrong in
+    practice: the criterion is authored fresh for every run (ADR-009), so its
+    check set varies between two runs of the SAME work. Keying on it
+    reintroduced exactly the fragmentation the key exists to remove -- the same
+    approach from two runs landed on two records, each with one task shape,
+    and neither could ever clear the bar.
+
+    Measured on a 38-record library: name plus check kinds gave 38 approaches
+    and 3 that cleared the bar; the name alone gave 34 and 5.
     """
     library = SkillLibrary(str(tmp_path / "skills.json"))
     library.propose(
         name="approach: produce verdict",
         task_pattern="decide whether the slot_term holds json_parses contains_all",
         instruction="State the verdict first, then each unmet requirement.",
-        evidence_task="shape-claim",
+        evidence_task="shape-uptime",
     )
     library.propose(
         name="approach: produce verdict",
         task_pattern="decide whether the slot_term holds output_nonempty",
         instruction="Answer in prose; there is no structure to satisfy.",
-        evidence_task="shape-claim",
+        evidence_task="shape-halved-time",
     )
 
-    assert len(library.all()) == 2
+    merged = library.all()
+    assert len(merged) == 1, "one approach, graded two ways by two criteria"
+    assert set(merged[0].evidence_tasks) == {"shape-uptime", "shape-halved-time"}
+    assert merged[0].promotable, "and the evidence now reaches the bar"
 
 
 def test_a_retired_approach_is_not_revived_by_re_proposing_it(tmp_path):
