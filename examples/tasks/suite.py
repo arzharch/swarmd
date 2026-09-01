@@ -94,6 +94,118 @@ CUSTOM: list[Task] = [
                 "duration for 250 pages."),
 ]
 
+# --- training arm ----------------------------------------------------------
+#
+# NOT AN EVALUATED SET, and `suite()` will not hand it to an eval (ADR-014).
+# These tasks exist to build a skill library, and a success rate measured over
+# the tasks a library was built from is memorisation wearing a measurement's
+# clothes.
+#
+# FIVE FAMILIES OF THREE, and the grouping is the whole point. A skill becomes
+# reviewable only once it has worked on two DISTINCT task shapes -- the bar
+# that makes "does this transfer?" answerable. The evaluated suite has twelve
+# tasks with twelve disjoint output shapes, so no approach was ever proposed
+# twice and nothing could ever clear it. Members of a family here call for the
+# same kind of work and the same output shape, so an approach distilled from
+# one can be proposed by another and accrue its second piece of evidence
+# honestly.
+#
+# Each family is aligned with a KIND of work the custom arm also needs, and
+# with none of its content: diagnosis-and-fix against `cus-repo-1`,
+# checkability against `cus-paper-1`, enumeration against `cus-puzzle-1`,
+# rate-limited planning against `cus-api-1`, normalisation against
+# `cus-wrangle-1`. What transfers, if anything does, is the approach.
+
+TRAIN: list[Task] = [
+    # Family: diagnose a failure and state the minimal fix.
+    Task("trn-diagnose-1", arm="train", domain="diagnose_and_fix", seed=4101,
+         prompt="A script fails with 'PermissionError: [Errno 13] Permission "
+                "denied' when writing to /var/log/app.log. It runs as an "
+                "unprivileged service user and the directory is owned by root "
+                "with mode 755. Produce a diagnosis and the minimal change "
+                "that would fix it, as structured output."),
+    Task("trn-diagnose-2", arm="train", domain="diagnose_and_fix", seed=4102,
+         prompt="A nightly job silently produces an empty report. Its query "
+                "filters on created_at greater than or equal to today, and the "
+                "job runs at 00:05 in UTC while the data is written with local "
+                "timestamps. Produce a diagnosis and the minimal change that "
+                "would fix it, as structured output."),
+    Task("trn-diagnose-3", arm="train", domain="diagnose_and_fix", seed=4103,
+         prompt="A web page loads but shows no data, and the browser console "
+                "reports a CORS error on the API call. The API is served from "
+                "a different host and returns no Access-Control-Allow-Origin "
+                "header. Produce a diagnosis and the minimal change that would "
+                "fix it, as structured output."),
+
+    # Family: decide whether a claim can be checked, and say what is missing.
+    Task("trn-checkable-1", arm="train", domain="checkability", seed=4201,
+         prompt="A vendor states their service has 99.99 percent uptime. "
+                "Determine whether that claim is checkable from the "
+                "information given, and produce a structured verdict listing "
+                "what additional information would be required to verify it."),
+    Task("trn-checkable-2", arm="train", domain="checkability", seed=4202,
+         prompt="A report states that switching to the new algorithm halved "
+                "processing time. Determine whether that claim is checkable "
+                "from the information given, and produce a structured verdict "
+                "listing what additional information would be required to "
+                "verify it."),
+    Task("trn-checkable-3", arm="train", domain="checkability", seed=4203,
+         prompt="A summary states that most users prefer the redesigned "
+                "layout. Determine whether that claim is checkable from the "
+                "information given, and produce a structured verdict listing "
+                "what additional information would be required to verify it."),
+
+    # Family: count arrangements under stated constraints.
+    Task("trn-enumerate-1", arm="train", domain="enumeration", seed=4301,
+         prompt="Four books are placed on a shelf. The dictionary must not be "
+                "at either end. Determine how many arrangements are possible "
+                "and produce the count with your reasoning as structured "
+                "output."),
+    Task("trn-enumerate-2", arm="train", domain="enumeration", seed=4302,
+         prompt="Five runners finish a race with no ties. The runner in red "
+                "finishes ahead of the runner in blue. Determine how many "
+                "finishing orders are possible and produce the count with your "
+                "reasoning as structured output."),
+    Task("trn-enumerate-3", arm="train", domain="enumeration", seed=4303,
+         prompt="Three couples are seated in a row of six chairs. Each couple "
+                "must sit together. Determine how many seatings are possible "
+                "and produce the count with your reasoning as structured "
+                "output."),
+
+    # Family: plan work against a stated rate limit, with a worst case.
+    Task("trn-ratelimit-1", arm="train", domain="rate_limited_plan", seed=4401,
+         prompt="A mail service accepts 20 messages per minute and a campaign "
+                "must send 4,000 messages. Produce a sending strategy that "
+                "stays within the limit, and state its worst-case duration."),
+    Task("trn-ratelimit-2", arm="train", domain="rate_limited_plan", seed=4402,
+         prompt="A geocoding service allows 5 lookups per second and a batch "
+                "of 90,000 addresses must be resolved. Produce a lookup "
+                "strategy that stays within the limit, and state its "
+                "worst-case duration."),
+    Task("trn-ratelimit-3", arm="train", domain="rate_limited_plan", seed=4403,
+         prompt="A build farm runs at most 4 jobs concurrently and each job "
+                "takes 6 minutes. 50 jobs are queued. Produce a scheduling "
+                "strategy that respects the concurrency limit, and state its "
+                "worst-case duration."),
+
+    # Family: map inconsistent names onto a canonical set.
+    Task("trn-normalise-1", arm="train", domain="normalisation", seed=4501,
+         prompt="Three exports label the same field Order No, order_number "
+                "and OrderNum. Produce a normalisation mapping onto a single "
+                "canonical name and a summary of how many source fields map "
+                "onto each canonical field."),
+    Task("trn-normalise-2", arm="train", domain="normalisation", seed=4502,
+         prompt="A survey records country as USA, U.S.A., United States and "
+                "us. Produce a normalisation mapping onto a single canonical "
+                "value and a summary of how many source values map onto each "
+                "canonical value."),
+    Task("trn-normalise-3", arm="train", domain="normalisation", seed=4503,
+         prompt="A log file records severity as ERR, error, Error and E. "
+                "Produce a normalisation mapping onto a single canonical level "
+                "and a summary of how many source levels map onto each "
+                "canonical level."),
+]
+
 # --- held out --------------------------------------------------------------
 #
 # PRD acceptance criterion 2: a task from this list, never seen during
@@ -117,12 +229,20 @@ def suite(*, arms: str = "both", include_holdout: bool = False) -> list[Task]:
 
     Holdout tasks are opt-in rather than default, so a routine `swarmd eval`
     cannot silently consume the one set reserved for acceptance.
+
+    `train` is its own arm and is NEVER part of `both` (ADR-014). A session
+    builds a library from it; an eval measures over `public` and `custom`,
+    which that library has not seen. Folding it into `both` would turn every
+    later measurement into a memorisation check, and would do it silently --
+    which is why the separation lives in the data rather than in a convention.
     """
     tasks: list[Task] = []
     if arms in {"both", "public"}:
         tasks += PUBLIC
     if arms in {"both", "custom"}:
         tasks += CUSTOM
+    if arms == "train":
+        tasks += TRAIN
     if include_holdout:
         tasks += HOLDOUT
     return tasks

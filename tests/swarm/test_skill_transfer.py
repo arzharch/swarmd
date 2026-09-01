@@ -551,3 +551,137 @@ def test_the_shape_of_a_task_is_never_stored_as_its_text(library):
     stored = json.dumps(skill.to_dict())
     assert "pens" not in stored
     assert "1.25" not in stored
+
+
+# --- evidence has to be able to accumulate (ADR-014) -----------------------
+
+
+def test_the_same_approach_worded_differently_is_one_skill(tmp_path):
+    """The first of two reasons nothing ever reached the approval queue.
+
+    `make_skill_id` hashes the instruction TEXT, and the instruction is written
+    by a model, so the same approach distilled from two runs came back phrased
+    differently and minted a second record starting again from one piece of
+    evidence. `promotable` wants two distinct shapes, so the queue stayed
+    empty, the library never held an approved skill, and the treatment arm of
+    every ablation had nothing to retrieve.
+    """
+    library = SkillLibrary(str(tmp_path / "skills.json"))
+
+    first = library.propose(
+        name="approach: produce diagnosis, minimal_fix",
+        task_pattern="determine why the slot_term failed and state the change",
+        instruction="Name the mechanism that fails, then the smallest edit.",
+        evidence_task="shape-permissions",
+    )
+    second = library.propose(
+        name="approach: produce diagnosis, minimal_fix",
+        task_pattern="determine why the slot_term failed and state the change",
+        instruction="State the failing mechanism first, then the minimal edit.",
+        evidence_task="shape-timezones",
+    )
+
+    assert second.skill_id == first.skill_id, "one approach, one record"
+    assert len(library.all()) == 1
+    assert set(second.evidence_tasks) == {"shape-permissions", "shape-timezones"}
+    assert second.promotable, "two distinct shapes is exactly what the bar asks"
+
+
+def test_merging_keeps_the_instruction_that_was_actually_stored(tmp_path):
+    """`skill_id` still addresses the CONTENT, so a record verifies against its
+    own hash. The second wording is discarded, not blended in -- blending model
+    text is how a library fills with advice nobody wrote."""
+    library = SkillLibrary(str(tmp_path / "skills.json"))
+    first = library.propose(
+        name="approach: produce total",
+        task_pattern="add the slot_term items",
+        instruction="Sum the line items and round once at the end.",
+        evidence_task="shape-aaa",
+    )
+    merged = library.propose(
+        name="approach: produce total",
+        task_pattern="add the slot_term items",
+        instruction="Add each line, rounding only the final figure.",
+        evidence_task="shape-bbb",
+    )
+    assert merged.instruction == first.instruction
+
+
+def test_two_steps_with_the_same_shape_and_checks_are_one_approach(tmp_path):
+    """The accepted cost of ADR-014, asserted so it stays deliberate.
+
+    Identity is the artifact shape plus the kinds of check that graded it. Two
+    steps of one task that produce the same shape under the same checks
+    therefore merge, and the instruction kept is the one proposed first.
+
+    Why that is the right trade: the alternative is including the plan step,
+    and plan steps are synthesised per task. A key containing one can only ever
+    match another proposal from the SAME task -- which is exactly the evidence
+    the promotion bar refuses to count -- so it can never accrue the second
+    shape, at any sample size. Those two records were also already competing
+    for the same retrieval slot, because `_terms` indexes on the same name.
+    """
+    library = SkillLibrary(str(tmp_path / "skills.json"))
+    library.propose(
+        name="approach: produce dates, amounts",
+        task_pattern="identify every calendar date in the slot_term json_parses",
+        instruction="Scan in document order and keep the original spelling.",
+        evidence_task="shape-extract",
+    )
+    library.propose(
+        name="approach: produce dates, amounts",
+        task_pattern="identify every monetary amount in the slot_term json_parses",
+        instruction="Keep the currency symbol with the figure it belongs to.",
+        evidence_task="shape-extract",
+    )
+
+    assert len(library.all()) == 1
+    assert library.all()[0].instruction.startswith("Scan in document order")
+
+
+def test_work_graded_a_different_way_is_a_different_approach(tmp_path):
+    """What still discriminates once the step text is out of the key.
+
+    Producing an artifact that must parse as JSON is not the same approach as
+    producing one checked only for being non-empty, even under the same name.
+    """
+    library = SkillLibrary(str(tmp_path / "skills.json"))
+    library.propose(
+        name="approach: produce verdict",
+        task_pattern="decide whether the slot_term holds json_parses contains_all",
+        instruction="State the verdict first, then each unmet requirement.",
+        evidence_task="shape-claim",
+    )
+    library.propose(
+        name="approach: produce verdict",
+        task_pattern="decide whether the slot_term holds output_nonempty",
+        instruction="Answer in prose; there is no structure to satisfy.",
+        evidence_task="shape-claim",
+    )
+
+    assert len(library.all()) == 2
+
+
+def test_a_retired_approach_is_not_revived_by_re_proposing_it(tmp_path):
+    """Pruning is a decision. A re-proposal must not undo it through the back
+    door of evidence accrual, leaving `retired_reason` describing a live
+    skill."""
+    library = SkillLibrary(str(tmp_path / "skills.json"))
+    original = library.propose(
+        name="approach: produce total",
+        task_pattern="add the slot_term items",
+        instruction="Sum the line items and round once at the end.",
+        evidence_task="shape-aaa",
+    )
+    library.reject(original.skill_id, actor="reviewer", reason="failed six times")
+
+    fresh = library.propose(
+        name="approach: produce total",
+        task_pattern="add the slot_term items",
+        instruction="Add each line, rounding only the final figure.",
+        evidence_task="shape-bbb",
+    )
+
+    assert fresh.skill_id != original.skill_id
+    retired = library.get(original.skill_id)
+    assert retired is not None and retired.retired

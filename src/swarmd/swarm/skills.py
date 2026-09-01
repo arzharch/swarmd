@@ -216,6 +216,56 @@ def make_skill_id(name: str, instruction: str) -> str:
     return hashlib.sha256(payload.encode()).hexdigest()[:12]
 
 
+def approach_key(name: str, task_pattern: str) -> str:
+    """Identity for "the same approach", independent of wording and of the plan.
+
+    WHY NOT `make_skill_id`. That hashes the instruction TEXT, and the
+    instruction is written by a model: the same approach distilled from two
+    runs comes back phrased differently every time. Each phrasing minted a new
+    record starting again from one piece of evidence, so `promotable` -- which
+    wants MIN_DISTINCT_TASKS distinct task shapes -- was unreachable, nothing
+    was ever queued for review, nothing was ever approved, and the treatment
+    arm of every ablation had an empty library to retrieve from.
+
+    WHY THE PLAN STEP IS NOT IN THE KEY, which is the part that took a
+    measurement to see. `task_pattern` is the abstracted step plus the kinds of
+    check that graded it, and the step comes from a plan synthesised for one
+    task. Steps therefore never recur across tasks: a key containing one can
+    only ever match another proposal from the SAME task, which is precisely the
+    evidence the bar refuses to count. Measured on a real session -- four
+    proposals from one task, four distinct step texts, and no cross-task match
+    available at any sample size.
+
+    What does recur is the kind of work: the artifact shape the step produced
+    and the kinds of check that graded it. Both are already in `name` and in
+    the tail of `task_pattern`, both are abstracted, and neither carries a
+    literal. That is the identity here.
+
+    THE COST, stated because it is real: two different steps of one task merge
+    when they produce the same artifact shape under the same checks, and the
+    instruction kept is the one proposed first. Those two records were already
+    competing for the same retrieval slot -- `_terms` indexes on the same name
+    -- so the library was not distinguishing them either. The human gate and
+    success-rate pruning are what choose between approaches; this only decides
+    what counts as one.
+
+    Deterministic: sha256 over sorted unique terms and a closed check-kind
+    vocabulary. No threshold, no model in the path.
+
+    Necessary and NOT sufficient. Evidence only accumulates when two DIFFERENT
+    tasks propose the same approach, which needs a corpus whose tasks share
+    output shapes -- the `train` arm. See ADR-014.
+    """
+    from swarmd.swarm.criteria import CHECK_KINDS
+
+    shape = sorted(set(tokenize(index_text(name))))
+    # The closed vocabulary, taken from wherever it appears in the pattern.
+    # Everything else in the pattern is the per-task step, deliberately dropped.
+    graded_by = sorted({t for t in tokenize(task_pattern) if t in CHECK_KINDS})
+    payload = f"{' '.join(shape)}|{' '.join(graded_by)}"
+    return hashlib.sha256(payload.encode()).hexdigest()[:12]
+
+
 # A distilled instruction has to be an INSTRUCTION. The distiller reads model
 # output, and model output is not trustworthy input just because this system
 # produced it -- the library once filled with entries whose "instruction" was a
@@ -504,6 +554,12 @@ class SkillLibrary:
         # raw task here is the memorisation channel this library used to have.
         pattern = index_text(task_pattern.strip())
         existing = self._skills.get(skill_id)
+        if existing is None:
+            # Same approach, different words. The evidence belongs on the
+            # record that already holds some, rather than on a second copy
+            # starting again from one shape -- which is what put `promotable`
+            # out of reach entirely (ADR-014).
+            existing = self._same_approach(name, pattern)
         if existing is not None:
             if self._add_evidence(existing, evidence_task):
                 self.save()
@@ -535,6 +591,21 @@ class SkillLibrary:
         if self._add_evidence(skill, task_fingerprint):
             self.save()
         return skill
+
+    def _same_approach(self, name: str, pattern: str) -> Skill | None:
+        """An existing, non-retired record for this approach, or None.
+
+        Retired records are skipped deliberately: reviving a pruned approach
+        through the back door of a re-proposal would undo a decision somebody
+        made, and `retired_reason` would then describe a live skill.
+        """
+        key = approach_key(name, pattern)
+        for skill in self._skills.values():
+            if skill.retired:
+                continue
+            if approach_key(skill.name, skill.task_pattern) == key:
+                return skill
+        return None
 
     @staticmethod
     def _add_evidence(skill: Skill, task_fingerprint: str) -> bool:

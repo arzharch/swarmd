@@ -57,6 +57,10 @@ _CONFIG_NOTES = (_NOTE_THRESHOLDS, _NOTE_SECRETS, _NOTE_SCOPE)
 
 
 class EvalRequest(BaseModel):
+    # `train` is deliberately absent, and its absence is the control. A
+    # measurement over the tasks a library was built from is memorisation, and
+    # the way to stop that is to make it unexpressible rather than discouraged
+    # (ADR-014). `SessionRequest.arms` accepts it; this does not.
     arms: str = Field(default="both", pattern="^(both|public|custom)$")
     repeats: int = Field(default=5, ge=1, le=20)
     profile: str = "smoke"
@@ -70,11 +74,16 @@ class SessionRequest(BaseModel):
     # measuring learning: a skill distilled from `pub-extract-1` and retrieved
     # while solving `pub-extract-1` again is memorisation, and it moves the
     # treatment arm for a reason that will not survive a task the library has
-    # never seen. `public` and `custom` are disjoint, so training on one and
-    # evaluating on the other is a real split using sets that already exist.
+    # never seen.
+    #
+    # `train` is the set built for this: five families of three, where members
+    # of a family share an output shape so an approach can accrue evidence
+    # from two DISTINCT task shapes and clear the promotion bar (ADR-014). It
+    # is not evaluable -- `EvalRequest.arms` does not accept it.
+    #
     # The default stays "both" because a session is also just a way to build a
     # library for use, and that is the honest default for that purpose.
-    arms: str = Field(default="both", pattern="^(both|public|custom)$")
+    arms: str = Field(default="both", pattern="^(both|public|custom|train)$")
     tasks: int = Field(default=10, ge=1, le=200)
     profile: str = "smoke"
     consolidate_every: int = Field(default=5, ge=1, le=50)

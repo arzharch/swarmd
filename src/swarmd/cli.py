@@ -274,11 +274,23 @@ def main(argv: list[str] | None = None) -> int:
         "rate. Off by default: a patched prompt is a confound, and an arm must "
         "be able to run with the stock prompt and know that is what it ran.",
     )
+    swarm_session.add_argument(
+        "--arms", default="both", choices=["both", "public", "custom", "train"],
+        help="which tasks to learn from. `train` is the set built for this: "
+        "five families of three, where members of a family share an output "
+        "shape so an approach can accrue evidence from two DISTINCT task "
+        "shapes and clear the promotion bar. It is not evaluable -- `eval "
+        "--arms` does not accept it, because measuring over the tasks a "
+        "library was built from is memorisation (ADR-014).",
+    )
     swarm_session.add_argument("--json", action="store_true")
 
     ev = sub.add_parser("eval", help="run the evaluation suite with a control arm")
     ev.add_argument(
         "--arms", default="both", choices=["both", "public", "custom"],
+        # `train` is absent on purpose, and its absence is the control: a
+        # measurement over the tasks a library was built from is memorisation,
+        # so it is made unexpressible rather than discouraged (ADR-014).
         help="public answers 'is this self-graded?'; custom answers 'does it "
         "handle what it was not built for?'. Reported separately so a strong "
         "result on one cannot hide a weak result on the other.",
@@ -972,7 +984,7 @@ async def _session_command(args: argparse.Namespace) -> int:
         result = await run.run(task)
         return result, run.report(result)
 
-    tasks = [t.prompt for t in suite(arms="both")][: args.tasks]
+    tasks = [t.prompt for t in suite(arms=args.arms)][: args.tasks]
     if len(tasks) < args.tasks:
         # Cycle rather than silently running fewer: a session of 40 that ran 10
         # would report a curve over a quarter of the requested evidence.
