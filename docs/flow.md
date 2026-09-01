@@ -2898,11 +2898,17 @@ unseen task end to end. It does not reliably solve one.
 - [x] Profiles sized to the measured budget; any agent count honoured exactly,
       with a preflight that prices it before the run starts
 - [x] Distillation records an approach rather than the answer it produced
-- [ ] Volume: n=5 gives CI[0.00,0.60]. 50-200 tasks before 20% is a property
+- [ ] Volume, and it is STRUCTURAL not statistical: the suite needs task
+      FAMILIES sharing an output shape, or no skill ever reaches two
+      distinct shapes and the library can never promote (measured
+      2026-09-01: 22 skills, 5 shapes, 0 promotable)
 - [x] The ablation actually compares two different things (it did not before)
 - [x] pass@k and node pass rate reported and traceable
 - [ ] Re-measure learning with the node-anchor fix: blocked on daily quota
-- [ ] Volume: n=5 gives CI[0.00,0.60]. 50-200 tasks before 20% is a property
+- [ ] Volume, and it is STRUCTURAL not statistical: the suite needs task
+      FAMILIES sharing an output shape, or no skill ever reaches two
+      distinct shapes and the library can never promote (measured
+      2026-09-01: 22 skills, 5 shapes, 0 promotable)
 - [ ] The learning curve: 50-200 tasks with the control arm, once runs pass
 - [ ] The learning curve: 50-200 tasks with the control arm, then and only then
       generate BENCHMARKS.md and make an improvement claim
