@@ -1836,18 +1836,36 @@ class SwarmRun:
             # rather than inventing a method nobody demonstrated.
             return f"When a step calls for this: {what}"
 
-        fields = ", ".join(f"{k} ({v})" for k, v in sorted(shapes.items()))
-        # No count of the successes. It was a digit in the instruction that had
-        # nothing to do with the task, and the shared-literal check in
-        # `validate_instruction` compares whole literals -- so a task that
-        # happened to mention the same small number would have had a correct
-        # skill refused for a leak that was never there.
+        # THE TYPES, NOT THE KEY NAMES. Artifact keys are chosen by the worker
+        # for the task in front of it, so `most_users`, `preference_threshold`
+        # and `invalid_arrangements_left_end` are as task-specific as any
+        # literal -- and they used to be written verbatim into advice offered
+        # to every later task. Measured on a real library: 17 of 31 live
+        # records carried task-derived key names, more than any other leak.
+        #
+        # They are also redundant. The worker is shown the frozen criterion's
+        # exact requirements (`Criterion.as_requirements`), so it already knows
+        # which keys IT must produce. A skill naming a different task's keys
+        # can only agree with that by accident or disagree with it by default,
+        # and disagreeing is how a correct answer lands under a key nothing is
+        # looking for.
+        #
+        # What does transfer is that the work produced a structured object of
+        # roughly this shape -- so the count and the types stay, and the names
+        # go.
+        # AND NO DIGITS, which a first attempt at this got wrong. A field
+        # COUNT reads as harmless and is not: `validate_instruction` compares
+        # whole literals against the source task, so an instruction saying
+        # "3 fields" distilled from a task about "3 pens" is refused as a leak
+        # -- and every skill from that run is lost. The same trap the removed
+        # success-count comment describes, walked into from the other side.
+        kinds = ", ".join(sorted(set(shapes.values())))
         return (
             f"When a step calls for this: {what} "
-            f"Produce a JSON object with these fields: {fields}. "
-            f"Derive every value from the task at hand -- this records the "
-            f"shape that satisfied the criterion, not the answer, which will "
-            f"differ."
+            f"Produce a JSON object whose values are of these kinds: {kinds}. "
+            f"Take the KEY NAMES from your own criterion, never from here -- "
+            f"this records the shape that satisfied a different task, and its "
+            f"keys and its values will both differ from yours."
         )
 
     def _distil_name(self, shapes: dict[str, str], kinds: list[str]) -> str:

@@ -827,7 +827,12 @@ def test_a_distilled_skill_records_an_approach_not_an_answer():
 
     assert "94.3" not in instruction, "the answer leaked into the skill"
     assert "82.1" not in instruction
-    assert "accuracy (float)" in instruction
+    # The key names are deliberately absent: they belong to the task this was
+    # distilled from, and the worker reading this skill is shown its OWN
+    # criterion's required keys. Naming a different set is how correct data
+    # ends up under keys nothing is looking for.
+    assert "accuracy" not in instruction
+    assert "float" in instruction
     assert "pull the numbers out" in instruction
     # No node name: plan node names are regenerated every run, so advice
     # anchored to one describes a step the reader does not have.

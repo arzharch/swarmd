@@ -153,9 +153,21 @@ async def test_a_skill_learned_from_pens_carries_none_of_the_pens(library):
     assert "3" not in skill.instruction
     assert "1.25" not in skill.instruction
     assert "pens" not in skill.instruction
-    # And what SHOULD survive: the method, and the shape it produced.
+    # And what SHOULD survive: the method.
     assert "total cost" in skill.instruction
-    assert "total_cost (float)" in skill.instruction
+
+    # THE KEY NAMES DO NOT SURVIVE, which reverses what this test used to
+    # assert. `total_cost` and `unit_price` are the keys ONE task's worker
+    # chose; measured on a real library, 17 of 31 live records carried key
+    # names taken straight from their source task -- a larger leak than any
+    # other. They are redundant as well as harmful: the worker is shown its own
+    # frozen criterion's exact requirements, so it already knows which keys it
+    # must produce, and a skill naming different ones can only agree by
+    # accident. What transfers is that the work produced a structured object,
+    # and of what kinds of value.
+    assert "total_cost" not in skill.instruction
+    assert "unit_price" not in skill.instruction
+    assert "float" in skill.instruction
 
 
 async def test_a_skill_learned_from_pens_is_retrieved_for_pencils(library):

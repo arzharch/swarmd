@@ -142,10 +142,24 @@ def graded_block(criterion: Criterion | None) -> str:
 
 
 def skills_block(skills: Sequence[Skill]) -> str:
+    """The retrieved advice, and NOT the label it is filed under.
+
+    A skill's name is derived from the artifact keys of the task it came from
+    -- `approach: produce method, total_cost, unit_price`. That is the right
+    identity for the library, which has to recognise the same approach across
+    runs, and it is exactly the wrong thing to put in a worker's prompt: the
+    keys belong to another task, while this worker's keys are specified by its
+    own frozen criterion a few lines above. Naming a different set invites the
+    failure `graded_block` exists to prevent, where correct data is emitted
+    under keys nothing is looking for.
+
+    The instruction opens "When a step calls for this:", so it introduces
+    itself; the label was never carrying meaning the worker needed.
+    """
     if not skills:
         return ""
     return "APPROACHES THAT WORKED BEFORE (use if applicable):\n" + "\n".join(
-        f"- {s.name}: {s.instruction}" for s in skills
+        f"- {s.instruction}" for s in skills
     )
 
 
