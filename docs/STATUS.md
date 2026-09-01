@@ -305,24 +305,71 @@ five tasks", not "skills do not help" -- and the honest fix for that is more
 training volume, which is now finally worth spending.
 
 **The ablation was started and stopped at cell 5 of 30, on purpose.** A free
-check first: neither approved skill retrieves for the task it was built for.
+check first: neither approved skill retrieved for the task it was built for.
 Over both the bare prompt and the task-plus-step query `worker.py` actually
-issues, the five custom tasks draw 0, 0, 0, 1 and 0 hits -- and the single hit
-is `approach: produce diagnosis, fix` offered to the colour-ordering puzzle,
-not to the ModuleNotFoundError diagnosis.
+issues, the five custom tasks drew 0, 0, 0, 1 and 0 hits -- and the single hit
+was `approach: produce diagnosis, fix` offered to the colour-ordering puzzle.
+The cause was index size: `_idf` weights terms across APPROVED skills, and two
+of them yield two distinct weights over 32 terms, so ranking collapses to raw
+term overlap.
 
-The cause is index size rather than skill quality. `_idf` weights terms across
-APPROVED skills; with two of them it yields two distinct values over 32 terms,
-so ranking collapses to raw term overlap. An experiment run on that index
-cannot discriminate, and its null was knowable in advance -- so it was stopped
-rather than allowed to spend the ~500 requests the day had left.
+#### And then the loop answered the question without the ablation
 
-**What is left of G-4, precisely.** Not "does self-learning work", and no
-longer "is there quota". It is: *the library has to clear the size at which a
-retrieval index can rank at all.* Two approved skills is demonstrably below it.
-The corpus is now eight families rather than five for exactly that reason, and
-the next step is a session over it followed by the ablation -- one day's quota,
-one command each.
+**The economy pruned both approved skills for failing.** They were retrieved
+during training and scored:
+
+| approach | successes / uses | |
+|---|---|---|
+| `produce diagnosis, fix` | 0 / 26 | 0% |
+| `produce duration_minutes, strategy` | 5 / 27 | 19% |
+
+Both under the consolidator's 30% floor, both retired automatically with the
+reason written to the record. Propose, gate, retrieve, measure, prune --
+running end to end and reaching a verdict unprompted. It is the first
+empirical statement this project has made about whether its own skills help:
+**retrieved 53 times, succeeded 5.**
+
+**The review then said why.** Four approaches later cleared the evidence bar,
+and three carried their own source task:
+
+- `produce reconciliation`, generality **1.00** -- the top score -- instructs
+  every future run to emit `stock_count` and `ledger_count`, the stock task's
+  vocabulary welded into identifiers where abstraction could not see it.
+- `produce verdict`, 0.86, is advice about how UPTIME is measured. That is one
+  task's subject matter, not a method for judging whether a claim is checkable.
+- `produce count, reasoning`, 0.57, ends `<NUMBER>! = 6`. The factorial's
+  argument abstracted; its result did not. `validate_instruction` cannot catch
+  this: `shared_literals` compares against the TASK, and 6 never appeared in
+  the task -- it was computed.
+
+One survived: `produce count`, three shapes, no literals, an actual method.
+**One clean skill in four.**
+
+So the 0/26 is not mysterious. A worker handed advice naming another task's
+keys, domain, or answer is worse off than one handed nothing, which is exactly
+what the retrieval threshold's own docstring predicts.
+
+**Fixed:** the identifier leak. `strip_source_terms` now splits on `_`, `-` and
+camelCase, stripping a token when every part came from the task and not all are
+method words -- so `stock_count` collapses while `sort_by_price` survives.
+**Not fixed, and now specified with examples:** domain content presented as
+method, and a computed result that never appeared in the task.
+
+**Also corrected, by measurement:** the approach identity included the
+criterion's check kinds, but the criterion is authored fresh per run (ADR-009)
+so its check set drifts between two runs of the same work -- reintroducing the
+fragmentation the key exists to remove. On the 38-record library: name plus
+check kinds gave 38 approaches and 3 clearing the bar; the name alone gave 34
+and 5. Keyed on artifact shape alone now.
+
+#### What G-4 is, as of this measurement
+
+Not "does self-learning work" -- the loop demonstrably runs and returns a
+verdict. Not corpus size, and not quota. It is **distillation quality**, with a
+rate attached: three of four promoted approaches carried their source task, and
+the skills that did reach retrieval scored 5 successes in 53 uses. That is a
+specific piece of work with worked examples attached, which is a considerably
+better place to stand than "no measured improvement".
 
 **The re-measurement did not run**, because the day's provider budget was spent
 on the two that did:
