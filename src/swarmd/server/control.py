@@ -214,6 +214,11 @@ def register(
             raise HTTPException(400, f"unknown profile; known: {sorted(PROFILES)}")
         if request.ceiling_usd > CEILING_MAX:
             raise HTTPException(400, f"ceiling exceeds maximum {CEILING_MAX}")
+        # Refused here rather than an hour later, because the sweep this would
+        # start spends real provider quota to produce a number about nothing.
+        unmeasurable = _why_the_arms_would_match(app)
+        if unmeasurable:
+            raise HTTPException(422, unmeasurable)
 
         job = registry.submit(
             JobKind.EVAL,
@@ -325,18 +330,63 @@ def register(
 # --- job bodies ------------------------------------------------------------
 
 
+def _why_the_arms_would_match(app: FastAPI) -> str:
+    """Empty string when an eval can actually measure something.
+
+    The treatment arm is "the same run, with skill retrieval". With no library
+    to retrieve from, `SwarmRun` sets `self.skills` to None in both arms and
+    the ablation compares a configuration against itself -- which reports "no
+    measured improvement" for a reason that has nothing to do with skills, and
+    is indistinguishable in the output from the real thing.
+    """
+    from swarmd.swarm.skills import SkillLibrary
+
+    path = app.state.skills_path
+    if not path:
+        return (
+            "this control plane was started without --skills / "
+            "SWARMD_SKILLS_PATH, so the treatment arm has nothing to retrieve "
+            "from and both arms would run identical code. The result would be "
+            "a non-result that looks like a measurement."
+        )
+    try:
+        approved = len(SkillLibrary(path).approved())
+    except Exception as exc:  # noqa: BLE001 - any unreadable library is fatal here
+        return f"the skill library at {path} cannot be read: {exc}"
+    if approved == 0:
+        return (
+            f"the skill library at {path} has no approved skills, so both arms "
+            f"would run identical code. Build one first: swarmd swarm session "
+            f"--skills {path}, then approve what it proposes."
+        )
+    return ""
+
+
 def _eval_runner(app: FastAPI, request: EvalRequest, registry: JobRegistry) -> Any:
     async def run(job: Any) -> dict[str, Any]:
         from examples.tasks.suite import suite
         from swarmd.harnesses.sandbox import SandboxHarness
         from swarmd.swarm.evaluate import Evaluator
         from swarmd.swarm.run import SwarmRun
+        from swarmd.swarm.skills import SkillLibrary
 
         pool = app.state.provider_factory()
         sandbox = SandboxHarness()
         tasks = suite(arms=request.arms, include_holdout=request.holdout)
         registry.progress(job, 0, len(tasks) * request.repeats * 2)
         completed = 0
+
+        # THE TREATMENT ARM NEEDS A LIBRARY. Without one, `use_skills=True`
+        # sets `self.skills = skills if use_skills else None` to None in BOTH
+        # arms and the ablation compares a configuration against itself. The
+        # CLI has passed a library since that was found; this path never did,
+        # so every eval started from the dashboard was a null-result generator
+        # that looked exactly like a measurement.
+        library = (
+            SkillLibrary(app.state.skills_path) if app.state.skills_path else None
+        )
+        # `/api/evals` refuses to start a sweep whose arms would match, so by
+        # here the library exists and has something approved in it.
 
         async def run_factory(task: Any, use_skills: bool, seed: int) -> Any:
             nonlocal completed
@@ -345,6 +395,7 @@ def _eval_runner(app: FastAPI, request: EvalRequest, registry: JobRegistry) -> A
                 profile=request.profile,
                 ceiling_usd=request.ceiling_usd,
                 use_skills=use_skills,
+                skills=library,
                 sandbox=sandbox,
                 run_id=f"{job.job_id}-{task.task_id}-{seed}-"
                 f"{'t' if use_skills else 'c'}",

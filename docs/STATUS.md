@@ -1,7 +1,7 @@
 # Status
 
-**Generated:** 2026-08-28 · **Commit:** `aefe50b` · **Tests:** 803 passed, 9 skipped
-**Gates:** ruff clean · mypy clean (54 files) · frontend typechecks and builds ·
+**Generated:** 2026-09-01 · **Commit:** `ceb4a71` · **Tests:** 1,250 passed, 9 skipped
+**Gates:** ruff clean · mypy clean (61 files) · frontend typechecks and builds ·
 kernel chaos integrity at kill-rate 0.9 · red-team gate passes with five seeded rogues ·
 image builds and serves · manifests validate against real k8s schemas · rollback exercised on a cluster
 
@@ -32,7 +32,7 @@ cd frontend && npm run dev
 | Component | Port | Notes |
 |---|---|---|
 | Dashboard | **3001** | 3000 occupied by another app |
-| Control plane | 8000 | `SWARMD_API` retargets the dev proxy |
+| Control plane | 8000 | `SWARMD_API` retargets the dev proxy. Windows reserves port blocks for Hyper-V; if bind fails with `[winerror 10013]`, pick a port outside `netsh int ipv4 show excludedportrange protocol=tcp` and point `SWARMD_API` at it |
 | Postgres | **5435** | 5434 occupied by `platform_postgres` |
 | Redis | 6379 | quota only; deliberately not persisted |
 
@@ -52,7 +52,7 @@ The CLI is the same operations without a browser, not a separate product.
 | FR-5 | Budget ledger | **DONE** | `ledger.py`. Append-only, fsync per row, sums never counters, prices as data, hard ceiling at the harness boundary ([ADR-007](adr/ADR-007.md)) |
 | FR-6 | Red-team organ | **DONE** | Five detectors, containment, audit — and `seed_rogues` injects real misbehaviour into a real run, requiring each pattern to be caught **by its own detector** ([ADR-010](adr/ADR-010.md)) |
 | FR-7 | Provider pool router | **DONE** | `router/pool.py` + `router/quota.py`. Five providers, per-credential quota, empirical 429 discovery ([ADR-008](adr/ADR-008.md)), Redis coordination |
-| FR-8 | Live UI | **DONE** | Next.js, six views, websocket only, no fixture path (CI-enforced). Agent count and rogue seeding are controls, not config files |
+| FR-8 | Live UI | **DONE** | Next.js, six views, websocket only, no fixture path (CI-enforced). Agent count and rogue seeding are controls, not config files. Every operation the CLI performs is reachable from it: start a run, read the artifacts it produced, run an eval or a session, probe providers, approve a skill, resume a run parked on a spent ration |
 | FR-9 | Eval harness | **DONE** | `swarm/evaluate.py`. Both arms, bootstrap CIs, paired on (task, seed), refuses a claim without a control |
 | FR-10 | Recovery | **DONE** | Kernel at kill-rate 0.9, byte-identical. Swarm workers checkpoint at `generate/materialise/grade` boundaries; a killed agent's replacement resumes, verified by **counting provider calls** across a kill rather than by comparing output |
 
@@ -83,7 +83,7 @@ The CLI is the same operations without a browser, not a separate product.
 | 4 | All five seeded rogues detected and contained | **PASS** — four caught by their own detector; one blocked by the frozen criterion before any detector saw it, reported as its own outcome rather than counted as a catch |
 | 5 | Full run at or under $0.05, itemised by provider | **PASS structurally** — ceiling enforced and itemised; unverified against paid traffic (G-4) |
 | 6 | Eval shows treatment vs control with CIs on both arms | **PASS** — verified over HTTP: 10 runs, both arms, "no measured improvement" |
-| 7 | Frontend replays a live run, zero mock data paths | **PASS** — three CI guards enforce the no-fixture rule |
+| 7 | Frontend replays a live run, zero mock data paths | **PASS** — three CI guards enforce the no-fixture rule. The dashboard also *acts* now: it sent no operator token until 2026-09-01, so on a gated control plane it rendered live data and answered 401 to every button |
 | 8 | Kill mid-run, restart, state intact | **PASS** — approvals, ledger, skills and criteria survive; the run resumes from the killed agent's checkpoint |
 
 ---

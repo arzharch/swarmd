@@ -21,11 +21,38 @@ from tests.server.test_app import FakeProvider
 
 
 @pytest.fixture
-def client(tmp_path):
-    app = create_app(
-        provider_factory=FakeProvider,
-        skills_path=str(tmp_path / "skills.json"),
+def skills_path(tmp_path):
+    """A library with something approved in it.
+
+    An eval whose treatment arm has nothing to retrieve compares a
+    configuration against itself, so `/api/evals` refuses to start one. A
+    fixture with an empty library would therefore be testing the refusal in
+    every test that only wants a sweep.
+    """
+    from swarmd.swarm.skills import SkillLibrary
+
+    path = tmp_path / "skills.json"
+    library = SkillLibrary(str(path))
+    skill = library.propose(
+        name="extract amounts",
+        task_pattern="extract every monetary amount",
+        instruction="Read the amounts in document order and keep the currency.",
     )
+    library.approve(skill.skill_id, actor="test")
+    return str(path)
+
+
+@pytest.fixture
+def client(skills_path):
+    app = create_app(provider_factory=FakeProvider, skills_path=skills_path)
+    with TestClient(app) as c:
+        yield c
+
+
+@pytest.fixture
+def client_without_skills(tmp_path):
+    """A control plane started with no library at all, which is the default."""
+    app = create_app(provider_factory=FakeProvider)
     with TestClient(app) as c:
         yield c
 
@@ -317,3 +344,53 @@ def test_starting_an_eval_requires_the_operator_token(tmp_path):
     app = create_app(provider_factory=FakeProvider, api_token="secret-token")
     with TestClient(app) as c:
         assert c.post("/api/evals", json={"repeats": 1}).status_code == 401
+
+
+def test_an_eval_refuses_to_run_when_both_arms_would_be_identical(
+    client_without_skills,
+):
+    """The failure this endpoint could not previously express.
+
+    `SwarmRun` sets `self.skills = skills if use_skills else None`, so with no
+    library BOTH arms get None and the ablation compares a configuration
+    against itself. It reports "no measured improvement" -- the same words the
+    real experiment produces -- after spending a sweep's worth of provider
+    quota. The CLI has passed a library since this was found; this path never
+    did, so every eval started from the dashboard was a null-result generator
+    that read as a measurement.
+    """
+    response = client_without_skills.post(
+        "/api/evals", json={"arms": "custom", "repeats": 1, "profile": "smoke"}
+    )
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert "identical" in detail
+    assert "--skills" in detail
+
+
+def test_an_eval_refuses_when_the_library_has_nothing_approved(tmp_path):
+    """A library file that exists but holds only unapproved proposals is the
+    same experiment as no library: nothing is retrievable."""
+    from swarmd.swarm.skills import SkillLibrary
+
+    path = tmp_path / "empty.json"
+    SkillLibrary(str(path)).propose(
+        name="unapproved", task_pattern="anything", instruction="not gated yet"
+    )
+    app = create_app(provider_factory=FakeProvider, skills_path=str(path))
+    with TestClient(app) as client:
+        response = client.post("/api/evals", json={"repeats": 1})
+    assert response.status_code == 422
+    assert "no approved skills" in response.json()["detail"]
+
+
+def test_the_eval_gives_the_treatment_arm_the_library_it_refuses_to_run_without(
+    client, skills_path
+):
+    """The refusal above is only worth having if the arm it protects actually
+    receives the library."""
+    job_id = client.post(
+        "/api/evals", json={"arms": "custom", "repeats": 1, "profile": "smoke"}
+    ).json()["job_id"]
+    body = _await_job(client, job_id, timeout=60)
+    assert body["state"] == "completed", body.get("error")
