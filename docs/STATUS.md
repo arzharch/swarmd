@@ -70,7 +70,7 @@ The CLI is the same operations without a browser, not a separate product.
 | 8 | Red-team organ | **PASS** — `--seed-rogues all` runs in CI; all five patterns handled, attribution checked |
 | 9 | Skills, economy, consolidation, curriculum, supervisor | **PASS** — library grows, human gate holds, state survives restart, supervisor patches and reverts |
 | 10 | Evaluation harness | **PASS** — both arms with CIs; BENCHMARKS.md refuses simulated data |
-| 11 | Hardening and honest documentation | **PARTIAL** — docs complete (PRR, SECURITY, SLO, RUNBOOK, CAPACITY, 13 ADRs); the acceptance run against real providers has not happened (G-4) |
+| 11 | Hardening and honest documentation | **PARTIAL** — docs complete (PRR, SECURITY, SLO, RUNBOOK, CAPACITY, 15 ADRs); the acceptance run against real providers has not happened (G-4) |
 
 ---
 
@@ -349,11 +349,23 @@ So the 0/26 is not mysterious. A worker handed advice naming another task's
 keys, domain, or answer is worse off than one handed nothing, which is exactly
 what the retrieval threshold's own docstring predicts.
 
-**Fixed:** the identifier leak. `strip_source_terms` now splits on `_`, `-` and
-camelCase, stripping a token when every part came from the task and not all are
-method words -- so `stock_count` collapses while `sort_by_price` survives.
-**Not fixed, and now specified with examples:** domain content presented as
-method, and a computed result that never appeared in the task.
+**Two of the three classes are now closed** ([ADR-015](adr/ADR-015.md)), and
+each was traced to the line that let it through rather than blamed on the
+model. The identifier leak: `strip_source_terms` splits on `_`, `-` and
+camelCase, so `stock_count` collapses while `sort_by_price` survives. The
+computed answer: the NUMBER pattern rejected any following period so that
+`1.25` would not be split, and swallowed sentence-final digits with it --
+`"the answer is 42."` yielded no literals at all. It now rejects a period only
+when it is a decimal point.
+
+**The third is not closable deterministically, and that was measured rather
+than assumed.** Domain knowledge the planner introduced -- `probes`,
+`monitoring` -- is structurally identical to `parse` and `validate` to any rule
+that does not already know the subject. A detector was built and scored against
+the four judged candidates: 0.41, 0.52, 0.35 for the rejects and 0.33 for the
+approval. That is not a threshold. What compensates instead: retrieval now
+withholds a skill that has already earned a pruning verdict, so a bad one costs
+at most `PRUNE_MIN_USES` retrievals rather than the 26 it cost here.
 
 **Also corrected, by measurement:** the approach identity included the
 criterion's check kinds, but the criterion is authored fresh per run (ADR-009)

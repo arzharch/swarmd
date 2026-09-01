@@ -3118,6 +3118,110 @@ a rate attached: three of four promoted approaches carried their source task.
 Fixing that is a specific piece of work with examples, which is a better place
 to be than "no measured improvement".
 
+## 2026-09-01 - Design fault or model fault: tracing each leak to its line
+
+The library that reached retrieval scored 5 successes in 53 uses, and three of
+the next four candidates carried their own source task. The tempting reading is
+"the model writes bad advice", and it is worth resisting: there is no prompt
+that makes a model reliably produce advice general enough for tasks it has not
+seen, and believing there is turns a fixable pipeline into a vendor problem.
+
+So each class was traced to the line that let it through. [ADR-015](adr/ADR-015.md).
+
+**`stock_count` -- an identifier naming the source task.** `strip_source_terms`
+compared WORDS against the task's vocabulary. `stock_count` is not in it;
+"stock" and "count" are. The abstraction tokenised prose and never considered
+that a writer packs two words into one identifier. **Design.** Fixed: split on
+the boundaries a writer actually put there -- `_`, `-`, camelCase -- and strip
+when every part came from the task and not all parts are method vocabulary. So
+`stock_count` collapses and `sort_by_price` survives.
+
+**`<NUMBER>! = 6` -- a computed answer.** This one is two characters. The NUMBER
+pattern ended `(?![\w.])`, rejecting a following period so `1.25` would not be
+split in half -- and rejecting the period that ends a sentence with it. A number
+in final position was invisible: `"the answer is 42."` yielded no literals at
+all. The end of a sentence is where an answer gets stated. **Design.** Fixed:
+reject a following period only when it is a decimal point.
+
+`shared_literals` could never have caught this one either, and that is worth
+saying plainly: it compares the instruction against the TASK, and a computed
+answer never appeared in the task. It was derived.
+
+**Advice about synthetic probes and real-user monitoring.** Distillation
+abstracts the PLAN STEP, and the step is prose written for one task by a planner
+that knows the domain. Abstraction removes literals and words the task used; it
+cannot remove domain knowledge the planner introduced, because "domain" is not
+a structural property. `probes` and `monitoring` look exactly like `parse` and
+`validate` to any rule that does not already know the subject. **Design, and
+the deepest of the three.**
+
+**Zero of three were model faults.** In each case the model did what it was
+asked and the pipeline failed to enforce the property it needed.
+
+### The signal that was measured and then not shipped
+
+For the third class a detector was built: the share of an instruction's content
+words appearing in neither the task nor the method lexicon -- the symmetric
+partner to `strip_source_terms`, which handles words FROM the task, catching
+words the planner INVENTED. Measured against the four candidates already judged
+by hand:
+
+```
+REJECT (leaked keys)     ratio 0.41
+REJECT (domain as method) ratio 0.52
+REJECT (computed answer)  ratio 0.35
+APPROVE (clean)           ratio 0.33
+```
+
+0.35 against 0.33 is not a threshold, it is a coincidence with two decimal
+places. Shipping it would have meant tuning a float on four samples to
+reproduce a judgement already made by hand, which is how a metric becomes a
+rationalisation. Not shipped, and recorded here so the next person does not
+rebuild it.
+
+### The deeper fault, and what compensates
+
+Distillation is the one place in this system that **trusts instead of
+verifying.** Everything else is criterion-first: a claim is not believed until
+something independent checks it. A skill claims *this approach transfers*, and
+until it is retrieved nothing tests that. It enters future worker prompts on
+the strength of having been distilled.
+
+Which is why the compensating control matters more than another filter. The
+mechanism that DID catch these skills is the one that measures them in use --
+retrieval scoring and pruning -- and it worked, retiring both automatically with
+the reason on the record. It was only slow: `prune` runs at consolidation, every
+N tasks, while a skill can be retrieved by every node of every task in between.
+That is how one reached **26 uses at 0%**.
+
+So retrieval now applies the same rule against the same constants: a skill at or
+past `PRUNE_MIN_USES` with a success rate below `PRUNE_MIN_SUCCESS_RATE` is not
+offered, even before consolidation formalises the retirement. Damage capped at
+the evidence threshold instead of at the consolidation interval. Consolidation
+still does the retiring; this only stops the bleeding.
+
+### What is still exposed
+
+Domain-as-method still reaches the library. It now costs at most five
+retrievals, and the human gate sees it first -- which is how the uptime-probes
+candidate was caught. But the gate's own signals are weak: `generality` scored
+**1.00** on the worst candidate in the set, the one naming another task's keys,
+because it measures method-vocabulary density and contamination does not reduce
+that. A reviewer reading the instruction catches these. A reviewer reading the
+score does not, and anything automating approval on it would have admitted all
+three.
+
+There is a design that eliminates the class outright and is deliberately not
+taken: build the instruction from structured parts only -- artifact shape,
+check kinds, method verbs -- and never embed the step's prose. No prose, no
+leaks, by construction. The prose is also what tells a worker HOW, so trading
+all of it for cleanliness is a bet to settle by measurement rather than
+argument, once the library is large enough for an ablation to discriminate.
+
+**And for anyone reading the 0/26:** it is not evidence that skill retrieval
+does not work. It is evidence that three specific pipeline defects produced
+advice that could not work, two of which are now closed.
+
 ## Next up
 
 - [x] Kernel, pipeline, harnesses, gates, HITL state machine, router

@@ -112,7 +112,7 @@ a review with no partials has usually been graded generously.
 
 | Item | State | Evidence / gap |
 |---|---|---|
-| Architecture decisions recorded, including reversals | PASS | 13 ADRs; ADR-001 superseded, ADR-004 and ADR-006 amended |
+| Architecture decisions recorded, including reversals | PASS | 15 ADRs; ADR-001 superseded, ADR-004 and ADR-006 amended, ADR-014 and ADR-015 added 2026-09-01 for the learning loop |
 | Runbook per alert | PASS | [RUNBOOK.md](RUNBOOK.md) |
 | Capacity plan with dated measurements | PASS | [CAPACITY.md](CAPACITY.md) |
 | Decision log with alternatives and follow-ups | PASS | [flow.md](flow.md) |
