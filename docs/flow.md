@@ -2986,6 +2986,53 @@ that promotes an approach adds a document to the index, and it is documents
 that give IDF something to weigh.
 
 
+## 2026-09-01 - Two ways to lose a human decision without noticing
+
+Both found by running the thing that was supposed to preserve them.
+
+**The merge silently un-approved the library.** `swarmd skills merge` replays
+stored records through `propose`, which is right -- the merge rule then lives in
+one place instead of being reimplemented by a migration. But `propose` mints
+CANDIDATES. So the replay returned a library where two skills approved on their
+own evidence were pending again, and the `uses`/`successes` counts that pruning
+reads were back to zero. A migration that destroys the reviews it exists to
+preserve.
+
+Fixed by carrying the decision across, matched on `skill_id` -- the hash of the
+surviving instruction -- so the approval follows the text a human actually
+looked at. When two phrasings merge the loser's approval does not transfer: it
+was granted for text no longer stored. Pinned by a test that approves a record,
+records a use, merges, and asserts both survive.
+
+**And the chain approved in bulk.** The unattended script ran: train, merge,
+approve everything promotable, run the ablation. The RUNBOOK names that failure
+in the ApprovalQueueStale entry -- *"approving in bulk to clear the queue
+defeats the control"* -- and the script did it anyway, because it was written to
+get to the measurement rather than to hold the gate.
+
+It let through `approach: produce mapping, summary`, whose own generality score
+was **0.25**: the instruction is the step restated, teaching an output shape and
+nothing about how to reach it. That score exists as a reviewer signal for
+exactly this case, and nothing between the bar and the library was reading it.
+Now rejected, with the reason on the record.
+
+The distinction the script blurred: `promotable` answers *"is there enough
+evidence to ASK a human"*. It does not answer the question. The script now stops
+at the candidates and prints them with their generality and their instruction;
+approval and starting the ablation are separate deliberate acts.
+
+**Where the measurement stands.** Three approved skills gave an IDF index of 38
+terms with **three** distinct weights, and retrieval covered 1 of the 5 tasks
+about to be evaluated -- still the diagnosis skill offered to the colour puzzle.
+Rejecting the weak one puts it back to two. The ablation is still not worth
+running: an index that cannot rank cannot produce a result that means anything,
+and the honest spend is another training pass rather than a sweep.
+
+A second pass over the same corpus is not wasted even though the task shapes
+repeat: a family member that failed its criterion on the first pass and passes
+on the second supplies the second shape its sibling's approach was waiting for.
+Three of eight families promoted an approach on pass one.
+
 ## Next up
 
 - [x] Kernel, pipeline, harnesses, gates, HITL state machine, router
