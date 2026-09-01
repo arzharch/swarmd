@@ -380,3 +380,25 @@ export interface PauseView {
   /** Set once the run has come back; seconds actually spent parked. */
   paused_for_s?: number;
 }
+
+/* --- parked runs -------------------------------------------------------- */
+
+/**
+ * A run on DISK that has not finished. Not the in-process registry: that is
+ * emptied by a restart, and a run parked on a spent ration is exactly the run
+ * most likely to outlive the process that started it.
+ */
+export type ResumableRun = {
+  run_id: string;
+  task: string;
+  profile: string;
+  agents: number;
+  status: string;
+  paused_reason: string;
+  resumes_at: number;
+  nodes_done: number;
+  has_criterion: boolean;
+  has_plan: boolean;
+  /** This control plane is still working on it, so resuming would be a 409. */
+  live: boolean;
+};

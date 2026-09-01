@@ -10,6 +10,7 @@ import type {
   JobSummary,
   PendingApproval,
   ProviderRow,
+  ResumableRun,
   SkillsResponse,
 } from "@/lib/types";
 
@@ -484,6 +485,134 @@ export function ProviderPanel() {
                 </td>
                 <td className="num" style={{ textAlign: "right" }}>
                   {row.rate_limits ?? 0}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </Card>
+  );
+}
+
+/* ----------------------------------------------------------- parked runs */
+
+/**
+ * Runs that stopped without finishing, and the button that picks them back up.
+ *
+ * This was the last thing only the terminal could do. A run that spends the
+ * day's ration parks rather than fails -- correct behaviour, and the whole
+ * point of the pacer -- but from the dashboard it simply stopped, and the only
+ * way to continue it was `swarmd runs resume` in a shell. An operator watching
+ * this screen could see the pause and could do nothing about it.
+ *
+ * Resuming buys nothing the run already paid for: the criterion, the plan and
+ * the batch drafts come off disk. Re-deriving the criterion would grade the
+ * second half of a run against a target the first half never saw.
+ */
+export function ParkedPanel() {
+  const [runs, setRuns] = useState<ResumableRun[] | null>(null);
+  const [busy, setBusy] = useState("");
+  const { error, guard } = useError();
+
+  const load = useCallback(
+    () =>
+      guard(async () => {
+        const body = await api<{ runs: ResumableRun[] }>("/api/runs/resumable");
+        setRuns(body.runs);
+      }),
+    [guard],
+  );
+
+  useEffect(() => {
+    load();
+    // Polled rather than driven by the event stream: a run parked before this
+    // browser was open emitted its pause event to nobody.
+    const timer = setInterval(load, 15000);
+    return () => clearInterval(timer);
+  }, [load]);
+
+  const resume = (runId: string) =>
+    guard(async () => {
+      setBusy(runId);
+      try {
+        // The idempotency key makes a double click one resume rather than a
+        // 409 the operator has to interpret.
+        await api(`/api/runs/${runId}/resume`, {
+          method: "POST",
+          headers: { "Idempotency-Key": `dash-resume-${runId}` },
+        });
+        await load();
+      } finally {
+        setBusy("");
+      }
+    });
+
+  return (
+    <Card title="Parked runs" meta={runs ? `${runs.length}` : undefined}>
+      <p style={{ margin: "0 0 12px", color: "var(--text-muted)" }}>
+        Unfinished runs on disk. A run that exhausts the day&apos;s ration
+        parks here instead of failing, and resuming reuses its frozen criterion
+        and plan rather than paying for them twice.
+      </p>
+
+      <ErrorLine error={error} />
+
+      {!runs ? (
+        <p className="empty">Loading…</p>
+      ) : runs.length === 0 ? (
+        <p className="empty">
+          Nothing parked.
+          <span className="hint">Every stored run reached a terminal state.</span>
+        </p>
+      ) : (
+        <table style={{ marginTop: 12 }}>
+          <thead>
+            <tr>
+              <th>run</th>
+              <th>task</th>
+              <th>why it stopped</th>
+              <th style={{ textAlign: "right" }}>nodes</th>
+              <th />
+            </tr>
+          </thead>
+          <tbody>
+            {runs.map((run) => (
+              <tr key={run.run_id}>
+                <td className="mono">{run.run_id}</td>
+                <td title={run.task}>{run.task.slice(0, 48)}</td>
+                <td>
+                  <span className={`pill ${run.live ? "running" : "neutral"}`}>
+                    {run.live
+                      ? "running here"
+                      : run.paused_reason || run.status}
+                  </span>
+                  {run.resumes_at > 0 && (
+                    <span className="hint">
+                      {" "}
+                      capacity back{" "}
+                      {new Date(run.resumes_at * 1000).toLocaleTimeString()}
+                    </span>
+                  )}
+                </td>
+                <td className="num" style={{ textAlign: "right" }}>
+                  {run.nodes_done}
+                </td>
+                <td style={{ textAlign: "right" }}>
+                  <button
+                    className="ghost"
+                    onClick={() => resume(run.run_id)}
+                    disabled={busy === run.run_id || run.live}
+                    title={
+                      run.live
+                        ? "Still running on this control plane. Resuming it would be refused: two runs sharing an id would interleave their writes into one ledger."
+                        : run.has_criterion && run.has_plan
+                          ? "Continues from the stored criterion and plan."
+                          : "This run parked before it had both a criterion and a plan; resuming re-derives what is missing."
+                    }
+                  >
+                    {busy === run.run_id ? "Resuming…" : "Resume"}
+                  </button>
                 </td>
               </tr>
             ))}

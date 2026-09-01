@@ -24,6 +24,7 @@ import {
   EvalReportPanel,
   HarnessPanel,
   BudgetPanel,
+  ParkedPanel,
   ProviderPanel,
   ReviewPanel,
   SessionPanel,
@@ -339,11 +340,16 @@ export default function Dashboard() {
         )}
 
         {view === "harness" && (
-          <div className="board cols-3">
-            <HarnessPanel />
-            <ProviderPanel />
-            <BudgetPanel />
-          </div>
+          <>
+            <div className="board cols-3">
+              <HarnessPanel />
+              <ProviderPanel />
+              <BudgetPanel />
+            </div>
+            <div className="board" style={{ paddingTop: 0 }}>
+              <ParkedPanel />
+            </div>
+          </>
         )}
 
         {view === "cost" && (

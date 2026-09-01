@@ -565,6 +565,11 @@ def create_app(
         outlive the pod that started it. Registered before the
         `/api/runs/{run_id}` route so "resumable" is not read as a run id.
         """
+        live = {
+            run_id
+            for run_id, task in app.state.registry.tasks.items()
+            if not task.done()
+        }
         return JSONResponse(
             {
                 "runs": [
@@ -579,6 +584,12 @@ def create_app(
                         "nodes_done": len(s.finished_nodes),
                         "has_criterion": bool(s.criterion),
                         "has_plan": bool(s.plan),
+                        # A run this process is still working on is on disk
+                        # with status "running" and looks identical to one
+                        # abandoned by a pod that died mid-run. Resuming the
+                        # first is refused with 409; only the caller can tell
+                        # them apart, and only if it is told which is which.
+                        "live": s.run_id in live,
                     }
                     for s in app.state.run_store.list_runs()
                     if all or s.status not in TERMINAL

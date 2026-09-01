@@ -278,3 +278,26 @@ def test_an_interrupted_run_is_still_resumable(client, store_root):
     assert "run-cut" in {r["run_id"] for r in listed}
     assert client.post("/api/runs/run-cut/resume").status_code == 202
     wait_for(client, "run-cut")
+
+
+def test_a_run_left_by_a_dead_pod_is_not_marked_live(client, store_root):
+    """A run abandoned mid-flight is on disk with status "running", exactly
+    like one this process is still working on. The dashboard offers Resume on
+    the first and must not on the second, where it would be refused 409 -- so
+    the listing says which is which rather than leaving the caller to guess
+    from a status that cannot tell them apart."""
+    RunStore(store_root).save(
+        RunState(
+            run_id="run-orphan",
+            task="left mid-flight by a pod that died",
+            profile="smoke",
+            status="running",
+        )
+    )
+    row = next(
+        r
+        for r in client.get("/api/runs/resumable").json()["runs"]
+        if r["run_id"] == "run-orphan"
+    )
+    assert row["status"] == "running"
+    assert row["live"] is False
