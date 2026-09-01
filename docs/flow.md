@@ -2802,6 +2802,35 @@ clients of the same code, tests covered the CLI, and the fix landed on one
 side. Both paths now construct the run the same way, and the test that pins it
 starts a control plane with no library and asserts the refusal.
 
+**Then the experiment itself turned out to be measuring memorisation.** With
+the library wired in, the next step was to build one: `POST /api/sessions`,
+ten tasks, auto-approved. The session draws its curriculum from
+`suite(arms="both")` -- the same ten tasks `swarmd eval` then measures. A skill
+distilled from `pub-extract-1` and retrieved while solving `pub-extract-1`
+again is not learning; it is the answer, written down. It would have moved the
+treatment arm for a reason that does not survive a task the library has never
+seen, and the report would have called it an improvement.
+
+`public` and `custom` are disjoint sets that already exist, so a session can
+now be pointed at one and the eval at the other. The default is unchanged --
+a session is also just how a library gets built for use -- but a session run
+for a *measurement* has to name its training set, and this one does:
+`{"arms": "public"}` trains, `{"arms": "custom"}` measures.
+
+Three defects, all found while trying to produce one number, and all of the
+same kind: the machinery worked and was pointed at the wrong thing. The
+double-charged meter was a number that described something other than what it
+claimed; so was an ablation with identical arms; so is a success rate measured
+on the training set.
+
+**A fourth, found the same way.** The first session died after one task with
+`ConnectionRefusedError` out of `_auto_approve`: `DATABASE_URL` pointed at a
+Postgres that was not running, and the approval store is not touched until the
+first consolidation. So the pod reported ready, the job was accepted, one
+task's provider quota was bought, and only then did the run discover it had
+nowhere to put what it had learned. `/readyz` now checks the approval store,
+and `POST /api/sessions` refuses before anything is spent.
+
 ## Next up
 
 - [x] Kernel, pipeline, harnesses, gates, HITL state machine, router
