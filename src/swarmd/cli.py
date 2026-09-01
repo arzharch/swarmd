@@ -1252,6 +1252,28 @@ def _replay(records: list[Any], path: str) -> Any:
                 evidence_task=shape,
                 generality=record.generality,
             )
+
+    # DECISIONS AND HISTORY SURVIVE THE MERGE. `propose` mints candidates, so a
+    # replay alone silently un-approves every skill in the library and resets
+    # the use counts that pruning reads -- a migration that destroys the
+    # reviews it was supposed to preserve. Found by running it: two skills
+    # approved on their own evidence came back pending.
+    #
+    # Matched on `skill_id`, which is the hash of the surviving instruction, so
+    # this carries the decision to the record a human actually looked at. When
+    # two phrasings merge, the loser's approval does not transfer: it was
+    # granted for text that is no longer stored.
+    by_id = {record.skill_id: record for record in records}
+    for skill in library.all():
+        source = by_id.get(skill.skill_id)
+        if source is None:
+            continue
+        skill.approved = source.approved
+        skill.approved_by = source.approved_by
+        skill.approval_note = source.approval_note
+        skill.uses = source.uses
+        skill.successes = source.successes
+    library.save()
     return library
 
 

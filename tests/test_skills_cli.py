@@ -110,3 +110,31 @@ def test_merge_says_so_on_an_empty_library(tmp_path, capsys):
     SkillLibrary(str(path))
     assert main(["skills", "merge", "--skills", str(path)]) == 0
     assert "empty" in capsys.readouterr().out
+
+
+def test_merge_does_not_silently_un_approve_the_library(tmp_path):
+    """Found by running it on a real library: two skills approved on their own
+    evidence came back pending, and their use counts came back zero.
+
+    `propose` mints CANDIDATES, so a replay that only proposes destroys exactly
+    what the migration was meant to preserve -- the reviews, and the history
+    that pruning reads. Approval is matched on `skill_id`, the hash of the
+    surviving instruction, so the decision follows the text a human looked at.
+    """
+    path = _write_pre_merge_library(tmp_path / "skills.json")
+
+    # Approve one of the two phrasings and give it a use record, the way a
+    # reviewed and exercised library looks.
+    library = SkillLibrary(str(path))
+    first = library.all()[0]
+    library.approve(first.skill_id, actor="reviewer", force=True)
+    library.record_use(first.skill_id, success=True)
+
+    main(["skills", "merge", "--skills", str(path), "--apply"])
+
+    merged = SkillLibrary(str(path)).all()
+    assert len(merged) == 1
+    assert merged[0].approved, "the approval survived the merge"
+    assert merged[0].approved_by == "reviewer"
+    assert merged[0].uses == 1, "and so did the history pruning reads"
+    assert merged[0].successes == 1
