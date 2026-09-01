@@ -349,9 +349,18 @@ So the 0/26 is not mysterious. A worker handed advice naming another task's
 keys, domain, or answer is worse off than one handed nothing, which is exactly
 what the retrieval threshold's own docstring predicts.
 
-**Two of the three classes are now closed** ([ADR-015](adr/ADR-015.md)), and
-each was traced to the line that let it through rather than blamed on the
-model. The identifier leak: `strip_source_terms` splits on `_`, `-` and
+**Three of four classes are now closed** ([ADR-015](adr/ADR-015.md)) -- the
+fourth was found while auditing for the first three, and was the largest of
+them: `_distil_instruction` wrote the artifact KEY NAMES into the advice, and
+the skill's name (derived from those keys) was printed into the worker prompt
+beside it. 17 of 31 live records carried them, against 8 for the identifier
+leak. They are redundant as well as harmful -- the worker is shown its own
+criterion's exact required keys, so a skill naming a different task's keys can
+only agree by accident. Removed from both places; the instruction now records
+the KINDS of value and says to take key names from the reader's own criterion.
+
+Each of the others was traced to the line that let it through rather than
+blamed on the model. The identifier leak: `strip_source_terms` splits on `_`, `-` and
 camelCase, so `stock_count` collapses while `sort_by_price` survives. The
 computed answer: the NUMBER pattern rejected any following period so that
 `1.25` would not be split, and swallowed sentence-final digits with it --
