@@ -2831,6 +2831,45 @@ task's provider quota was bought, and only then did the run discover it had
 nowhere to put what it had learned. `/readyz` now checks the approval store,
 and `POST /api/sessions` refuses before anything is spent.
 
+**And with all four fixed, the measurement still did not happen -- for a
+reason worth more than the measurement would have been.** The clean experiment
+ran: ten tasks on `public`, live providers, 458 seconds, 22 skills proposed.
+Zero approved. Zero even *queued*.
+
+A skill reaches the human queue only once it is `promotable`: verified on two
+distinct task shapes, which is the bar that makes "this transfers" a question
+with an answer. All 22 carried evidence from exactly one shape. The five
+training tasks have disjoint output shapes, so no approach was ever proposed
+by two of them.
+
+The first guess was fragmentation -- `make_skill_id` hashes the instruction
+text, the instruction is written by a model, so the same approach worded twice
+mints two records. That is true, and it is not the cause: grouping the 22 by
+abstracted name and pattern gives 12 groups and still **zero** with two
+shapes. A merge was written, tested, measured against the real library, and
+reverted, because it fixed nothing that was actually broken here and changed
+what "the same skill" means to do it.
+
+The real finding is about the corpus. The transfer bar asks for an approach
+that worked on two different kinds of task; a twelve-task suite with twelve
+different output shapes cannot supply one. The "volume: 50-200 tasks" item has
+been on this list for days as a statistical argument. It is not: it is a
+structural precondition, and the tasks have to come in FAMILIES that share an
+output shape, or the library can never promote regardless of how many there
+are.
+
+Two ways forward, and the choice is the operator's rather than mine: grow the
+suite into families, or bypass the bar deliberately with
+`approve(..., force=True)` -- which records the bypass on each record -- and
+label the result as measuring RETRIEVAL rather than transfer.
+
+**Acceptance criterion 2 did land.** Both holdout tasks ran end to end on live
+providers with no code change: frozen criterion, plan, graded nodes, $0.00,
+no simulated rows. `hold-schedule-1` passed 15 of 20 nodes and produced the
+right answer (13 minutes); `hold-logistics-1` passed 0 of 30 and produced a
+wrong one. Which is the honest reading of that criterion: the system takes an
+unseen task end to end. It does not reliably solve one.
+
 ## Next up
 
 - [x] Kernel, pipeline, harnesses, gates, HITL state machine, router
