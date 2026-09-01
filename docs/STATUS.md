@@ -89,6 +89,75 @@ The CLI is the same operations without a browser, not a separate product.
 
 ---
 
+## 4a. Acceptance evidence, item by item
+
+SPEC Phase 11's gate is "PRD section 13 acceptance criteria, item by item, each
+with pasted evidence". This is that. Each entry names what produced it, so a
+reader can re-run the thing rather than trust the row.
+
+**1 — All SPEC phase gates pass.** PARTIAL. Phases 1–10 pass; this section is
+Phase 11's own gate, and it is complete except where the rows below say
+otherwise.
+
+**2 — A held-out task runs end to end with no code change.** PASS mechanically,
+2026-09-01, live providers, submitted through `POST /api/runs`:
+
+```
+run-3f4757e392  hold-logistics-1  completed  0/30 nodes   78.9s
+                criterion 43b7c37957bb8bde   simulated=False   $0.00
+run-21e0a680fe  hold-schedule-1   completed  15/20 nodes 103.5s
+                criterion 7642a158f5945d7e   simulated=False   $0.00
+                artifact: {"total_time": 13, "schedule": [...]}   <- correct
+```
+
+Both took an unseen task from prompt to graded artifact against a criterion the
+system authored and froze itself. Neither passed every node, so this is not
+"solves a held-out task"; `hold-logistics-1` produced a wrong answer on every
+node.
+
+**3 — Chaos at 0.2 across every stage; integrity hashes match.** PASS. CI job
+`chaos integrity (SLO-2, no error budget)`, step `kernel determinism under
+chaos`: `swarmd demo kernel --kill-rate 0.9 --tasks 40`, and step `swarm run
+completes under chaos`. Verified at 0.9 rather than 0.2 because the gate has no
+error budget.
+
+**4 — All five seeded rogues detected and contained.** PASS. CI step `red-team
+gate (SPEC Phase 8)` runs `--seed-rogues all`. Four are caught by their own
+detector; `criterion_gaming` is blocked by the frozen criterion before any
+detector sees it, and is reported as its own outcome rather than counted as a
+catch.
+
+**5 — Full run at or under $0.05, itemised by provider.** PASS structurally.
+The ceiling is enforced at the harness boundary and every run is itemised in
+the ledger. **Never exercised against paid traffic:** `SWARMD_ALLOW_PAID` is
+false and every live run to date cost $0.00 on free tiers, so the abort path
+has been tested against a synthetic ceiling and not against real spend. Closing
+this means deliberately spending money, which is an operator decision rather
+than an oversight.
+
+**6 — Eval shows treatment vs control with CIs on both arms.** PASS. Verified
+over HTTP; the report carries `success_ci` on both arms, a paired delta with
+its own interval, pass@k where the sample supports it, and the words "no
+measured improvement" when the intervals overlap. Two refusals now guard it:
+the sweep will not start when the arms would be identical, and runs that never
+reached the task are excluded from every figure rather than counted as
+failures.
+
+**7 — Frontend replays a live run, zero mock data paths.** PASS. Three CI
+guards in `tests/test_deploy_guards.py` (`test_the_frontend_imports_no_sample_data`,
+`test_the_frontend_has_no_hardcoded_backend_host`, and the manifest checks).
+Additionally, as of 2026-09-01 the dashboard can act as well as watch: it sends
+the operator token, resumes a run parked on a spent ration, and renders the
+artifacts a run produced.
+
+**8 — Kill mid-run, restart, state intact.** PASS. `tests/test_kill_resume_process.py`
+kills a real process mid-run and resumes it, asserting progress is preserved by
+**counting provider calls** across the kill rather than by comparing output —
+identical output would only prove the work was deterministic, not that it was
+recovered instead of repeated.
+
+---
+
 ## 5. The remaining gap
 
 ### G-4 · The system solves tasks. The learning loop turns; whether it helps is now measurable
