@@ -78,10 +78,10 @@ The CLI is the same operations without a browser, not a separate product.
 | # | Criterion | State |
 |---|---|---|
 | 1 | All SPEC phase gates pass | **PARTIAL** — only Phase 11's live run outstanding |
-| 2 | A held-out task runs end to end with no code change | **NOT VERIFIED** — machinery and holdout set exist; only run against the simulated provider (G-4) |
+| 2 | A held-out task runs end to end with no code change | **PASS mechanically, 2026-09-01** — both holdout tasks ran on live providers with no code change: frozen criterion, plan, graded nodes, $0.00, zero simulated ledger rows. Neither passed every node (`hold-schedule-1` 15/20 with the right answer; `hold-logistics-1` 0/30 with a wrong one), so this is 'takes an unseen task end to end', not 'solves it' |
 | 3 | Chaos at 0.2 across every stage; integrity hashes match | **PASS** — verified at 0.9 in CI, and in the swarm loop at 0.3 |
 | 4 | All five seeded rogues detected and contained | **PASS** — four caught by their own detector; one blocked by the frozen criterion before any detector saw it, reported as its own outcome rather than counted as a catch |
-| 5 | Full run at or under $0.05, itemised by provider | **PASS structurally** — ceiling enforced and itemised; unverified against paid traffic (G-4) |
+| 5 | Full run at or under $0.05, itemised by provider | **PASS structurally** — ceiling enforced and itemised; every live run on 2026-09-01 cost $0.00 on free tiers, so it remains unverified against PAID traffic |
 | 6 | Eval shows treatment vs control with CIs on both arms | **PASS** — verified over HTTP: 10 runs, both arms, "no measured improvement" |
 | 7 | Frontend replays a live run, zero mock data paths | **PASS** — three CI guards enforce the no-fixture rule. The dashboard also *acts* now: it sent no operator token until 2026-09-01, so on a gated control plane it rendered live data and answered 401 to every button |
 | 8 | Kill mid-run, restart, state intact | **PASS** — approvals, ledger, skills and criteria survive; the run resumes from the killed agent's checkpoint |
@@ -153,6 +153,47 @@ the retrieval threshold's own docstring predicts.
 output shape it produced, with no node name. The library was rebuilt and reads
 `"When a step calls for this: Return a list of all date strings found in the
 paragraph. Produce a JSON object with these fields: ..."`.
+
+#### And on 2026-09-01, the real blocker was measured
+
+The re-measurement was attempted properly: train on `public`, measure on
+`custom` (disjoint sets), library built by a full ten-task session on live
+providers. It produced no number, and the reason is not quota.
+
+**The library cannot promote anything.** A skill reaches the human queue only
+when it is `promotable` — verified on `MIN_DISTINCT_TASKS = 2` distinct task
+shapes, which is the bar that makes "this approach transfers" answerable at
+all. The session's result:
+
+| | |
+|---|---|
+| skills proposed | 22 |
+| distinct task shapes seen in training | 5 |
+| skills with evidence from 2+ shapes | **0** |
+| promotable | **0** |
+| approved | **0** |
+
+Every one of the 22 carries evidence from exactly one shape. Nothing was ever
+queued, so nothing was approved, so the treatment arm had nothing to retrieve —
+and an eval in that state compares a configuration against itself.
+
+**This is a corpus property, not a bug.** Promotion asks for the same approach
+to succeed on two *different* task shapes. The five training tasks have
+disjoint output shapes, so no approach was ever proposed twice. Merging
+proposals by wording does not help and was tried: grouping the 22 records by
+their abstracted name and pattern still yields zero approaches with two shapes,
+because the shapes themselves are all distinct. What the corpus needs is
+FAMILIES of tasks that call for the same kind of output — which sharpens the
+existing "volume: 50–200 tasks" item into a requirement it did not previously
+state.
+
+**So G-4 is now precise.** It was "the re-measurement has not run, for want of
+quota". It is: *the learning loop cannot close on a 12-task suite, because the
+transfer bar and the corpus are incompatible.* Either the suite grows task
+families, or the bar is bypassed deliberately and the result is labelled as
+measuring retrieval rather than transfer. The bypass exists (`approve(...,
+force=True)` records itself in `approval_note`) and is an operator decision,
+not one to take silently while producing a number.
 
 **The re-measurement did not run**, because the day's provider budget was spent
 on the two that did:
