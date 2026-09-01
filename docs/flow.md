@@ -2708,6 +2708,75 @@ point: the comment was the thing that was wrong.
 
 ---
 
+## 2026-09-01 - The dashboard could watch, but it could not act
+
+The service and the dashboard were built together and tested apart, and four
+things fell into the gap between them. All four have the same shape: the
+control plane offered something and the browser could not reach it.
+
+**The dashboard sent no operator token.** `SWARMD_API_TOKEN` gates every
+mutating endpoint and the event stream. The dashboard's `fetch` helper set one
+header, `Content-Type`. Reads are ungated, so the page loaded, filled with real
+provider data and looked entirely healthy -- and then every button returned
+401 and the websocket closed with 1008 and reconnected forever behind a
+flickering "Connecting". Nothing in the UI could say why, because nothing in
+the UI knew a token existed.
+
+Fixed in one place: every request the app makes now goes through `lib/api.ts`,
+which attaches `X-Swarmd-Token`, puts the same value in the stream's `?token=`
+(a browser cannot set a header on a handshake), and rewrites 401 into the
+sentence that says what to do. The new `GET /api/auth` lets the page ask
+whether a token is wanted before anything is attempted, so a locked control
+plane shows a field instead of a working-looking screen; a pasted token is
+checked there rather than by spending a run to find out. The stream reconnects
+when the token changes, and a 1008 close now reads "No token" and stops
+retrying instead of pretending to be a network problem.
+
+This is not user auth and does not become it. One operator, one credential, no
+accounts -- ADR-013 is unchanged. What changed is that the operator can now
+supply the credential from the thing they are looking at.
+
+**A parked run could only be resumed from a terminal.** The pacer parks a run
+that has spent the day's ration; the control plane has listed those runs at
+`/api/runs/resumable` and resumed them at `/api/runs/{id}/resume` for as long
+as it has existed. The dashboard called neither. Someone watching the screen
+could see the run stop, could read the reason and the time capacity returns,
+and then had to open a shell to do the one thing the situation calls for. The
+Harness view now lists parked runs and resumes one in place, with the
+idempotency key that makes a double click one resume rather than a 409.
+
+That listing needed a change in the service too. A run this process is still
+working on is on disk with status `running`, and so is a run abandoned by a pod
+that died -- identical rows, and resuming the first is refused. The listing now
+marks which runs are live here, so the button is offered only where it would
+work.
+
+**The dashboard never showed what a run produced.** It showed which agents ran,
+what each cost, what was contained, which criterion was frozen and which plan
+was chosen -- everything about HOW the run went, and nothing about what came
+out of it. The artifacts were in the report the whole time. Reading the answer
+meant opening the JSON. The Decisions view now renders them per node, with the
+attempts and the skill used beside each.
+
+**And the eval was counting capacity as failure.** A run stopped by something
+other than the task -- every provider spent, the cost ceiling reached, the
+process killed -- returns `solved=False`, which is the same value a run that
+tried and failed returns. `summarise` counted them. A sweep long enough to
+outlast the day's allowance therefore measured how much quota was left and
+reported it as capability, and the damage was not symmetric: the loss lands on
+whichever arm was running when the wall arrived, so the DELTA moved too.
+
+Runs that never reached the task are now excluded from every figure, dropped
+from the pairing, and counted out loud, because a rate over half a sweep
+presented as a rate over all of it is just a different wrong number.
+`failed_criterion` still counts as an attempt -- no criterion surviving attack
+is a real thing this system failed to do.
+
+The test fixture had been hiding it: `_outcome(solved=False)` stamped
+`status="error"` with no nodes, which is the shape of a run that never started
+rather than one that failed. It now builds what an unsolved run actually looks
+like.
+
 ## Next up
 
 - [x] Kernel, pipeline, harnesses, gates, HITL state machine, router
