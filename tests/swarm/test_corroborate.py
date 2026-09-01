@@ -118,3 +118,24 @@ def test_a_second_shape_records_its_own_wording(tmp_path) -> None:
     assert len(second.evidence_instructions) == 2
     assert "probes" not in second.served_instruction.lower()
     assert second.instruction == UPTIME, "the stored text is half the content address"
+
+
+def test_merging_identities_keeps_every_recorded_wording(tmp_path) -> None:
+    """A migration must not un-verify advice two shapes had corroborated."""
+    source = SkillLibrary(tmp_path / "before.json")
+    source.propose(
+        name="approach: produce total, method",
+        task_pattern="count slot_number slot_term",
+        instruction=UPTIME,
+        evidence_task="shape-a",
+    )
+    source.propose(
+        name="approach: produce total, method",
+        task_pattern="count slot_number slot_term",
+        instruction=LEDGER,
+        evidence_task="shape-b",
+    )
+    merged, _ = source.merge_identity(tmp_path / "after.json")
+    [record] = merged.all()
+    assert len(record.evidence_instructions) == 2
+    assert "probes" not in record.served_instruction.lower()

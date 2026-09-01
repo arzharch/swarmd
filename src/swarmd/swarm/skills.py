@@ -880,6 +880,20 @@ class SkillLibrary:
 
             target.uses += record.uses
             target.successes += record.successes
+            # The wordings each contributing shape distilled. The replay above
+            # can only pass the record's ONE instruction, so without this a
+            # merge would silently reduce a corroborated skill (ADR-016) back
+            # to a single unverified variant -- and the served advice would
+            # widen back out to what one task said.
+            for wording in record.evidence_instructions:
+                if (
+                    wording not in target.evidence_instructions
+                    and len(target.evidence_instructions) < MAX_EVIDENCE_TASKS
+                ):
+                    target.evidence_instructions = (
+                        *target.evidence_instructions,
+                        wording,
+                    )
             if record.retired:
                 target.retired = True
                 target.retired_reason = record.retired_reason
