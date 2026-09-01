@@ -619,3 +619,44 @@ async def test_the_token_estimate_is_measured_from_settled_calls_not_itself(tmp_
     assert track.observed_tokens_per_request("groq") == (
         resp.tokens_in + resp.tokens_out
     )
+
+
+class TestConsentDefaultsFromEnvironment:
+    """One operator decision, honoured identically by every client.
+
+    The CLI passed `allow_data_training=False` by omission while the server
+    read `SWARMD_ALLOW_DATA_TRAINING`, so the same deployment had Mistral in
+    its pool from the dashboard and not from a terminal -- and Mistral is the
+    only provider here with no daily cap, so terminal sessions parked for
+    hours on capacity that was sitting unloaded.
+    """
+
+    def test_a_consented_tier_is_admitted_without_being_asked_for(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SWARMD_ALLOW_DATA_TRAINING", "true")
+        monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+        monkeypatch.delenv("SWARMD_SIMULATED_PROVIDER", raising=False)
+        pool = ProviderPool.from_env(include=["mistral-free"])
+        assert [slot.spec.name for slot in pool._slots] == ["mistral-free"]
+
+    def test_without_consent_the_tier_stays_out(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("SWARMD_ALLOW_DATA_TRAINING", raising=False)
+        monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+        monkeypatch.delenv("SWARMD_SIMULATED_PROVIDER", raising=False)
+        with pytest.raises(RuntimeError, match="allow-data-training"):
+            ProviderPool.from_env(include=["mistral-free"])
+
+    def test_an_explicit_false_still_overrides_the_environment(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`None` means "ask the operator"; a bool means the caller decided."""
+        monkeypatch.setenv("SWARMD_ALLOW_DATA_TRAINING", "true")
+        monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+        monkeypatch.delenv("SWARMD_SIMULATED_PROVIDER", raising=False)
+        with pytest.raises(RuntimeError, match="allow-data-training"):
+            ProviderPool.from_env(
+                include=["mistral-free"], allow_data_training=False
+            )

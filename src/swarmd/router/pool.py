@@ -213,6 +213,14 @@ TIER_RANK = {
     "paid": 4,
 }
 
+# The two consent gates are read from the environment in ONE place, so the CLI
+# and the server cannot disagree about what the operator consented to.
+_CONSENT_TRUE = frozenset({"1", "true", "yes", "on"})
+
+
+def _consented(var: str) -> bool:
+    return os.environ.get(var, "").strip().lower() in _CONSENT_TRUE
+
 
 def credentials_for(spec: ProviderSpec) -> list[tuple[str, str]]:
     """Discover every credential configured for a provider.
@@ -668,8 +676,8 @@ class ProviderPool(Provider):
         cls,
         *,
         account: CostAccount | None = None,
-        allow_data_training: bool = False,
-        allow_paid: bool = False,
+        allow_data_training: bool | None = None,
+        allow_paid: bool | None = None,
         include: list[str] | None = None,
         max_wait_s: float = 30.0,
         quota: QuotaBackend | None = None,
@@ -682,8 +690,26 @@ class ProviderPool(Provider):
         A missing key is a skip, not an error: the pool's whole premise is that
         capacity is assembled from whatever is available. Zero usable providers
         IS an error, raised here rather than discovered on the first call.
+
+        ANATOMY: the consent flags default to None, not False
+          Both gates are the OPERATOR's decision, recorded once in the
+          environment, and `None` means "whatever they decided" while `True`
+          and `False` are a caller overriding it. Defaulting them to False
+          instead is what let the two clients of this contract disagree: the
+          server read `SWARMD_ALLOW_DATA_TRAINING` and the CLI did not, so a
+          run launched from the dashboard had Mistral in its pool and the same
+          run launched from a terminal did not -- and Mistral is the only
+          provider here with no daily cap. Measured cost of that gap: sessions
+          parking for hours on an exhausted OpenRouter day while the largest
+          free allowance in the deployment sat unloaded, reported as "Enabled
+          for this deployment" by `providers budget` the whole time.
         """
         from swarmd.router.simulated import SimulatedProvider, simulation_enabled
+
+        if allow_data_training is None:
+            allow_data_training = _consented("SWARMD_ALLOW_DATA_TRAINING")
+        if allow_paid is None:
+            allow_paid = _consented("SWARMD_ALLOW_PAID")
 
         if simulation_enabled():
             # Exclusive, not additive. A pool mixing real and simulated

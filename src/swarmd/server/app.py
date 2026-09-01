@@ -975,10 +975,8 @@ def _default_provider_factory() -> Any:
     """
     from swarmd.router.pool import ProviderPool
 
-    return ProviderPool.from_env(
-        allow_data_training=os.environ.get(
-            "SWARMD_ALLOW_DATA_TRAINING", ""
-        ).lower() in {"1", "true", "yes"},
-        allow_paid=os.environ.get("SWARMD_ALLOW_PAID", "").lower()
-        in {"1", "true", "yes"},
-    )
+    # Both consent flags are read inside `from_env` now. Parsing them here as
+    # well is what let the CLI and this path disagree about the same
+    # environment: one client honoured the operator's consent and the other
+    # silently did not.
+    return ProviderPool.from_env()

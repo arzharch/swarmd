@@ -163,9 +163,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     budget.add_argument("--json", action="store_true")
 
+    # default=None, not False: absent means "use whatever the operator
+    # consented to in the environment", and only passing the flag overrides.
     probe.add_argument(
         "--allow-data-training",
         action="store_true",
+        default=None,
         help="admit the Mistral Experiment tier, whose free quota is granted in "
         "exchange for consenting to have submitted prompts used for training. "
         "Off by default: that tier's price is paid in data, not dollars, and "
@@ -174,6 +177,7 @@ def main(argv: list[str] | None = None) -> int:
     probe.add_argument(
         "--allow-paid",
         action="store_true",
+        default=None,
         help="admit the paid overflow tier (GLM 5.3 Flash). Off by default, so "
         "exhausting free capacity stops the run instead of quietly spending.",
     )
