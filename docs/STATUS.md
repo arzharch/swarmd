@@ -114,6 +114,19 @@ cannot produce anything else, at any sample size. Fixed: the library is passed
 to both arms, and `use_skills` gates retrieval, so the only variable between
 arms is whether a skill may be read.
 
+**And it was still not an ablation over HTTP, until 2026-09-01.** The fix
+above landed in the CLI. `_eval_runner` in the control plane — the path the
+dashboard and `POST /api/evals` use — kept constructing `SwarmRun` with no
+`skills=`, so every eval started from a browser compared a configuration
+against itself and reported "no measured improvement" in the same words the
+real experiment produces. Found by starting a 100-cell sweep and reading the
+code while it ran; cancelled at cell 20 rather than spending the remaining
+~1,500 requests on a null experiment. The endpoint now refuses at submit time,
+with the reason, when the treatment arm would have nothing to retrieve — no
+library configured, or a library with nothing approved in it. Refused rather
+than warned: a warning in a job log is not attached to the number, and the
+number is what gets quoted.
+
 #### Then: with a real library, skills made it WORSE
 
 11 skills distilled from a training session, human-gate approved, retrieved by

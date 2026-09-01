@@ -82,9 +82,29 @@ export async function apiJson<T>(path: string, init?: RequestInit): Promise<T> {
           : "operator token required — set it in the top bar",
       );
     }
-    throw new Error(`${response.status}: ${(await response.text()).slice(0, 200)}`);
+    throw new Error(await _reason(response));
   }
   return (await response.json()) as T;
+}
+
+/**
+ * The sentence out of an error response, not the envelope around it.
+ *
+ * FastAPI answers `{"detail": "..."}` and the hardening middleware answers
+ * `{"error": ..., "detail": ...}`. Both are written to be read by a person --
+ * the eval refusal explains how to build a skill library -- and both were
+ * being rendered as a raw JSON blob prefixed with a status code.
+ */
+async function _reason(response: Response): Promise<string> {
+  const body = (await response.text()).slice(0, 600);
+  try {
+    const parsed = JSON.parse(body) as { detail?: unknown; error?: unknown };
+    const detail = parsed.detail ?? parsed.error;
+    if (typeof detail === "string" && detail) return detail;
+  } catch {
+    // Not JSON. The text itself is the best available answer.
+  }
+  return `${response.status}: ${body}`;
 }
 
 /**
