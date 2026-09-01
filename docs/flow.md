@@ -3251,6 +3251,43 @@ argument, once the library is large enough for an ablation to discriminate.
 does not work. It is evidence that three specific pipeline defects produced
 advice that could not work, two of which are now closed.
 
+## 2026-09-01 - The acceptance-scale chaos run, on real providers
+
+The SPEC Phase 11 deliverable that had only ever run against the simulated
+provider, and the thing QA has been refusing to sign since the profiles were
+resized: every live run to date had been `smoke`.
+
+```
+swarmd swarm run "<logistics scheduling>" --profile standard --chaos --no-skills
+
+run=run-61cd7e40d6  status=completed  34.5s
+criterion=9368bc96464e34d0 (4 checks, attempts=1)
+plan=655bdafb711165f3 (5 nodes, width=2)
+nodes_passed=25/25  contained=0
+integrity_hash=ee7e549f587d3ae6
+cost=$0.000000 of $0.05 ceiling  calls=17
+prefix_cache=896/6736 prompt tokens served from the provider's cache (13.3%)
+agents=34 alive=25 bankrupt=0 contained=0
+```
+
+Nine of thirty-four agents were killed mid-run. Each replacement logged
+`resumed` then `skipped_generate` -- it read the checkpoint and did not re-buy
+the generation -- and every node still passed with the integrity hash intact.
+That is the recovery guarantee holding on real traffic rather than on a
+deterministic mock, which is the only version of it worth anything.
+
+`--no-skills` deliberately: this is a resilience gate, and skill retrieval
+would make the run's shape depend on library contents that change between runs.
+
+**First live prefix-cache reading: 13.3%**, on openrouter. Worth naming
+carefully, because two different caches get confused in this repo's own notes:
+this is the PROVIDER's prompt-prefix cache, measured on the run-stable system
+block, not the semantic run memo. The memo's hit rate on genuinely novel tasks
+is still unmeasured and still expected to be near zero by construction.
+
+`deep` has still never met a real provider, and neither has the 500-agent
+claim. The gap narrowed; it did not close.
+
 ## Next up
 
 - [x] Kernel, pipeline, harnesses, gates, HITL state machine, router

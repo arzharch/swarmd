@@ -193,6 +193,11 @@ else the product says it does, it demonstrably does.
    against the measured budget and have never met a real provider.
 3. **Volume.** The success rate rests on single-digit task counts.
 
+Item 2 changed the same day it was written: a `standard`-profile chaos run went
+through on live providers — 25 of 25 nodes, 34 agents with 9 killed and resumed
+from checkpoint, integrity hash intact, $0.00. What has still never met a real
+provider at that scale is `deep`.
+
 Down from four because the ablation now compares two genuinely different
 configurations -- it did not, over HTTP, until 2026-09-01, and every eval ever
 started from the dashboard before that compared a configuration against itself.
@@ -228,6 +233,11 @@ in the README and the runbook rather than worked around.
 
 **Verdict: PARTIAL.** Fine for a single-operator evaluation deployment. Not
 production without a second person.
+
+*Added after the re-review:* the acceptance-scale chaos run has now happened
+against live providers, so v1.0's blocker 1 — "everything at 500 agents has run
+against the simulated provider" — is narrowed rather than closed. 34 agents
+recovered under chaos on real traffic; the 500-agent claim remains untested.
 
 ### Security
 

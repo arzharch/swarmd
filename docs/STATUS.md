@@ -70,7 +70,7 @@ The CLI is the same operations without a browser, not a separate product.
 | 8 | Red-team organ | **PASS** — `--seed-rogues all` runs in CI; all five patterns handled, attribution checked |
 | 9 | Skills, economy, consolidation, curriculum, supervisor | **PASS** — library grows, human gate holds, state survives restart, supervisor patches and reverts |
 | 10 | Evaluation harness | **PASS** — both arms with CIs; BENCHMARKS.md refuses simulated data |
-| 11 | Hardening and honest documentation | **PARTIAL** — docs complete (PRR, SECURITY, SLO, RUNBOOK, CAPACITY, 15 ADRs); the acceptance run against real providers has not happened (G-4) |
+| 11 | Hardening and honest documentation | **PARTIAL** — docs complete (PRR, SECURITY, SLO, RUNBOOK, CAPACITY, 15 ADRs); the full-system chaos run at acceptance scale landed on live providers 2026-09-01 (25/25 nodes, 9 agents killed and resumed, $0.00). What remains is the learning measurement itself (G-4) |
 
 ---
 
@@ -120,6 +120,28 @@ node.
 chaos`: `swarmd demo kernel --kill-rate 0.9 --tasks 40`, and step `swarm run
 completes under chaos`. Verified at 0.9 rather than 0.2 because the gate has no
 error budget.
+
+**And at acceptance scale on live providers, 2026-09-01** — the SPEC Phase 11
+deliverable, which until now had only ever run against the simulated provider:
+
+```
+swarmd swarm run "<logistics scheduling task>" --profile standard --chaos --no-skills
+
+run=run-61cd7e40d6  status=completed  34.5s
+criterion=9368bc96464e34d0 (4 checks, attempts=1)
+plan=655bdafb711165f3 (5 nodes, width=2)
+nodes_passed=25/25  contained=0
+integrity_hash=ee7e549f587d3ae6
+cost=$0.000000 of $0.05 ceiling  calls=17
+prefix_cache=896/6736 prompt tokens served from the provider's cache (13.3%)
+agents=34 alive=25 bankrupt=0 contained=0
+```
+
+Nine of thirty-four agents were killed mid-run and resumed from their
+checkpoints (`resumed`, then `skipped_generate` — the replacement did not
+re-buy the work), every node passed, and the integrity hash came out intact.
+The 13.3% is the PROVIDER's prompt-prefix cache, not the run memo; it is the
+first live reading of either.
 
 **4 — All five seeded rogues detected and contained.** PASS. CI step `red-team
 gate (SPEC Phase 8)` runs `--seed-rogues all`. Four are caught by their own
