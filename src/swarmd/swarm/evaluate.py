@@ -150,6 +150,10 @@ class ArmSummary:
     # Nodes passed over nodes attempted, across every run in the arm. Moves
     # long before the task rate does, which makes it the leading indicator.
     node_pass_rate: float = 0.0
+    # Runs excluded from every figure above because they never reached the
+    # task. Nonzero means this arm was measured over fewer runs than were
+    # requested, and the reader needs to know that before reading the rate.
+    not_attempted: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -186,10 +190,34 @@ def pass_at_k(outcomes: list[TaskOutcome], k: int) -> float | None:
     return round(solved / len(by_task), 4)
 
 
+def attempted(outcome: TaskOutcome) -> bool:
+    """Whether this run actually got to try the task.
+
+    A run stopped by something other than the task -- every provider spent, the
+    cost ceiling reached, the process killed -- produces `solved=False` that is
+    indistinguishable from a run that tried and could not do it. Counting those
+    in a success rate measures the day's remaining capacity and reports it as
+    capability, and the arms are not affected equally: whichever one happens to
+    be running when the day runs out absorbs the whole loss.
+
+    `failed_criterion` IS an attempt: no criterion survived attack, which is a
+    real thing this system failed to do. So is any run that produced node
+    results, whatever it ended as. What is excluded is the run that ended
+    before it had anything to be graded on.
+    """
+    if outcome.status in {"completed", "failed_criterion"}:
+        return True
+    return outcome.nodes_total > 0
+
+
 def summarise(outcomes: list[TaskOutcome], label: str) -> ArmSummary:
+    # Counted, then set aside. The count is reported so a rate computed over
+    # half a sweep cannot be mistaken for one computed over all of it.
+    stopped = [o for o in outcomes if not attempted(o)]
+    outcomes = [o for o in outcomes if attempted(o)]
     if not outcomes:
         return ArmSummary(label, 0, 0, 0.0, (0.0, 0.0), None, (0.0, 0.0),
-                          0.0, 0.0, 0.0, 0, {}, 0.0)
+                          0.0, 0.0, 0.0, 0, {}, 0.0, len(stopped))
     solved = [o for o in outcomes if o.solved]
     successes = [1.0 if o.solved else 0.0 for o in outcomes]
     # Cost per SOLVED task: a run that failed cheaply is not efficient.
@@ -225,6 +253,7 @@ def summarise(outcomes: list[TaskOutcome], label: str) -> ArmSummary:
                 4,
             )
         ),
+        not_attempted=len(stopped),
     )
 
 
@@ -252,9 +281,15 @@ def compare(
 
     # Pair on (task_id, seed). Task difficulty varies far more than the effect
     # being measured, so an unpaired comparison buries the signal in task noise.
-    control_index = {(o.task_id, o.seed): o for o in control}
+    # Only attempted runs pair. A pair where either side was stopped by
+    # capacity contributes a delta of -1 or +1 that says nothing about skills.
+    control_index = {
+        (o.task_id, o.seed): o for o in control if attempted(o)
+    }
     paired_deltas: list[float] = []
     for outcome in treatment:
+        if not attempted(outcome):
+            continue
         match = control_index.get((outcome.task_id, outcome.seed))
         if match is not None:
             paired_deltas.append(
@@ -384,6 +419,14 @@ class EvalReport:
             ]
             if comparison.get("note"):
                 lines.append(f"    {comparison['note']}")
+            stopped = treated["not_attempted"] + baseline["not_attempted"]
+            if stopped:
+                # Loud, because every rate above is computed over what is left.
+                lines.append(
+                    f"    {stopped} run(s) never reached the task (capacity or "
+                    f"ceiling) and are excluded from every figure above. "
+                    f"Re-run those cells before quoting this."
+                )
         return "\n".join(lines)
 
     def write_benchmarks(self, path: str | Path) -> None:

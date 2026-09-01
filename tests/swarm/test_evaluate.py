@@ -32,12 +32,34 @@ from swarmd.swarm.evaluate import (
 def _outcome(
     *, task_id="t1", solved=True, treatment=True, cost=0.001, seed=0,
     arm="custom", first_pass=True, containments=0, simulated=False,
+    status=None, nodes_total=3,
 ):
+    """A run that reached the task, whether or not it solved it.
+
+    An unsolved run here is "completed" with some node failing its criterion,
+    which is what an unsolved run actually looks like. It used to be stamped
+    "error" with no nodes -- the shape of a run that never got to try -- and
+    those are now excluded from the figures, so the fixture would have quietly
+    emptied every arm it appeared in.
+    """
     return TaskOutcome(
         task_id=task_id, arm=arm, domain="general", seed=seed,
         treatment=treatment, solved=solved, cost_usd=cost, tokens=500,
         duration_s=1.0, first_pass=first_pass, containments=containments,
-        status="completed" if solved else "error", simulated=simulated,
+        status=status or "completed", simulated=simulated,
+        nodes_total=nodes_total,
+        nodes_passed=nodes_total if solved else max(0, nodes_total - 1),
+    )
+
+
+def _stopped(*, task_id="t1", treatment=True, seed=0, arm="custom"):
+    """A run that never reached the task: the pool gave up, the ceiling bit, or
+    the process died. No nodes, no grade, and nothing to say about skills."""
+    return TaskOutcome(
+        task_id=task_id, arm=arm, domain="general", seed=seed,
+        treatment=treatment, solved=False, cost_usd=0.0, tokens=0,
+        duration_s=0.4, first_pass=False, containments=0,
+        status="error", simulated=False, nodes_total=0, nodes_passed=0,
     )
 
 
@@ -462,3 +484,54 @@ def test_the_summary_reports_pass_at_k_it_can_compute():
     assert 1 in summary.pass_at_k
     assert 3 in summary.pass_at_k
     assert 5 not in summary.pass_at_k       # only three attempts exist
+
+
+# --- capacity is not capability --------------------------------------------
+
+
+def test_a_run_stopped_by_capacity_is_not_counted_as_a_failure():
+    """The way a long sweep quietly lies.
+
+    A sweep that outlasts the day's provider allowance parks or gives up
+    part-way. Those runs return `solved=False`, which is the same value a run
+    that tried and failed returns, so the success rate silently becomes a
+    measure of how much quota was left. Worse, the loss lands on whichever arm
+    happened to be running at the wall, so the DELTA moves too."""
+    outcomes = [_outcome(task_id=f"t{i}", solved=True, seed=i) for i in range(4)]
+    outcomes += [_stopped(task_id=f"t{i}", seed=i) for i in range(4, 8)]
+
+    summary = summarise(outcomes, "treatment")
+
+    assert summary.runs == 4, "the stopped runs are not part of the sample"
+    assert summary.success_rate == 1.0, "4 of 4 attempts solved it"
+    assert summary.not_attempted == 4, "and the reader is told four are missing"
+
+
+def test_a_pair_is_dropped_when_either_side_never_ran():
+    """A pair where one arm was stopped contributes a +1 or -1 delta that is
+    entirely an artefact of when the quota ran out."""
+    treatment = [_outcome(task_id="t1", solved=True, seed=0)]
+    control = [_stopped(task_id="t1", treatment=False, seed=0)]
+    treatment.append(_outcome(task_id="t2", solved=True, seed=1))
+    control.append(_outcome(task_id="t2", solved=False, treatment=False, seed=1))
+
+    result = compare(treatment, control)
+
+    assert result["pairs"] == 1, "only t2 has both halves"
+    assert result["paired_mean_delta"] == 1.0
+
+
+def test_the_summary_says_when_runs_were_left_out():
+    """Excluding them silently would swap one wrong number for another: a rate
+    over half a sweep, presented as a rate over all of it."""
+    report = EvalReport(
+        outcomes=[
+            _outcome(task_id="t1", solved=True, seed=0),
+            _outcome(task_id="t1", solved=False, treatment=False, seed=0),
+            _stopped(task_id="t2", seed=1),
+            _stopped(task_id="t2", treatment=False, seed=1),
+        ],
+        repeats=1,
+    )
+    rendered = report.render()
+    assert "2 run(s) never reached the task" in rendered
