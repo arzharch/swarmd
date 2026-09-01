@@ -58,7 +58,16 @@ SLOTS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ),
     ("PERCENT", re.compile(r"\d+(?:\.\d+)?\s?(?:%|percent)")),
     ("QUOTED", re.compile(r"\"[^\"\n]{1,80}\"|'[^'\n]{1,80}'")),
-    ("NUMBER", re.compile(r"(?<![\w.])\d[\d,]*(?:\.\d+)?(?![\w.])")),
+    # The trailing guard rejects a following period ONLY when it is a decimal
+    # point. It used to reject any period, which meant a number at the end of a
+    # sentence was invisible to abstraction -- and the end of a sentence is
+    # where an answer gets stated. `"the answer is 42."` yielded no literals at
+    # all, so a distilled step reading `"count permutations of the remaining
+    # <NUMBER> <TERM>: <NUMBER>! = 6."` kept the 6: the factorial's argument
+    # abstracted and its RESULT did not. `shared_literals` cannot catch that
+    # either -- it compares the instruction against the TASK, and a computed
+    # answer never appeared in the task.
+    ("NUMBER", re.compile(r"(?<![\w.])\d[\d,]*(?:\.\d+)?(?!\w|\.\d)")),
     (
         "TERM",
         re.compile(r"\b(?:[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2}|[A-Z]{2,})\b"),

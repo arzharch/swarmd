@@ -33,6 +33,7 @@ from swarmd.swarm.planner import PlanNode
 from swarmd.swarm.run import SwarmRun
 from swarmd.swarm.skills import (
     MIN_DISTINCT_TASKS,
+    PRUNE_MIN_USES,
     Skill,
     SkillLibrary,
     SkillLibraryError,
@@ -697,3 +698,38 @@ def test_a_retired_approach_is_not_revived_by_re_proposing_it(tmp_path):
     assert fresh.skill_id != original.skill_id
     retired = library.get(original.skill_id)
     assert retired is not None and retired.retired
+
+
+def test_a_skill_that_has_already_failed_enough_is_not_offered_again(tmp_path):
+    """Measured cost of waiting for consolidation: 26 uses at 0% success.
+
+    `prune` runs every N TASKS, and within one task a skill can be retrieved by
+    every node -- so a skill the library already had the evidence to withdraw
+    kept being handed to workers until consolidation caught up. Retrieval now
+    applies the same rule, against the same constants, so the damage is capped
+    at the evidence threshold rather than at the consolidation interval.
+    """
+    library = SkillLibrary(str(tmp_path / "skills.json"))
+    skill = library.propose(
+        name="approach: produce total",
+        task_pattern="add the slot_term line items into a total",
+        instruction="Sum the line items and round once at the end.",
+        evidence_task="shape-a",
+    )
+    library.propose(
+        name="approach: produce total",
+        task_pattern="add the slot_term line items into a total",
+        instruction="Sum the line items and round once at the end.",
+        evidence_task="shape-b",
+    )
+    library.approve(skill.skill_id, actor="reviewer")
+    query = "add the line items into a total"
+    assert library.retrieve(query), "offered while it still has standing"
+
+    for _ in range(PRUNE_MIN_USES):
+        library.record_use(skill.skill_id, success=False)
+
+    assert library.retrieve(query) == [], "and withheld once the record is in"
+    # Consolidation still does the retiring; this only stops the bleeding.
+    assert not library.get(skill.skill_id).retired
+    assert library.prune()

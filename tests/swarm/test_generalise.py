@@ -822,3 +822,25 @@ def test_a_word_is_not_split_where_the_writer_put_no_boundary():
     assert _identifier_parts("counterpart") == ["counterpart"]
     assert _identifier_parts("stock_count") == ["stock", "count"]
     assert _identifier_parts("nextCursor") == ["next", "cursor"]
+
+
+def test_a_number_at_the_end_of_a_sentence_is_still_a_literal():
+    """Where an answer gets stated, and where abstraction could not see one.
+
+    The NUMBER guard rejected any following period so that `1.25` would not be
+    split, and swallowed sentence-final digits with it: `"the answer is 42."`
+    yielded no literals at all. A distilled step then kept `"<NUMBER>! = 6."` --
+    the factorial's argument abstracted, its RESULT preserved -- and
+    `shared_literals` cannot catch that, because it compares the instruction
+    against the TASK and a computed answer never appeared there.
+    """
+    assert literals("the answer is 42.") == {"42"}
+    assert abstract("3! = 6.").template == "<NUMBER>! = <NUMBER>."
+
+    # The decimal this guard exists for is still one literal, not two.
+    assert abstract("costs 1.25 dollars").template == "costs <MONEY>"
+    assert abstract("due 2024-01-05.").template == "due <DATE>."
+    # And the method phrasing KEEP_AFTER protects is untouched.
+    assert abstract("round to 2 decimal places").template == (
+        "round to 2 decimal places"
+    )

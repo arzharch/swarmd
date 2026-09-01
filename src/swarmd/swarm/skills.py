@@ -285,6 +285,18 @@ def approach_key(name: str, task_pattern: str) -> str:
 # csv.DictReader with an explicit dialect" is a good skill. This floor only
 # rejects the degenerate case; hallucinated-but-plausible content is what the
 # human approval gate and success-rate pruning are for.
+# The record at which an approved skill has demonstrably stopped earning its
+# retrieval slot. Shared by `prune`, which retires on it, and by `retrieve`,
+# which stops offering on it -- one rule, so a skill cannot be simultaneously
+# too poor to keep and still being handed to workers.
+#
+# Why 5 uses: a skill that failed twice may have met two hard tasks. Why 30%:
+# well below useful, so only clearly-harmful entries are caught; pruning harder
+# would shrink the library toward the current task distribution, which is
+# overfitting by another name.
+PRUNE_MIN_USES = 5
+PRUNE_MIN_SUCCESS_RATE = 0.3
+
 MIN_INSTRUCTION_CHARS = 8
 MAX_INSTRUCTION_CHARS = 2_000
 MAX_NAME_CHARS = 120
@@ -851,7 +863,7 @@ class SkillLibrary:
           token cost on a quota-bound system. Three gives the worker options
           without crowding out the task itself.
         """
-        usable = self.approved()
+        usable = [s for s in self.approved() if not self._spent(s)]
         if not usable:
             return []
 
@@ -901,7 +913,34 @@ class SkillLibrary:
             skill.successes += 1
         self.save()
 
-    def prune(self, *, min_uses: int = 5, min_success_rate: float = 0.3) -> list[Skill]:
+    @staticmethod
+    def _spent(skill: Skill) -> bool:
+        """Has this skill already earned a pruning verdict?
+
+        `prune` runs at consolidation, which is every N TASKS -- and within one
+        task a skill can be retrieved by every node. So a skill that is failing
+        kept being offered until the next consolidation caught up with it.
+        Measured: an approved skill reached **26 uses at 0% success** before it
+        was retired, which is 26 workers handed advice the library already had
+        the evidence to withdraw.
+
+        Checked here as well, against the same constants, so the damage is
+        capped at the evidence threshold instead of at whatever the
+        consolidation interval happens to be. Consolidation still does the
+        retiring: this only stops the bleeding, and a skill it hides is a skill
+        the next `prune` will retire for the same reason.
+        """
+        return (
+            skill.uses >= PRUNE_MIN_USES
+            and skill.success_rate < PRUNE_MIN_SUCCESS_RATE
+        )
+
+    def prune(
+        self,
+        *,
+        min_uses: int = PRUNE_MIN_USES,
+        min_success_rate: float = PRUNE_MIN_SUCCESS_RATE,
+    ) -> list[Skill]:
         """Retire skills with a demonstrated poor record.
 
         ANATOMY: min_uses
