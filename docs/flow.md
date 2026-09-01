@@ -2977,18 +2977,20 @@ finally worth spending quota on.
 - [x] Profiles sized to the measured budget; any agent count honoured exactly,
       with a preflight that prices it before the run starts
 - [x] Distillation records an approach rather than the answer it produced
-- [ ] Volume, and it is STRUCTURAL not statistical: the suite needs task
-      FAMILIES sharing an output shape, or no skill ever reaches two
-      distinct shapes and the library can never promote (measured
-      2026-09-01: 22 skills, 5 shapes, 0 promotable)
+- [x] Task FAMILIES sharing an output shape, without which no skill ever
+      reaches two distinct shapes and the library can never promote. Done
+      2026-09-01: a `train` arm of 15 in 5 families, plus an identity that
+      lets two phrasings of one approach be one record. 2 skills approved on
+      their own evidence, where every previous session produced 0
+- [ ] Volume, now that it can pay off: 5 families of 3 promoted 2 approaches.
+      More families and more members per family is what turns 2 into a
+      library big enough to move a five-task eval
 - [x] The ablation actually compares two different things (it did not before)
 - [x] pass@k and node pass rate reported and traceable
-- [ ] Re-measure learning with the node-anchor fix: blocked on daily quota
-- [ ] Volume, and it is STRUCTURAL not statistical: the suite needs task
-      FAMILIES sharing an output shape, or no skill ever reaches two
-      distinct shapes and the library can never promote (measured
-      2026-09-01: 22 skills, 5 shapes, 0 promotable)
-- [ ] The learning curve: 50-200 tasks with the control arm, once runs pass
+- [x] Re-measure learning: the node-anchor fix was never the blocker. The
+      library could not promote at all, for two reasons neither of which
+      was quota (ADR-014); the ablation over the unseen `custom` arm runs
+      on a library with approved skills for the first time
 - [ ] The learning curve: 50-200 tasks with the control arm, then and only then
       generate BENCHMARKS.md and make an improvement claim
 - [x] Product posture: operator token, edge allowlist, rate limits, JSON logs
