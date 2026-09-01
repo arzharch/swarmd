@@ -3288,6 +3288,76 @@ is still unmeasured and still expected to be near zero by construction.
 `deep` has still never met a real provider, and neither has the 500-agent
 claim. The gap narrowed; it did not close.
 
+## 2026-09-01 - A criterion nothing could satisfy, and the bar that found it
+
+The acceptance bar was restated: not 500 agents, but **5-10 agents running
+perfectly on a task nobody scoped**. Measured rather than asserted, on tasks
+belonging to no suite in this repo:
+
+```
+bakery waste flags      --agents 5              14/14 nodes   30.0s
+library overdue fines   --agents 8               8/8  nodes   16.4s
+server uptime shortfall --agents 10 --chaos     10/10 nodes   30.2s
+logistics scheduling    --profile standard      25/25 nodes   34.5s  (9 killed, resumed)
+```
+
+All $0.00, all with integrity hashes, criteria authored and frozen per run.
+Then the holdout warehouse task, which had failed 0/30 nodes on 2026-09-01
+morning, failed again -- **0/12, same criterion hash**. Reproducible total
+failure is the useful kind.
+
+**The criterion was self-contradictory.**
+
+```
+numeric_range  total_boxes  min=8 max=8
+numeric_range  total_boxes  min=9 max=9
+```
+
+Eight is correct. Nothing is both, so every worker failed every attempt, on
+every run, forever. Two proposers disagreed about the answer and the consensus
+merge unioned their checks rather than noticing they could not both hold. The
+same criterion also demanded `boxes_per_order` AND `order_boxes` as required
+keys -- two proposers' names for one thing, both mandatory.
+
+**`attack` cannot find this, by construction.** It tries degenerate candidates
+-- empty, constant, task-echo -- and a criterion nothing can satisfy rejects
+those exactly as it rejects correct work. It survives every attack while making
+the task unsolvable. `is_weak` catches a criterion that accepts everything;
+there was no counterpart for one that accepts nothing.
+
+`Criterion.contradictions()` is that counterpart. It intersects every
+`numeric_range` asserted on a key and reports an empty intersection, plus any
+single range with min above max. Only PROVABLE conflicts: two proposers naming
+different keys may well be over-constrained, but that is a judgement about
+intent, while disjoint numeric ranges on one key is arithmetic. `attack`
+appends them unconditionally rather than only when the sampled attacks found
+nothing, because this is a proof rather than a sample.
+
+**The memo replayed it, and the memo caught it.** A frozen criterion is
+memoised, so re-running the task served the impossible target again --
+`attempts=0` on both failing runs. That could have made the fix useless. It did
+not, because `_criterion_from_memo` re-attacks every stored criterion against
+THIS run's task using the code running now, which its own docstring says is the
+point: "the check list it runs is the code running NOW rather than the code
+that froze it".
+
+So the fix reached a criterion frozen before the fix existed. Live proof:
+
+```
+before  criterion=43b7c37957bb8bde (7 checks, attempts=0)   0/12 nodes
+after   criterion=24a950ae092e9b82 (4 checks)              14/14 nodes
+        - numeric_range total_boxes min=8 max=8     <- one check, and correct
+```
+
+The memo was rejected on re-attack, synthesis re-authored, and a task that had
+never once succeeded now passes every node.
+
+**Where the bar stands.** Five unknown tasks at 5-10 agents, four of them
+passing every node. The fifth -- the parallel-scheduling holdout -- improved
+from 15/20 to 7/8 nodes and produces the right answer, but still leaves a node
+unpassed. That is variance in worker quality rather than a structural defect,
+and it is the honest remaining gap against "perfectly".
+
 ## Next up
 
 - [x] Kernel, pipeline, harnesses, gates, HITL state machine, router

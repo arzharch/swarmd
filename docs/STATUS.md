@@ -99,6 +99,23 @@ reader can re-run the thing rather than trust the row.
 Phase 11's own gate, and it is complete except where the rows below say
 otherwise.
 
+**2a — Unknown tasks at the sizes this product is for, 2026-09-01.** Five
+tasks belonging to no suite in this repo, live providers, `--no-skills`:
+
+```
+bakery waste flags      --agents 5           14/14 nodes  30.0s  $0.00
+library overdue fines   --agents 8            8/8  nodes  16.4s  $0.00
+server uptime shortfall --agents 10 --chaos  10/10 nodes  30.2s  $0.00
+warehouse box counts    --agents 8           14/14 nodes         $0.00
+parallel scheduling     --agents 8            7/8  nodes  (right answer)
+```
+
+The warehouse task is the interesting one: it failed 0/30 and then 0/12 with
+the same memoised criterion, which turned out to be self-contradictory --
+`total_boxes` required to be exactly 8 AND exactly 9. `Criterion.contradictions()`
+now refuses that at freeze, and because the memo path re-attacks stored criteria
+with current code, the fix reached a criterion frozen before it existed.
+
 **2 — A held-out task runs end to end with no code change.** PASS mechanically,
 2026-09-01, live providers, submitted through `POST /api/runs`:
 
