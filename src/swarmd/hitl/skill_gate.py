@@ -115,7 +115,11 @@ class SkillGate:
                 # The reviewer needs to see what they are approving, and a
                 # reference they have to go look up is a reference nobody looks
                 # up. Truncated because the queue is meant to be skimmable.
-                "instruction": skill.instruction[:600],
+                # SERVED, not stored: a reviewer has to approve the text
+                # workers will actually be given, and the two differ once a
+                # second task shape has corroborated the advice.
+                "instruction": skill.served_instruction[:600],
+                "instruction_as_distilled": skill.instruction[:600],
                 "provenance_run": run_id,
                 "provenance_criterion": criterion_hash,
                 "verified_successes": evidence,

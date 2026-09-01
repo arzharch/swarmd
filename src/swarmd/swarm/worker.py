@@ -155,11 +155,16 @@ def skills_block(skills: Sequence[Skill]) -> str:
 
     The instruction opens "When a step calls for this:", so it introduces
     itself; the label was never carrying meaning the worker needed.
+
+    `served_instruction`, not `instruction`. The stored text is ONE task's
+    wording of the approach, kept verbatim because it is half of the content
+    address; what a worker sees is that wording reduced to the words a second,
+    differently-shaped task also used. See `Skill.served_instruction`.
     """
     if not skills:
         return ""
     return "APPROACHES THAT WORKED BEFORE (use if applicable):\n" + "\n".join(
-        f"- {s.instruction}" for s in skills
+        f"- {s.served_instruction}" for s in skills
     )
 
 

@@ -52,7 +52,13 @@ from swarmd.swarm.planner import (
 from swarmd.swarm.redteam import RedTeam
 from swarmd.swarm.rogues import RogueSeeder, parse_patterns
 from swarmd.swarm.runstore import RunState, RunStore
-from swarmd.swarm.skills import MAX_NAME_CHARS, MIN_DISTINCT_TASKS, SkillLibrary
+from swarmd.swarm.skills import (
+    INSTRUCTION_PREFIX,
+    INSTRUCTION_SHAPE_CLAUSE,
+    MAX_NAME_CHARS,
+    MIN_DISTINCT_TASKS,
+    SkillLibrary,
+)
 from swarmd.swarm.synthesis import (
     PROPOSAL_SCHEMA_HINT,
     PROPOSER_SYSTEM,
@@ -1856,7 +1862,7 @@ class SwarmRun:
         if not shapes:
             # Nothing structured to generalise from. Describe the work and stop
             # rather than inventing a method nobody demonstrated.
-            return f"When a step calls for this: {what}"
+            return f"{INSTRUCTION_PREFIX}{what}"
 
         # THE TYPES, NOT THE KEY NAMES. Artifact keys are chosen by the worker
         # for the task in front of it, so `most_users`, `preference_threshold`
@@ -1882,9 +1888,12 @@ class SwarmRun:
         # -- and every skill from that run is lost. The same trap the removed
         # success-count comment describes, walked into from the other side.
         kinds = ", ".join(sorted(set(shapes.values())))
+        # The prefix and the shape clause are shared with `skills.py`, which
+        # splits on them: `what` is the one span written by a model about one
+        # task, so it is the one span `Skill.served_instruction` corroborates.
         return (
-            f"When a step calls for this: {what} "
-            f"Produce a JSON object whose values are of these kinds: {kinds}. "
+            f"{INSTRUCTION_PREFIX}{what}"
+            f"{INSTRUCTION_SHAPE_CLAUSE}{kinds}. "
             f"Take the KEY NAMES from your own criterion, never from here -- "
             f"this records the shape that satisfied a different task, and its "
             f"keys and its values will both differ from yours."

@@ -51,6 +51,7 @@ from swarmd.swarm.generalise import (
     METHOD_LEXICON,
     _stem,
     abstract,
+    corroborate,
     render_pattern,
     shared_literals,
 )
@@ -164,6 +165,12 @@ class Skill:
     # file with these fields refuses it, which is the one-way direction
     # `_load`'s unknown-field check already enforces.
     evidence_tasks: tuple[str, ...] = ()
+    # The instruction each of those shapes distilled, in the same order. Kept
+    # so promotion can VERIFY the advice rather than trust it: two task shapes
+    # producing the same approach also produced two independent wordings of
+    # it, and what only one of them said came from that one task. See
+    # `served_instruction`. Defaulted for libraries written before this field.
+    evidence_instructions: tuple[str, ...] = ()
     # How much of the ORIGINATING step was method vocabulary rather than the
     # task's own words, before literals were stripped. A reviewer signal, not a
     # gate: a low score says "this step was mostly the task restated", which is
@@ -181,6 +188,8 @@ class Skill:
         # invariant holds for every construction path, including a test's.
         if not isinstance(self.evidence_tasks, tuple):
             self.evidence_tasks = tuple(self.evidence_tasks)
+        if not isinstance(self.evidence_instructions, tuple):
+            self.evidence_instructions = tuple(self.evidence_instructions)
 
     @property
     def promotable(self) -> bool:
@@ -205,6 +214,52 @@ class Skill:
     @property
     def usable(self) -> bool:
         return self.approved and not self.retired
+
+    @property
+    def served_instruction(self) -> str:
+        """What a worker is actually shown, and what a reviewer approves.
+
+        NOT `instruction`, which is one task's wording of the approach and is
+        kept verbatim because it is half of the content address. This is that
+        wording with every prose word no OTHER contributing task also used
+        removed -- the verification step ADR-015 named as missing.
+
+        Domain-as-method contamination is one task's vocabulary by
+        construction: `probes`, `monitoring`, `stock levels` reach the library
+        because the planner knew the subject, and no rule can tell them from
+        `parse` and `validate` by looking. It does not need to. A second task
+        of a DIFFERENT shape, which the promotion bar already requires, either
+        used the word too -- in which case it is not one task's vocabulary --
+        or did not, in which case it goes. Deterministic, no threshold, no
+        classifier, and nothing tuned on a sample.
+
+        Falls back to the stored instruction when there is only one variant,
+        or when the format is not the distiller's. Both are honest: a single
+        variant corroborated against itself would look verified and is not.
+        """
+        parts = split_instruction(self.instruction)
+        if parts is None or len(self.evidence_instructions) < 2:
+            return self.instruction
+        # DISTINCT wordings. `merge_identity` replays one record's single
+        # instruction once per shape it had accrued, so a migrated library can
+        # hold the same string several times -- and corroborating a string
+        # against itself claims a verification that never happened.
+        prose = list(dict.fromkeys(
+            split[1]
+            for variant in self.evidence_instructions
+            if (split := split_instruction(variant)) is not None
+        ))
+        if len(prose) < 2:
+            return self.instruction
+        prefix, _, tail = parts
+        agreed = corroborate(prose)
+        if not agreed:
+            # Nothing in the prose survived two tasks. The advice keeps the
+            # part that is generated from structure and says nothing else --
+            # the "structured parts only" instruction ADR-015 describes,
+            # arrived at by evidence rather than chosen up front.
+            return tail.strip() or self.instruction
+        return f"{prefix}{agreed} {tail}".rstrip() if tail else f"{prefix}{agreed}"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -300,6 +355,32 @@ PRUNE_MIN_SUCCESS_RATE = 0.3
 MIN_INSTRUCTION_CHARS = 8
 MAX_INSTRUCTION_CHARS = 2_000
 MAX_NAME_CHARS = 120
+
+# The one prose span in a distilled instruction, and therefore the only span
+# corroboration has anything to do. Everything around it is generated from
+# structure -- the artifact's value kinds and a fixed warning -- and is
+# identical in every variant by construction, so intersecting it would only
+# shred a sentence that carries nothing a task contributed. Defined here rather
+# than in `run.py` because BOTH sides need the same two strings: the distiller
+# writes them and `Skill.served_instruction` splits on them.
+INSTRUCTION_PREFIX = "When a step calls for this: "
+INSTRUCTION_SHAPE_CLAUSE = " Produce a JSON object whose values are of these kinds: "
+
+
+def split_instruction(instruction: str) -> tuple[str, str, str] | None:
+    """`(prefix, prose, tail)`, or None if this is not a distilled instruction.
+
+    None rather than a guess. A library predating this format, or an
+    instruction written by hand, has no identifiable prose span, and treating
+    the whole string as prose would corroborate the boilerplate away.
+    """
+    if not instruction.startswith(INSTRUCTION_PREFIX):
+        return None
+    body = instruction[len(INSTRUCTION_PREFIX) :]
+    cut = body.find(INSTRUCTION_SHAPE_CLAUSE.strip())
+    if cut < 0:
+        return INSTRUCTION_PREFIX, body.strip(), ""
+    return INSTRUCTION_PREFIX, body[:cut].strip(), body[cut:]
 
 
 def validate_instruction(instruction: str, *, source_task: str = "") -> str:
@@ -582,7 +663,11 @@ class SkillLibrary:
             # out of reach entirely (ADR-014).
             existing = self._same_approach(name, pattern)
         if existing is not None:
-            if self._add_evidence(existing, evidence_task):
+            # The NEW wording travels with the new fingerprint. This is the
+            # whole input to `served_instruction`: without it a second shape
+            # confirms that the approach transfers but leaves no way to tell
+            # which words were the approach and which were the first task.
+            if self._add_evidence(existing, evidence_task, instruction.strip()):
                 self.save()
             return existing
         skill = Skill(
@@ -593,6 +678,7 @@ class SkillLibrary:
             provenance_run=run_id,
             provenance_criterion=criterion_hash,
             evidence_tasks=(evidence_task,) if evidence_task else (),
+            evidence_instructions=(instruction.strip(),) if evidence_task else (),
             generality=round(generality, 4),
         )
         self._skills[skill_id] = skill
@@ -629,13 +715,23 @@ class SkillLibrary:
         return None
 
     @staticmethod
-    def _add_evidence(skill: Skill, task_fingerprint: str) -> bool:
-        """Idempotent by construction: a repeated shape is not new evidence."""
+    def _add_evidence(
+        skill: Skill, task_fingerprint: str, instruction: str = ""
+    ) -> bool:
+        """Idempotent by construction: a repeated shape is not new evidence.
+
+        `instruction` is how the NEW shape worded this approach. Optional
+        because `record_evidence` is called from paths that only carry a
+        fingerprint; when it is absent the wording list simply does not grow,
+        and `served_instruction` corroborates over what it has.
+        """
         if not task_fingerprint or task_fingerprint in skill.evidence_tasks:
             return False
         if len(skill.evidence_tasks) >= MAX_EVIDENCE_TASKS:
             return False
         skill.evidence_tasks = (*skill.evidence_tasks, task_fingerprint)
+        if instruction and instruction not in skill.evidence_instructions:
+            skill.evidence_instructions = (*skill.evidence_instructions, instruction)
         return True
 
     def approve(self, skill_id: str, *, actor: str, force: bool = False) -> Skill:

@@ -39,6 +39,7 @@ from __future__ import annotations
 import functools
 import hashlib
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 # Ordered, longest-match-first. Order IS the semantics: `1.25 dollars` must be
@@ -974,3 +975,94 @@ def rebind(text: str, mapping: tuple[tuple[str, str], ...]) -> str:
     for old, new in mapping:
         text = re.sub(rf"(?<![\w.]){re.escape(old)}(?![\w.])", new, text)
     return text
+
+
+# ANATOMY: corroborate
+#   The one place distillation VERIFIES instead of trusting (ADR-015 named this
+#   as the deeper fault: everything else in this system is criterion-first, and
+#   a skill's claim -- "this approach transfers" -- went untested until it was
+#   already in worker prompts).
+#
+#   A skill only reaches a human once two DISTINCT task shapes have produced
+#   it. That means two independently distilled instructions exist for the same
+#   approach, and the difference between them is exactly the part that came
+#   from one task rather than from the method. Domain-as-method contamination
+#   -- `probes`, `monitoring`, `stock levels` -- is one task's vocabulary by
+#   construction, so it cannot appear in the other variant unless the other
+#   task genuinely called for it too, in which case it is not contamination.
+#
+#   Deterministic, threshold-free, and it uses evidence the promotion bar
+#   already requires. It is NOT a classifier: nothing here decides whether a
+#   word is domain vocabulary. It keeps what more than one task attested and
+#   drops what only one did.
+#
+#   Method words and function words are kept unconditionally. They are the
+#   vocabulary the abstraction already treats as task-independent, so
+#   intersecting them would only shred the sentence without removing anything
+#   a task contributed.
+_SEGMENT = re.compile(r"[A-Za-z][A-Za-z0-9_-]*|[^A-Za-z]+")
+_DANGLING = re.compile(r"\s+([,.;:])")
+_REPEATED_COMMA = re.compile(r",(\s*,)+")
+_SENTENCE = re.compile(r"[^.!?]*[.!?]|[^.!?]+")
+
+
+def corroborate(variants: Sequence[str]) -> str:
+    """Keep only the words EVERY variant of this advice used.
+
+    `variants` are instructions distilled independently for the same approach
+    from different task shapes. With fewer than two there is nothing to
+    corroborate and the text is returned unchanged -- deliberately, because
+    a single variant intersected with itself would look verified and is not.
+    """
+    kept_variants = [v for v in variants if v.strip()]
+    if len(kept_variants) < 2:
+        return kept_variants[0].strip() if kept_variants else ""
+
+    attested: set[str] | None = None
+    for variant in kept_variants:
+        stems = {_stem(token) for token in content_tokens(variant)}
+        attested = stems if attested is None else (attested & stems)
+    assert attested is not None
+
+    # Sentence by sentence, because a sentence that loses every word carrying
+    # meaning should GO rather than survive as a string of connectives. That
+    # case is the "structured parts only" instruction ADR-015 describes: the
+    # advice keeps the shape two tasks proved and drops the prose one task
+    # supplied.
+    out = [
+        rebuilt
+        for sentence in _SENTENCE.findall(kept_variants[0])
+        if (rebuilt := _corroborate_sentence(sentence, attested))
+    ]
+    return " ".join(out).strip()
+
+
+def _corroborate_sentence(sentence: str, attested: set[str]) -> str:
+    kept: list[str] = []
+    substantive = False
+    for segment in _SEGMENT.findall(sentence):
+        if not segment[:1].isalpha():
+            kept.append(segment)
+            continue
+        lowered = segment.lower()
+        if lowered in METHOD_LEXICON or _stem(lowered) in attested:
+            substantive = True
+        elif lowered not in FUNCTION_WORDS:
+            continue
+        elif not substantive:
+            # A connective with nothing yet in front of it is debris left by
+            # the word that was dropped -- "and to collect" out of "probes and
+            # monitoring to collect". Function words earn their place by
+            # joining things that survived, not by being harmless.
+            continue
+        kept.append(segment)
+    if not substantive:
+        return ""
+    # Removing a word leaves the punctuation that separated it. Tidied rather
+    # than left, because this string is read by a human at the approval gate
+    # and written into a worker prompt, and both are worse for the debris.
+    text = "".join(kept)
+    text = _REPEATED_COMMA.sub(",", text)
+    text = _DANGLING.sub(r"\1", text)
+    text = re.sub(r"[ \t]+", " ", text)
+    return text.strip().lstrip(" ,;:-").strip()
