@@ -2178,3 +2178,196 @@ any more. Raising a deadline is not
 always a fix, but here the assertion was about behaviour and the timeout was
 only there to stop a hang, so a deadline tight enough to fire on scheduling
 noise was measuring the machine rather than the product.
+
+---
+
+## Section 15: The learning loop, and why it never turned (answerable NOW)
+
+**Q: Your eval reported "no measured improvement" for months. Was the system
+not learning?**
+
+It was never asked. Four separate mechanisms produced that sentence for reasons
+unrelated to learning, and each one was found by looking at what the code
+actually did rather than what it returned.
+
+1. `swarmd eval` constructed both arms without a skill library, so
+   `self.skills = skills if use_skills else None` was `None` in both. The arms
+   were the same code. Fixed in the CLI on 2026-08-29.
+2. `_eval_runner` in the control plane kept doing exactly that for four more
+   days, so every eval started from the dashboard was a null-result generator.
+3. The session trained on the same tasks the eval measured, so any improvement
+   it did show would have been memorisation.
+4. The success rate counted runs stopped by capacity as failures, so a sweep
+   long enough to outlast the day's quota measured leftover quota and reported
+   it as capability -- and the loss landed on whichever arm hit the wall, so the
+   delta moved too.
+
+With all four fixed it still produced nothing, and that is where the real answer
+is: the library could not promote a single skill, ever, for two structural
+reasons. ADR-014.
+
+**Q: What were the two reasons?**
+
+A skill becomes reviewable only once it is `promotable`: verified on two
+DISTINCT task shapes. Both preconditions for clearing that bar failed.
+
+*The corpus had no shared structure.* Twelve evaluated tasks with twelve
+disjoint output shapes. An approach distilled from a median repair is never
+proposed by a colour-ordering puzzle, so no skill ever accrued a second shape.
+This is unreachable at any sample size -- a thousand unrelated tasks promote
+exactly as many as twelve: none.
+
+*Identity fragmented on wording.* `make_skill_id` hashes the instruction, the
+instruction is written by a model, so the same approach came back phrased
+differently every run and minted a fresh record starting again from one shape.
+
+**Q: You tried the second fix alone first, measured it, and reverted it. Why
+was that right, and why did you then put it back?**
+
+Measured against the old corpus it changed nothing: grouping 22 records by
+abstracted name and pattern still gave zero approaches with two shapes, because
+no two tasks shared an approach in the first place. Shipping a change to what
+"the same skill" means, on evidence that it fixes nothing, would have been
+shipping on faith.
+
+What the measurement showed is that merging is *insufficient*, not that it is
+unnecessary. That distinction is the whole lesson. On a corpus with families it
+becomes load-bearing: two tasks propose the same approach, phrase it
+differently, and without merging the evidence lands in two records of one shape
+each instead of one record with two. Both changes had to land together, and
+neither alone would have turned the loop.
+
+**Q: Why not lower `MIN_DISTINCT_TASKS` to 1? The bar is what is blocking you.**
+
+Because the bar is the claim. `MIN_DISTINCT_TASKS = 1` means "this worked once"
+is enough to put an approach in front of a reviewer and inject it into every
+future run that retrieves it. That is not a transfer claim, and the retrieval
+path fills with one-off advice -- which is the failure the bar was added to
+prevent after the library filled with skills anchored to plan node names.
+
+Lowering a bar because nothing clears it is how a metric stops measuring
+anything. The corpus was wrong, not the bar.
+
+**Q: What is `approach_key`, and why does it deliberately exclude the plan
+step?**
+
+It is the identity used for evidence accrual: a sha256 over the abstracted
+artifact-shape name plus the closed vocabulary of criterion check kinds that
+graded it. `skill_id` still hashes the instruction, so a stored record still
+verifies against its own content.
+
+The plan step is excluded because plans are synthesised per task. A key
+containing the step can only ever match another proposal from the SAME task --
+which is precisely the evidence the bar refuses to count. So a step-inclusive
+key is not merely strict, it is structurally incapable of ever accruing the
+second shape. That took a measurement to see: four proposals from one task,
+four distinct step texts, no cross-task match available at any sample size.
+
+**Q: Then two different steps of one task merge into one skill. Is that not a
+bug?**
+
+It is a stated cost, and it is asserted in a test so it stays deliberate. Two
+steps merge only when they produce the same artifact shape under the same
+checks -- and those two records were already competing for the same retrieval
+slot, because the index terms come from the same name. The library was not
+distinguishing them either. Which of two approaches survives is what the human
+gate and success-rate pruning decide; `approach_key` only decides what counts
+as one.
+
+**Q: Why is the training set unexpressible in `EvalRequest` rather than just
+documented as off-limits?**
+
+Because a convention a person has to keep is what failed here twice in one day.
+A session trained on the tasks an eval then measured, and nothing stopped it;
+an eval ran with identical arms, and nothing stopped that either. Measuring over
+the tasks a library was built from is memorisation, so `SessionRequest.arms`
+accepts `train` and `EvalRequest.arms` does not. The pattern refuses it before
+any code runs.
+
+**Q: You started a 30-cell ablation and cancelled it at cell 5. Justify
+spending nothing there.**
+
+A free check first: neither approved skill retrieved for the task it was built
+for. Across the five custom tasks the hit counts were 0, 0, 0, 1, 0 -- and the
+one hit offered a permissions-diagnosis skill to a puzzle about the order of
+coloured houses.
+
+The cause is index size. `_idf` weights terms across approved skills; with two
+of them it produced two distinct weights across 32 terms. An IDF with no spread
+is not a weighting -- ranking collapses to raw term overlap. So the experiment
+could not discriminate and its null was knowable in advance. Finishing it would
+have spent roughly 500 requests, most of what the day had left, to confirm
+something already established. The engineering call is to spend budget on
+experiments that can distinguish between hypotheses.
+
+**Q: So what is the minimum useful size of a skill library?**
+
+Unmeasured, and now on the list as a measurement rather than an assumption.
+What is established is that two is below it. This is a property of any TF-IDF
+index, not of this system: with N documents, a term's IDF can take at most a
+handful of values, and below some N the ranking carries no information.
+
+**Q: The dashboard sent no operator token for weeks. How did the tests not
+catch it?**
+
+Because the tests exercised the server and the client separately, and the fault
+was in the gap. Server tests asserted that a gated endpoint refuses a request
+without a token -- true, and passing. The frontend typechecked and built. What
+nothing asserted was that the browser sends one. Reads are ungated, so the page
+rendered live provider data and looked entirely healthy right up to the moment
+someone pressed a button.
+
+The general shape: **two clients of one contract, one of them tested.** The same
+shape produced the eval's missing skill library, fixed in the CLI four days
+before the service.
+
+**Q: Why does `/readyz` check the approval store when `/healthz` does not?**
+
+Because the two probes answer different questions and a wrong answer to either
+is expensive in a different way. Liveness asks "should this process be killed";
+a dependency failure there turns one outage into two by restarting pods that
+were working. Readiness asks "should new work come here", and a control plane
+that cannot reach the approval store cannot run a session -- but the runs it is
+already holding are fine.
+
+That distinction was not theoretical. A session was accepted, spent a task's
+provider quota, and only then hit `ConnectionRefusedError` out of
+`_auto_approve`, because the store is not touched until the first
+consolidation. Ready-looking service, dependency checked too late.
+
+### Parameter questions
+
+**Q: `MIN_DISTINCT_TASKS = 2`. Why two, and what does changing it cause?**
+
+Two is the smallest number that makes the question "does this transfer?"
+answerable at all: one task's evidence, drawn twice, is one observation. Setting
+it to 1 turns the library into a record of things that worked once and puts
+unvalidated advice into every future run. Raising it to 3 or more makes the bar
+stricter and the corpus requirement harder -- with families of three, an
+approach would need to recur across three members, which the current corpus
+would supply only sometimes. Two is the point where the bar means something and
+a realistic corpus can clear it.
+
+**Q: Five families of three, now eight. Why three members?**
+
+Two would be the minimum to supply a second shape, and gives no margin: if one
+member fails its criterion, the family produces nothing. Three means one member
+can fail and the approach still accrues its second shape. Beyond three the
+returns fall off per unit of provider quota -- a fourth member of an existing
+family adds a shape to approaches that already have two, while a new family adds
+a document to a retrieval index that badly needs documents.
+
+**Q: `retrieve(min_score=0.15, limit=3)` -- unchanged today. Are they still
+right?**
+
+`min_score` is unexamined by today's work and remains as documented: low enough
+that a related skill with different phrasing surfaces, high enough that an
+unrelated one does not. What today showed is that the floor cannot compensate
+for an index with no discriminating power -- at two documents, scores are
+term-overlap counts and the floor admits or rejects on that basis alone. The
+parameter is not wrong; it is being asked to do a job that belongs to corpus
+size.
+
+`limit = 3` is a prompt-budget decision, unchanged: skills are injected into a
+worker prompt, and prompt length is token cost on a quota-bound system.
+
