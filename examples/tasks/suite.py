@@ -204,6 +204,60 @@ TRAIN: list[Task] = [
                 "Produce a normalisation mapping onto a single canonical level "
                 "and a summary of how many source levels map onto each "
                 "canonical level."),
+
+    # The three families below were authored to the same pattern as the five
+    # above, AFTER those five were run and shown to promote. They have not
+    # themselves been run: they exist because retrieval needs a library big
+    # enough to discriminate, and two approved skills give an IDF index with
+    # two distinct values across 32 terms -- which scores by term overlap and
+    # nothing else. More families is the lever that fixes that.
+
+    # Family: reconcile two records that disagree.
+    Task("trn-reconcile-1", arm="train", domain="reconciliation", seed=4601,
+         prompt="An invoice totals 1,240 and the payment record shows 1,204. "
+                "Determine which figures disagree and produce the "
+                "reconciliation as structured output."),
+    Task("trn-reconcile-2", arm="train", domain="reconciliation", seed=4602,
+         prompt="A stock count records 87 units while the ledger shows 92. "
+                "Determine which figures disagree and produce the "
+                "reconciliation as structured output."),
+    Task("trn-reconcile-3", arm="train", domain="reconciliation", seed=4603,
+         prompt="A timesheet totals 38 hours and the payroll export shows 41. "
+                "Determine which figures disagree and produce the "
+                "reconciliation as structured output."),
+
+    # Family: order steps under stated dependencies.
+    Task("trn-sequence-1", arm="train", domain="sequencing", seed=4701,
+         prompt="A deployment requires migrating the database, restarting the "
+                "workers and clearing the cache. The migration must precede "
+                "the restart and the cache must be cleared last. Produce the "
+                "ordering and the reason each step sits where it does."),
+    Task("trn-sequence-2", arm="train", domain="sequencing", seed=4702,
+         prompt="A release requires tagging the commit, publishing the "
+                "package and updating the changelog. The tag must precede the "
+                "publish and the changelog must be updated before the tag. "
+                "Produce the ordering and the reason each step sits where it "
+                "does."),
+    Task("trn-sequence-3", arm="train", domain="sequencing", seed=4703,
+         prompt="An onboarding requires creating the account, assigning the "
+                "licence and sending the welcome mail. The account must exist "
+                "before the licence, and the mail must go last. Produce the "
+                "ordering and the reason each step sits where it does."),
+
+    # Family: decide what a threshold classifies, and where it is ambiguous.
+    Task("trn-threshold-1", arm="train", domain="thresholds", seed=4801,
+         prompt="Requests slower than 300 ms are 'slow'. Given timings 120, "
+                "300, 301 and 950, classify each and produce the "
+                "classification plus any case the rule leaves ambiguous."),
+    Task("trn-threshold-2", arm="train", domain="thresholds", seed=4802,
+         prompt="Accounts inactive for more than 90 days are 'dormant'. Given "
+                "last-seen gaps of 12, 90, 91 and 400 days, classify each and "
+                "produce the classification plus any case the rule leaves "
+                "ambiguous."),
+    Task("trn-threshold-3", arm="train", domain="thresholds", seed=4803,
+         prompt="Batches heavier than 25 kg need two handlers. Given weights "
+                "of 9, 25, 26 and 60 kg, classify each and produce the "
+                "classification plus any case the rule leaves ambiguous."),
 ]
 
 # --- held out --------------------------------------------------------------

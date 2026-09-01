@@ -235,6 +235,26 @@ bounded. A null result at this size would mean "not enough library to move
 five tasks", not "skills do not help" -- and the honest fix for that is more
 training volume, which is now finally worth spending.
 
+**The ablation was started and stopped at cell 5 of 30, on purpose.** A free
+check first: neither approved skill retrieves for the task it was built for.
+Over both the bare prompt and the task-plus-step query `worker.py` actually
+issues, the five custom tasks draw 0, 0, 0, 1 and 0 hits -- and the single hit
+is `approach: produce diagnosis, fix` offered to the colour-ordering puzzle,
+not to the ModuleNotFoundError diagnosis.
+
+The cause is index size rather than skill quality. `_idf` weights terms across
+APPROVED skills; with two of them it yields two distinct values over 32 terms,
+so ranking collapses to raw term overlap. An experiment run on that index
+cannot discriminate, and its null was knowable in advance -- so it was stopped
+rather than allowed to spend the ~500 requests the day had left.
+
+**What is left of G-4, precisely.** Not "does self-learning work", and no
+longer "is there quota". It is: *the library has to clear the size at which a
+retrieval index can rank at all.* Two approved skills is demonstrably below it.
+The corpus is now eight families rather than five for exactly that reason, and
+the next step is a session over it followed by the ablation -- one day's quota,
+one command each.
+
 **The re-measurement did not run**, because the day's provider budget was spent
 on the two that did:
 

@@ -2948,6 +2948,43 @@ approved skills aligned to two of the five custom tasks the effect it can show
 is bounded. A null at this size means "not enough library to move five tasks",
 not "skills do not help" -- and the fix for that is training volume, which is
 finally worth spending quota on.
+**And the ablation was started, then stopped at cell 5 of 30 -- deliberately.**
+
+Before spending the rest of the day on it, one free check: does either approved
+skill retrieve for any custom task? The answer, over both the bare prompt and a
+task-plus-step query matching what `worker.py` actually asks:
+
+```
+cus-wrangle-1    0 hits
+cus-paper-1      0 hits
+cus-repo-1       0 hits        <- the task the diagnosis skill was FOR
+cus-puzzle-1     1 hit         <- approach: produce diagnosis, fix
+cus-api-1        0 hits
+```
+
+One hit in five, on the wrong task. The cause is not the skills; it is the size
+of the index. `_idf` computes inverse document frequency across APPROVED
+skills, and with two of them it produced two distinct values across 32 terms.
+An IDF with no spread is not a weighting -- scoring collapses to "how many
+terms overlap", which is how advice about diagnosing a permissions failure came
+to be offered to a puzzle about the order of coloured houses.
+
+So the experiment could not discriminate, and its result was knowable in
+advance: a null, caused by the library being below the size at which retrieval
+means anything. Running it would have spent roughly 500 requests -- most of
+what the day had left -- to confirm that. Cancelled at cell 5.
+
+**This is a threshold, and it is worth stating as one.** A skill library is a
+retrieval index, and an index over two documents cannot rank. Somewhere above
+that, IDF starts carrying information; where exactly is itself a measurement
+nobody here has taken. What is certain is that two is below it.
+
+The corpus went from five families to eight in response -- reconciliation,
+sequencing, thresholds, authored to the same pattern as the five that worked
+and marked in the file as not yet run. More families is the lever: each one
+that promotes an approach adds a document to the index, and it is documents
+that give IDF something to weigh.
+
 
 ## Next up
 
