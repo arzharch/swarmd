@@ -1214,6 +1214,16 @@ def _skills_command(args: argparse.Namespace) -> int:
         shutil.copyfile(staged, destination)
 
     print(f"\nwritten: {destination}")
+    if promotable:
+        # Said out loud because the approval queue will look empty and that is
+        # not a fault. A merged record was never submitted to the gate --
+        # submission happens during distillation, the first time a proposal is
+        # seen to be promotable. The next session proposing one of these
+        # approaches queues it for review.
+        print(
+            "these are not in the approval queue yet: a merged record is "
+            "submitted the next time a run proposes that approach."
+        )
     return 0
 
 
