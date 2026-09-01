@@ -255,10 +255,16 @@ skills to clear the bar on their own evidence exist. Whether retrieving them
 helps is a question this repo can now ask, and has not yet answered.
 ([ADR-014](docs/adr/ADR-014.md))
 
-Two more numbers are unmeasured and worth naming, because both could come back
-worse than hoped: the cache hit rate on genuinely novel tasks (exact keying
-means novel work hits near zero), and whether a real model asked for eight
-distinct approaches returns eight rather than three and five rewordings.
+A `standard`-profile chaos run has now gone through on live providers: 25 of 25
+nodes, 34 agents with 9 killed mid-run and resumed from their checkpoints
+without re-buying the work, integrity hash intact, $0.00. `deep` and the
+500-agent claim still have not.
+
+Two numbers remain unmeasured and worth naming, because both could come back
+worse than hoped: the run memo's hit rate on genuinely novel tasks (exact
+keying means novel work hits near zero -- distinct from the provider's prompt
+prefix cache, which read 13.3% on that run), and whether a real model asked for
+eight distinct approaches returns eight rather than three and five rewordings.
 [STATUS.md](docs/STATUS.md) tracks it as the one remaining gap.
 
 Second domain: [`examples/leadops/`](examples/leadops/) is a sales pipeline on
