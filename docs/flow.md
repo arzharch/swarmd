@@ -3033,6 +3033,91 @@ repeat: a family member that failed its criterion on the first pass and passes
 on the second supplies the second shape its sibling's approach was waiting for.
 Three of eight families promoted an approach on pass one.
 
+## 2026-09-01 - The loop turned, and returned a negative on its own skills
+
+Not from the ablation. From the mechanism.
+
+**The economy pruned both approved skills for failing.** They were retrieved
+during training and scored:
+
+```
+approach: produce diagnosis, fix              0 successes / 26 uses   (0%)
+approach: produce duration_minutes, strategy  5 successes / 27 uses  (19%)
+```
+
+Both under the consolidator's 30% floor, both retired automatically with the
+reason on the record. That is propose -> gate -> retrieve -> measure -> prune,
+running end to end and reaching a verdict without anyone asking it to. It is
+also the first empirical statement this project has ever made about whether its
+own skills help: **retrieved 53 times, succeeded 5.**
+
+**Then the review said why.** Four approaches later cleared the evidence bar.
+Reading them, three were contaminated with their own source task:
+
+- `produce reconciliation` (generality **1.00**, the top score) instructs every
+  future run to emit keys `stock_count` and `ledger_count` -- the stock task's
+  vocabulary, welded into identifiers where the abstraction could not see it.
+- `produce verdict` (0.86) is advice about how UPTIME is measured -- synthetic
+  probes, RUM, probe locations. That is `trn-checkable-1` subject matter, not a
+  method for deciding whether any claim is checkable.
+- `produce count, reasoning` (0.57) ends `<NUMBER>! = 6`. The factorial's
+  ARGUMENT abstracted; its RESULT did not. One task's answer, in a method's
+  grammar -- the exact poisoning `validate_instruction` exists to stop, and it
+  cannot: `shared_literals` compares the instruction against the TASK, and 6
+  never appeared in the task. It was computed.
+
+One survived: `produce count`, three shapes, no literals, a real method (fix a
+position, count the arrangements of the rest). **One clean skill in four.**
+
+So the 0/26 is not mysterious. A worker handed advice that names another task's
+keys, or another task's domain, or another task's answer, is worse off than one
+handed nothing -- which is what the retrieval threshold's own docstring has
+predicted all along.
+
+**The identifier leak is fixed.** `strip_source_terms` now splits on the
+boundaries a writer actually put there -- `_`, `-`, camelCase -- and strips a
+token when every part came from the task and not all of them are method words.
+So `stock_count` collapses to `<TERM>` while `sort_by_price` survives, because
+an identifier made only of method vocabulary is describing the work rather than
+the thing worked on. The other two leaks are recorded here with examples and
+are not yet addressed: domain content presented as method, and a computed
+result that never appeared in the task for `shared_literals` to compare against.
+
+**And the identity was wrong in a way only a measurement showed.** The key
+included the criterion's check kinds. But the criterion is authored fresh for
+every run (ADR-009), so its check set differs between two runs of the same
+work -- which reintroduced the exact fragmentation the key exists to remove,
+one level up. Measured on the 38-record library rather than argued:
+
+```
+name + check kinds   38 approaches,  3 clearing the bar
+name alone           34 approaches,  5 clearing the bar
+```
+
+Keyed on the artifact shape alone now. The test that asserted the old rule was
+replaced rather than deleted, and says why it was wrong.
+
+**Two operational lessons, both learned by losing something.**
+
+`swarmd skills merge` replays records through `propose`, and `propose` mints
+CANDIDATES -- so the first version silently un-approved the library, dropped
+every retired record, and reset the use counts pruning reads. It erased the
+0/26 verdict that had cost 26 retrievals to earn. The merge now carries
+decisions at the approach level: a rejection is never resurrected, an approval
+transfers only when the surviving instruction is the one that was approved, and
+an approval that cannot be carried is reported rather than dropped quietly.
+
+And: **do not hand-edit a library a session has open.** A restore from backup
+was clobbered minutes later by a training session that had loaded the file at
+startup and saved at the end. Last writer wins, and the last writer was holding
+a stale copy.
+
+**Where G-4 stands.** Not "does self-learning work" -- the loop demonstrably
+runs and produces a verdict. The blocker is now **distillation quality**, with
+a rate attached: three of four promoted approaches carried their source task.
+Fixing that is a specific piece of work with examples, which is a better place
+to be than "no measured improvement".
+
 ## Next up
 
 - [x] Kernel, pipeline, harnesses, gates, HITL state machine, router
