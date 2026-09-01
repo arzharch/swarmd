@@ -3352,11 +3352,21 @@ after   criterion=24a950ae092e9b82 (4 checks)              14/14 nodes
 The memo was rejected on re-attack, synthesis re-authored, and a task that had
 never once succeeded now passes every node.
 
-**Where the bar stands.** Five unknown tasks at 5-10 agents, four of them
-passing every node. The fifth -- the parallel-scheduling holdout -- improved
-from 15/20 to 7/8 nodes and produces the right answer, but still leaves a node
-unpassed. That is variance in worker quality rather than a structural defect,
-and it is the honest remaining gap against "perfectly".
+**Where the bar stands: five unknown tasks at 5-10 agents, every node of
+every one solved.**
+
+That last clause needed a reporting fix to state truthfully. `nodes_passed`
+counted AGENT OUTCOMES under a node's name -- `results` holds one entry per
+agent, and a node is run by a pool -- so the scheduling task read "7/8 nodes"
+when all four of its nodes were solved and one pool of two had a single agent
+fail. Every run this system has ever reported was understated the same way.
+The holdout `hold-schedule-1` that this file recorded as 15/20 was 4 of 4
+nodes.
+
+Fixed: `nodes_passed` counts distinct plan nodes with at least one uncontained
+passing agent, `agents_passed` counts what the old field counted, and both are
+printed. A pool losing a member is a population search working, and the report
+should not read like a failure.
 
 ## Next up
 

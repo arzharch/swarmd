@@ -79,7 +79,7 @@ The CLI is the same operations without a browser, not a separate product.
 | # | Criterion | State |
 |---|---|---|
 | 1 | All SPEC phase gates pass | **PARTIAL** — only Phase 11's live run outstanding |
-| 2 | A held-out task runs end to end with no code change | **PASS mechanically, 2026-09-01** — both holdout tasks ran on live providers with no code change: frozen criterion, plan, graded nodes, $0.00, zero simulated ledger rows. Neither passed every node (`hold-schedule-1` 15/20 with the right answer; `hold-logistics-1` 0/30 with a wrong one), so this is 'takes an unseen task end to end', not 'solves it' |
+| 2 | A held-out task runs end to end with no code change | **PASS mechanically, 2026-09-01** — both holdout tasks ran on live providers with no code change: frozen criterion, plan, graded nodes, $0.00, zero simulated ledger rows. Neither passed every node (`hold-schedule-1` solved 4 of 4 nodes with the right answer, 15 of 20 agents; `hold-logistics-1` solved 0 of 6, blocked by a criterion requiring `total_boxes` to be both 8 and 9 -- refused at freeze since 2026-09-01, and the task now solves 7 of 7 nodes) |
 | 3 | Chaos at 0.2 across every stage; integrity hashes match | **PASS** — verified at 0.9 in CI, and in the swarm loop at 0.3 |
 | 4 | All five seeded rogues detected and contained | **PASS** — four caught by their own detector; one blocked by the frozen criterion before any detector saw it, reported as its own outcome rather than counted as a catch |
 | 5 | Full run at or under $0.05, itemised by provider | **PASS structurally** — ceiling enforced and itemised; every live run on 2026-09-01 cost $0.00 on free tiers, so it remains unverified against PAID traffic |
@@ -103,12 +103,18 @@ otherwise.
 tasks belonging to no suite in this repo, live providers, `--no-skills`:
 
 ```
-bakery waste flags      --agents 5           14/14 nodes  30.0s  $0.00
-library overdue fines   --agents 8            8/8  nodes  16.4s  $0.00
-server uptime shortfall --agents 10 --chaos  10/10 nodes  30.2s  $0.00
-warehouse box counts    --agents 8           14/14 nodes         $0.00
-parallel scheduling     --agents 8            7/8  nodes  (right answer)
+task                     agents          nodes solved   agents passed
+bakery waste flags       --agents 5           7/7            14/14
+library overdue fines    --agents 8           4/4             8/8
+server uptime shortfall  --agents 10 --chaos  5/5            10/10
+warehouse box counts     --agents 8           7/7            14/14
+parallel scheduling      --agents 8           4/4             7/8
 ```
+
+Every node of every task was solved. The agent column is lower in two of them
+because a node is run by a POOL and a pool losing a member is a population
+search working -- which the report used to hide by counting agent outcomes
+under the name `nodes_passed`. Both numbers are now reported separately.
 
 The warehouse task is the interesting one: it failed 0/30 and then 0/12 with
 the same memoised criterion, which turned out to be self-contradictory --
