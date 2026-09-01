@@ -1324,15 +1324,29 @@ class SwarmRun:
 
         plan = payload.get("forecast") or {}
         if plan.get("verdict") in {"fits_today_with_pauses", "spans_days"}:
+            # The projection counts only providers with a daily allowance to
+            # spread. Saying so turns a wrong prediction into a floor an
+            # operator can read: "one pause" from a forecast that could not
+            # see the uncapped provider serving most of the traffic is worse
+            # than useless if it is not labelled.
+            uncapped = plan.get("uncapped_providers") or []
+            caveat = (
+                f" Excludes {', '.join(uncapped)}, which have no daily cap to "
+                f"plan against, so this is a floor and the run will likely "
+                f"finish sooner."
+                if uncapped
+                else ""
+            )
             logger.warning(
                 "preflight: ~%d calls needs %d sessions with %d pause(s); "
                 "first pause in %.1fh, projected finish in %.1fh. The run will "
-                "wait rather than fail -- pass --no-wait to stop instead.",
+                "wait rather than fail -- pass --no-wait to stop instead.%s",
                 estimate,
                 plan.get("sessions_needed", 1),
                 plan.get("expected_pauses", 0),
                 max(0.0, (plan.get("first_pause_at") or 0) - time.time()) / 3600,
                 max(0.0, (plan.get("projected_finish") or 0) - time.time()) / 3600,
+                caveat,
             )
         elif plan.get("verdict") == "exceeds_horizon":
             logger.warning(

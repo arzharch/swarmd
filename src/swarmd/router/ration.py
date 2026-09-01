@@ -1047,11 +1047,28 @@ class Ration:
             verdict = "fits_today_with_pauses"
         else:
             verdict = "spans_days"
+        # Providers this projection COULD NOT COUNT. A rate-kind provider has
+        # no day to spread over, so it contributes nothing to a session
+        # capacity and the timeline above is a floor. That was a rounding
+        # error while such providers were a sliver of the pool; with Mistral
+        # loaded it is the largest allowance in the deployment, and a
+        # projection that silently omits it predicts pauses that will not
+        # happen. Named rather than modelled: multiplying a per-minute rate
+        # out over six hours would make every preflight answer "fits" and
+        # hide the pauses that ARE real.
+        uncapped = sorted(
+            name
+            for name, spec in self.tracker.budgets.items()
+            if spec.kind != "quota"
+            and not self.tracker.blocked(name, now=now)
+            and (credentials is None or name in credentials)
+        )
         return {
             "verdict": verdict,
             "estimated_calls": estimated_calls,
             "sessions_needed": max(1, len(used_windows)),
             "expected_pauses": max(0, len(used_windows) - 1),
+            "uncapped_providers": uncapped,
             "first_pause_at": (
                 round(first_pause_at, 3) if first_pause_at is not None else None
             ),

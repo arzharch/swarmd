@@ -175,3 +175,39 @@ async def test_a_broken_forecast_does_not_stop_the_run(tmp_path):
     assert "forecast" not in payload
     result = await run.run("summarise the source records")
     assert result.status == "completed"
+
+
+def test_a_forecast_names_the_allowances_it_could_not_count(tmp_path) -> None:
+    """A floor that does not say it is a floor reads as a prediction.
+
+    Rate-kind providers have no day to spread over, so they contribute nothing
+    to a session capacity. Once one of them is the largest allowance in the
+    pool, a timeline that omits it predicts pauses that will not happen -- and
+    the only honest fix short of modelling a per-minute rate over six hours is
+    to name what was left out.
+    """
+    tracker = BudgetTracker(
+        journal=UsageJournal(str(tmp_path / "usage.jsonl")),
+        budgets={
+            "capped": BudgetSpec(
+                provider="capped",
+                kind="quota",
+                limits=(Limit("day", requests=1000),),
+                reset="rolling",
+                source="test",
+                checked="test",
+            ),
+            "uncapped": BudgetSpec(
+                provider="uncapped",
+                kind="rate",
+                limits=(Limit("minute", requests=60),),
+                reset="rolling",
+                source="test",
+                checked="test",
+            ),
+        },
+    )
+    plan = Ration(tracker).forecast(
+        50_000, credentials={"capped": [""], "uncapped": [""]}
+    )
+    assert plan["uncapped_providers"] == ["uncapped"]
