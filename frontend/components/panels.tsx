@@ -1,10 +1,12 @@
 "use client";
 
+import { useState } from "react";
 import type {
   AgentState,
   CacheView,
   CostView,
   CriterionView,
+  NodeOutcome,
   PlanView,
   RogueReport,
   SwarmEvent,
@@ -293,6 +295,106 @@ function summarise(event: SwarmEvent): string {
 }
 
 /* --------------------------------------------------------------------- cost */
+
+/**
+ * What the run produced.
+ *
+ * Everything else on this screen is about HOW the run went -- which agents
+ * ran, what it cost, what was contained. This is the thing someone started it
+ * for, and it was the one part of the report the dashboard never rendered: an
+ * operator could watch a run pass every node and still have to open the JSON
+ * to read the answer.
+ *
+ * Straight off the report rather than the event stream, because a stream frame
+ * carries a preview and the report carries the artifact.
+ */
+export function OutputPanel({ results }: { results: NodeOutcome[] | null }) {
+  const [open, setOpen] = useState<string | null>(null);
+
+  if (!results || results.length === 0) {
+    return (
+      <Card title="Output">
+        <p className="empty">
+          Nothing produced yet.
+          <span className="hint">
+            Artifacts appear when the run finishes and its report is written.
+          </span>
+        </p>
+      </Card>
+    );
+  }
+
+  const passed = results.filter((r) => r.passed).length;
+
+  return (
+    <Card title="Output" meta={`${passed}/${results.length} nodes passed`}>
+      {results.map((result) => {
+        const key = `${result.node}-${result.agent_id}`;
+        const entries = Object.entries(result.artifacts ?? {});
+        const expanded = open === key;
+        return (
+          <div key={key} style={{ marginBottom: 12 }}>
+            <button
+              className="ghost"
+              onClick={() => setOpen(expanded ? null : key)}
+              style={{ width: "100%", textAlign: "left" }}
+            >
+              <span className={`pill ${result.passed ? "passed" : "failed"}`}>
+                {result.passed ? "passed" : "failed"}
+              </span>{" "}
+              <span className="mono">{result.node}</span>{" "}
+              <span style={{ color: "var(--text-faint)" }}>
+                {result.agent_id} · {result.attempts}{" "}
+                {result.attempts === 1 ? "attempt" : "attempts"}
+                {result.skill_used ? ` · skill ${result.skill_used}` : ""}
+              </span>
+            </button>
+
+            {expanded && (
+              <div style={{ marginTop: 8 }}>
+                {entries.length === 0 ? (
+                  <p className="empty">
+                    No artifact.
+                    <span className="hint">
+                      {result.output_preview || "The node produced nothing."}
+                    </span>
+                  </p>
+                ) : (
+                  entries.map(([name, body]) => (
+                    <div key={name}>
+                      <div className="mono" style={{ fontSize: 12, color: "var(--text-muted)" }}>
+                        {name}
+                      </div>
+                      {/* Wrapped and scrollable: an artifact is arbitrary text
+                          and must not stretch the page sideways. */}
+                      <pre
+                        style={{
+                          whiteSpace: "pre-wrap",
+                          overflowX: "auto",
+                          maxHeight: 320,
+                          overflowY: "auto",
+                        }}
+                      >
+                        {body}
+                      </pre>
+                    </div>
+                  ))
+                )}
+                {result.failures?.length > 0 && (
+                  <ul style={{ color: "var(--red)", fontSize: 12 }}>
+                    {result.failures.map((failure, i) => (
+                      <li key={i}>{failure}</li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </Card>
+  );
+}
 
 export function CostPanel({ cost }: { cost: CostView | null }) {
   if (!cost) {

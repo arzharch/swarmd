@@ -99,6 +99,25 @@ export interface CostView {
   by_stage: Record<string, number>;
 }
 
+/**
+ * One node's result, including the artifact it produced.
+ *
+ * The artifact is the point of the whole run and was the one thing the
+ * dashboard never showed: it could tell you a node passed, what it cost and
+ * which agent did it, but not what came out.
+ */
+export interface NodeOutcome {
+  agent_id: string;
+  node: string;
+  passed: boolean;
+  attempts: number;
+  contained: boolean;
+  skill_used: string;
+  failures: string[];
+  output_preview: string;
+  artifacts: Record<string, string>;
+}
+
 export interface RunSummary {
   run_id: string;
   task: string;
@@ -107,7 +126,11 @@ export interface RunSummary {
   started?: number;
   finished?: number;
   report?: {
-    run?: { integrity_hash?: string };
+    run?: {
+      integrity_hash?: string;
+      /** What the run actually produced. The reason someone started it. */
+      results?: NodeOutcome[];
+    };
     cost: CostView;
     economy: Record<string, number | null>;
     redteam: { contained: number; flagged: number; by_pattern: Record<string, number> };

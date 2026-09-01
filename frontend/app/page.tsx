@@ -7,6 +7,7 @@ import {
   EfficiencyPanel,
   CriterionPanel,
   EventLog,
+  OutputPanel,
   PlanPanel,
   ReasoningPanel,
   RedTeamPanel,
@@ -301,10 +302,15 @@ export default function Dashboard() {
         )}
 
         {view === "decisions" && (
-          <div className="board cols-2">
-            <CriterionPanel criterion={stream.criterion} />
-            <PlanPanel plan={stream.plan} agents={stream.agents} />
-          </div>
+          <>
+            <div className="board cols-2">
+              <CriterionPanel criterion={stream.criterion} />
+              <PlanPanel plan={stream.plan} agents={stream.agents} />
+            </div>
+            <div className="board" style={{ paddingTop: 0 }}>
+              <OutputPanel results={summary?.report?.run?.results ?? null} />
+            </div>
+          </>
         )}
 
         {view === "trace" && (
