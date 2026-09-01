@@ -243,6 +243,20 @@ def register(
                 "session %s requested auto-approve: skills will enter the "
                 "library with no human review", request.tasks,
             )
+        # Every skill a session proposes goes through the approval store, and
+        # it is not touched until the first consolidation -- so an unreachable
+        # store failed the job only after a task had been paid for. Checked
+        # here instead, before anything is spent.
+        from swarmd.server.app import _approval_store_error
+
+        unreachable = await _approval_store_error(app)
+        if unreachable:
+            raise HTTPException(
+                503,
+                f"the approval store is unreachable, and every skill this "
+                f"session proposes has to pass through it: {unreachable}. "
+                f"Start it, or unset DATABASE_URL to fall back to SQLite.",
+            )
 
         job = registry.submit(
             JobKind.SESSION,

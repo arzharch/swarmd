@@ -278,6 +278,20 @@ def create_app(
                 {"status": "all_providers_backed_off", "providers": status},
                 status_code=503,
             )
+
+        # The approval store, because a session that cannot reach it fails --
+        # after paying for a task. `DATABASE_URL` pointing at a Postgres that
+        # is not running produced exactly that: a pod reporting ready, a job
+        # accepted, one task's provider quota spent, and then
+        # ConnectionRefusedError out of `_auto_approve`. Readiness is the right
+        # place for it: this pod cannot serve the work, but the runs it already
+        # holds are unaffected, which is a 503 and not a restart.
+        detail = await _approval_store_error(app)
+        if detail:
+            return JSONResponse(
+                {"status": "approval_store_unreachable", "detail": detail},
+                status_code=503,
+            )
         return JSONResponse({"status": "ready", "providers": status})
 
     @app.get("/api/auth")
@@ -933,6 +947,23 @@ def create_app(
                 await websocket.close()
 
     return app
+
+
+
+async def _approval_store_error(app: FastAPI) -> str:
+    """Empty string when the approval store answers, the reason when it does not.
+
+    Cheap enough for a readiness probe: one `SELECT` against an already-open
+    pool, or a SQLite read.
+    """
+    from swarmd.hitl.stores import build_approval_store
+
+    try:
+        store = build_approval_store(os.environ.get("DATABASE_URL"))
+        await store.list_pending()
+    except Exception as exc:  # noqa: BLE001 - any failure to reach it is the answer
+        return f"{type(exc).__name__}: {exc}"
+    return ""
 
 
 def _default_provider_factory() -> Any:

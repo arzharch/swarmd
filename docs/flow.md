@@ -2777,6 +2777,31 @@ The test fixture had been hiding it: `_outcome(solved=False)` stamped
 rather than one that failed. It now builds what an unsolved run actually looks
 like.
 
+**And then the sweep itself turned out to be measuring nothing.** With the
+exclusion fixed, a 100-cell ablation was started over HTTP and left to run. At
+cell 18 it was reading treatment 6/9 against control 3/9 -- a positive result,
+the opposite of the -0.400 this project has been carrying since 2026-08-29.
+
+It was not a result. `SwarmRun` resolves `self.skills = skills if use_skills
+else None`, so a run constructed without a `skills=` argument gets None in
+BOTH arms. The CLI has passed a library since that exact defect was found and
+written up on 2026-08-29; `_eval_runner` in the control plane never did. Every
+eval ever started from the dashboard compared a configuration against itself
+and reported "no measured improvement" -- the same words the real experiment
+produces, for a reason that has nothing to do with skills.
+
+The sweep was cancelled at cell 20 rather than spending the remaining 1,500
+requests on a null experiment. The endpoint now refuses at submit time, with
+the reason, when the treatment arm would have nothing to retrieve: no library
+configured, or a library with nothing approved in it. Refused rather than
+warned, because a warning in a job log is not attached to the number, and the
+number is what gets quoted.
+
+The lesson is the same one as the meter: the CLI and the service are two
+clients of the same code, tests covered the CLI, and the fix landed on one
+side. Both paths now construct the run the same way, and the test that pins it
+starts a control plane with no library and asserts the refusal.
+
 ## Next up
 
 - [x] Kernel, pipeline, harnesses, gates, HITL state machine, router

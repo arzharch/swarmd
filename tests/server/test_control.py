@@ -394,3 +394,34 @@ def test_the_eval_gives_the_treatment_arm_the_library_it_refuses_to_run_without(
     ).json()["job_id"]
     body = _await_job(client, job_id, timeout=60)
     assert body["state"] == "completed", body.get("error")
+
+
+def test_a_session_is_refused_when_the_approval_store_cannot_be_reached(
+    client, monkeypatch
+):
+    """Found by running one: DATABASE_URL pointed at a Postgres that was not
+    up, the pod reported ready, the job was accepted, one task's provider quota
+    was spent, and only then did `_auto_approve` raise ConnectionRefusedError.
+
+    Every skill a session proposes passes through that store, so its absence is
+    knowable before anything is bought."""
+    monkeypatch.setenv("DATABASE_URL", "postgres://nobody@127.0.0.1:1/nothing")
+
+    response = client.post("/api/sessions", json={"tasks": 1, "profile": "smoke"})
+
+    assert response.status_code == 503
+    assert "approval store is unreachable" in response.json()["detail"]
+
+
+def test_readiness_is_red_when_the_approval_store_cannot_be_reached(
+    client, monkeypatch
+):
+    """A pod that cannot reach the store cannot serve the work, but the runs it
+    already holds are fine -- so this is readiness, not liveness."""
+    assert client.get("/readyz").status_code == 200
+
+    monkeypatch.setenv("DATABASE_URL", "postgres://nobody@127.0.0.1:1/nothing")
+    response = client.get("/readyz")
+
+    assert response.status_code == 503
+    assert response.json()["status"] == "approval_store_unreachable"
