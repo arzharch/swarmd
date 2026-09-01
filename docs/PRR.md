@@ -304,32 +304,94 @@ watching: **two clients, one of them tested.**
 
 ---
 
-## Go / no-go, 2026-09-01
+## Go / no-go, 2026-09-01 (revised at end of day)
+
+The bar was restated during the day and the revision matters: **not 500 agents,
+but 5-10 agents running correctly on a task nobody scoped.** Anyone wanting the
+500-agent number can supply their own credentials and measure it. What follows
+is judged against the stated bar.
+
+### Measured, not asserted
+
+Five tasks belonging to no suite in this repository, live providers, skills
+disabled:
+
+| task | size | nodes solved | agents passed |
+|---|---|---|---|
+| bakery waste flags | `--agents 5` | 7/7 | 14/14 |
+| library overdue fines | `--agents 8` | 4/4 | 8/8 |
+| server uptime shortfall | `--agents 10 --chaos` | 5/5 | 10/10 |
+| warehouse box counts | `--agents 8` | 7/7 | 14/14 |
+| parallel scheduling | `--agents 8` | 4/4 | 7/8 |
+
+Plus a `standard`-profile chaos run: 25 of 25 agent outcomes across 5 nodes, 34
+agents with 9 killed mid-run and resumed from checkpoint without re-buying the
+work, integrity hash intact.
+
+Every run $0.00, every criterion authored and frozen by the system itself,
+every artifact traceable to ledger rows.
 
 | | |
 |---|---|
 | **Evaluation deployment** | **GO** |
-| **Production deployment** | **NO-GO** — one maintainer, no on-call; nothing at `standard` scale has met a real provider |
-| **Publishing an improvement claim** | **NO-GO** — the measurement has not been taken |
+| **The stated product bar (5-10 agents, unknown task)** | **GO** — five for five |
+| **Production deployment** | **NO-GO** — one maintainer, no on-call rotation |
+| **Publishing an improvement claim** | **NO-GO** — deliberately unmade, see below |
 
-**Runbook:** [RUNBOOK.md](RUNBOOK.md), eleven alerts each with a confirm step
-and a first action, plus deploy and rollback exercised on a real k3s cluster.
+### Sign-offs
 
-**Eval ready:** yes. Both arms, bootstrap CIs, paired on (task, seed), refuses
-an improvement figure without a control, refuses to start when the arms would
-be identical, and excludes runs that never reached the task.
+**Product: GO.** The claim is that generic agents take a task nobody scoped,
+author their own success criterion, decompose it and solve it. Five unknown
+tasks at the stated sizes did exactly that, including one that had failed
+totally twice before its cause was found.
 
-**Harness ready:** yes. `draft`, `fetch`, `llm`, `sandbox`, `store`, `verify`,
-with the sandbox containing escapes under chaos.
+**QA: GO for the stated bar, with one number withdrawn.** The `nodes_passed`
+field counted AGENT OUTCOMES under a node's name, so every run this system has
+reported was understated -- a task reading "7/8 nodes" had solved all four of
+its nodes, with one agent of a pool of two failing. Nodes and agents are now
+counted separately. The holdout `hold-schedule-1`, recorded here this morning
+as 15/20, was 4 of 4 nodes.
 
-**What it will not do:**
+**SRE: GO for single-operator evaluation, NO-GO for production.** Unchanged and
+not a code problem: alerts plus one maintainer is not an on-call rotation.
+Everything else moved -- egress narrowed to provider CIDRs, the approval store
+now gates readiness after a session was found spending quota before discovering
+it could not reach one, and recovery under chaos is verified on real traffic
+rather than a deterministic mock.
 
-- It will not tell you it is learning. It cannot yet, and it says so rather than
-  reporting a number that would read as one.
-- It will not run at `standard` or `deep` against real providers on today's
-  free-tier budget without pacing across slices.
-- It will not survive a second operator: there is one credential and no
-  accounts, by decision.
-- It will not spend money without being told to. `SWARMD_ALLOW_PAID` is off,
-  the ceiling is $0.05, and every live run so far has cost $0.00 -- which also
-  means the ceiling has never been exercised against paid traffic.
+**Security: GO for the stated threat model.** ADR-013 holds. The dashboard now
+passes the operator token it was silently omitting, and a locked control plane
+looks locked instead of looking healthy.
+
+**AI engineering: GO on the apparatus, claim withheld.** Four ways the
+measurement machinery was producing numbers about something other than what
+they claimed were fixed today, and three of four skill-contamination channels
+were closed. The fourth is not deterministically detectable, which was
+established by building the detector, measuring it (0.35 against 0.33 across
+the judged cases) and refusing to ship a threshold tuned on four samples.
+
+**Backend: GO with a watch item.** Determinism is enforced rather than
+intended. The watch item is drift between the CLI and the service: two clients
+of one contract, and fixes have twice landed on only one side.
+
+### The improvement claim is deliberately not made
+
+The learning loop turns -- skills promote on real evidence, get retrieved,
+scored, and pruned when they fail. Its first verdict on its own skills was
+negative (5 successes in 53 uses), the causes were traced to four pipeline
+defects rather than to the model, and three are fixed.
+
+What is NOT claimed is that the system improves. That needs an ablation over a
+library built entirely after those fixes, at a size where a retrieval index can
+rank at all -- and this repository's standing rule is that such a claim gets
+measured, never argued. `BENCHMARKS.md` is still deliberately ungenerated for
+the same reason.
+
+### Scope boundaries, chosen rather than pending
+
+- **500-agent runs:** out of scope by decision. Supply credentials and measure.
+- **Paid traffic:** the cost ceiling has never been exercised against real
+  spend, because `SWARMD_ALLOW_PAID` is false and every run to date cost $0.00.
+  Closing it means deliberately spending money, and the operator's standing
+  instruction is free tiers only. Out of scope by that instruction, not
+  outstanding.
