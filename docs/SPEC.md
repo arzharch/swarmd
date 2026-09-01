@@ -233,7 +233,16 @@ uv run swarmd eval --arms both --repeats 5
   caveat.
 - `flow.md` and `interview_prep.md` complete for every decision (protocol in PLAN section 0).
 - ADRs for all one-way doors.
-- CI green: lint, types, tests, mock-import check, frontend build, eval smoke run.
+- CI green: lint, types, tests, mock-import check, frontend build, chaos
+  integrity, deploy guards, image build and scan.
+  *Corrected 2026-09-01:* this line used to end "eval smoke run", which cannot
+  exist. CI is hermetic and has no provider credentials, so an eval there would
+  run against the simulated provider -- and `swarmd eval` refuses simulated
+  data outright (ADR-012), because a benchmark computed from synthetic output
+  is pixel-identical to one computed from real output. What CI asserts instead
+  is that the refusal fires, and the evaluator's aggregation is covered by
+  tests over fixtures. An eval smoke run belongs to a credentialled
+  environment, not to the build.
 
 **Gate** PRD section 13 acceptance criteria, item by item, each with pasted evidence.
 
