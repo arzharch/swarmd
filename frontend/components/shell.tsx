@@ -1,6 +1,12 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
+import {
+  authState,
+  onTokenChange,
+  operatorToken,
+  setOperatorToken,
+} from "@/lib/api";
 import type { ConnectionState } from "@/lib/types";
 
 /**
@@ -57,6 +63,82 @@ export function useTheme() {
     setTheme((t) => (t === "system" ? "light" : t === "light" ? "dark" : "system"));
 
   return { theme, cycle };
+}
+
+/**
+ * The operator token, and whether this control plane wants one.
+ *
+ * The dashboard's reads are ungated, so without this the page looks entirely
+ * healthy right up to the moment someone presses Run and gets a 401 from a
+ * red line under a panel. Asking at the top, before anything is attempted, is
+ * the difference between a locked door with a sign and one without.
+ *
+ * Not a login. One operator, one credential, no accounts (ADR-013) -- this is
+ * the same value the CLI reads from SWARMD_API_TOKEN, typed in once and kept
+ * in localStorage.
+ */
+export function TokenControl() {
+  const [required, setRequired] = useState(false);
+  const [ok, setOk] = useState(true);
+  const [draft, setDraft] = useState("");
+  const [editing, setEditing] = useState(false);
+
+  const check = useCallback(async () => {
+    try {
+      const state = await authState();
+      setRequired(state.token_required);
+      setOk(state.token_ok);
+      // Open the field unasked when a token is needed and none works. The
+      // operator cannot act until this is filled, so making them find it
+      // first is a step with no purpose.
+      setEditing(state.token_required && !state.token_ok);
+    } catch {
+      // The control plane being unreachable is the connection indicator's
+      // story to tell, not this one's.
+    }
+  }, []);
+
+  useEffect(() => {
+    void check();
+    return onTokenChange(() => void check());
+  }, [check]);
+
+  useEffect(() => setDraft(operatorToken()), []);
+
+  if (!required) return null;
+
+  if (!editing) {
+    return (
+      <button
+        className="toggle"
+        onClick={() => setEditing(true)}
+        title="Operator token accepted. Click to replace it."
+      >
+        token ok
+      </button>
+    );
+  }
+
+  return (
+    <label className="field" title="SWARMD_API_TOKEN from the control plane's environment. Stored in this browser only.">
+      <span>token</span>
+      <input
+        type="password"
+        value={draft}
+        onChange={(e) => setDraft(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") {
+            setOperatorToken(draft.trim());
+            setEditing(false);
+          }
+        }}
+        placeholder={ok ? "replace token" : "operator token"}
+        aria-label="Operator token"
+        aria-invalid={!ok}
+        style={{ width: 180 }}
+      />
+    </label>
+  );
 }
 
 export function Rail({
@@ -250,13 +332,24 @@ export function TopBar({
         {submitting ? "Starting…" : "Run"}
       </button>
 
-      <span className={`conn ${connection}`} title={`Event stream ${connection}`}>
+      <TokenControl />
+
+      <span
+        className={`conn ${connection}`}
+        title={
+          connection === "unauthorized"
+            ? "The control plane refused the stream: no operator token, or the wrong one."
+            : `Event stream ${connection}`
+        }
+      >
         <i aria-hidden />
         {connection === "open"
           ? "Live"
           : connection === "connecting"
             ? "Connecting"
-            : "Disconnected"}
+            : connection === "unauthorized"
+              ? "No token"
+              : "Disconnected"}
       </span>
 
       {error && (

@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
+import { apiFetch, apiJson } from "@/lib/api";
 import { Card } from "@/components/panels";
 import type {
   BudgetResponse,
@@ -20,16 +21,10 @@ import type {
  * the service is the thing that runs and this is how it is operated.
  */
 
-async function api<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(path, {
-    ...init,
-    headers: { "Content-Type": "application/json", ...(init?.headers ?? {}) },
-  });
-  if (!response.ok) {
-    throw new Error(`${response.status}: ${(await response.text()).slice(0, 200)}`);
-  }
-  return (await response.json()) as T;
-}
+// The operator token rides on every one of these. This was a bare `fetch`
+// that sent none, so every panel below rendered its controls and then
+// answered 401 the moment one was used.
+const api = apiJson;
 
 function useError() {
   const [error, setError] = useState<string | null>(null);
@@ -265,7 +260,7 @@ function JobList({ jobs, empty }: { jobs: JobSummary[]; empty: string }) {
                   className="ghost"
                   style={{ height: 24, fontSize: 11, padding: "0 8px" }}
                   onClick={() =>
-                    fetch(`/api/jobs/${job.job_id}`, { method: "DELETE" })
+                    apiFetch(`/api/jobs/${job.job_id}`, { method: "DELETE" })
                   }
                 >
                   cancel
@@ -295,7 +290,7 @@ export function EvalReportPanel({ jobs }: { jobs: JobSummary[] }) {
   useEffect(() => {
     if (!latest) return;
     let cancelled = false;
-    fetch(`/api/jobs/${latest.job_id}`)
+    apiFetch(`/api/jobs/${latest.job_id}`)
       .then((r) => (r.ok ? r.json() : null))
       .then((body) => {
         if (!cancelled && body?.report) setReport(body.report as EvalReport);
@@ -816,7 +811,7 @@ export function BudgetPanel() {
   const [error, setError] = useState<string | null>(null);
 
   const load = useCallback(() => {
-    fetch("/api/providers/budget")
+    apiFetch("/api/providers/budget")
       .then((r) => (r.ok ? r.json() : Promise.reject(new Error(String(r.status)))))
       .then(setData)
       .catch((e) => setError(String(e)));

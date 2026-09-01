@@ -322,3 +322,26 @@ def test_plain_logs_are_redacted_too():
         "connecting to postgres://u:secretpw@h/db", None, None,
     )
     assert "secretpw" not in PlainFormatter().format(record)
+
+
+def test_the_dashboard_can_ask_whether_a_token_is_needed(secured):
+    """Without this the browser cannot tell a locked control plane from an
+    open one: every GET it makes succeeds either way, and the first thing it
+    learns is a 401 on a run someone already pressed Run for."""
+    body = secured.get("/api/auth").json()
+    assert body == {"token_required": True, "token_ok": False}
+
+    body = secured.get("/api/auth", headers={"X-Swarmd-Token": TOKEN}).json()
+    assert body == {"token_required": True, "token_ok": True}
+
+    body = secured.get("/api/auth", headers={"X-Swarmd-Token": "wrong"}).json()
+    assert body == {"token_required": True, "token_ok": False}
+
+
+def test_an_open_control_plane_says_no_token_is_wanted(open_client):
+    """`token_ok` is true with nothing supplied, so a local dashboard with no
+    token configured shows no field to fill in."""
+    assert open_client.get("/api/auth").json() == {
+        "token_required": False,
+        "token_ok": True,
+    }

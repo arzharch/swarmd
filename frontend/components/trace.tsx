@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
+import { apiFetch } from "@/lib/api";
 import { Card } from "@/components/panels";
 import type { CriterionView, LedgerResponse, LedgerRow, PlanView, SwarmEvent } from "@/lib/types";
 
@@ -103,7 +104,7 @@ export function LedgerPanel({ runId }: { runId: string | null }) {
     }
     let cancelled = false;
     const query = kind ? `?kind=${encodeURIComponent(kind)}` : "";
-    fetch(`/api/runs/${runId}/ledger${query}`)
+    apiFetch(`/api/runs/${runId}/ledger${query}`)
       .then((r) => (r.ok ? r.json() : Promise.reject(new Error(String(r.status)))))
       .then((body) => {
         if (!cancelled) {

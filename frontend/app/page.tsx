@@ -30,6 +30,7 @@ import {
 } from "@/components/control";
 import { ForecastBanner, PauseBanner } from "@/components/pace";
 import { Rail, TopBar, VIEWS, type ViewId } from "@/components/shell";
+import { apiFetch } from "@/lib/api";
 import { useRunStream } from "@/lib/useRunStream";
 import type {
   CostView,
@@ -89,7 +90,7 @@ export default function Dashboard() {
     if (!stream.activeRun) return;
     if (stream.runStatus === "running" || stream.runStatus === null) return;
     let cancelled = false;
-    fetch(`/api/runs/${stream.activeRun}`)
+    apiFetch(`/api/runs/${stream.activeRun}`)
       .then((r) => (r.ok ? r.json() : null))
       .then((body) => {
         if (!cancelled && body) setSummary(body as RunSummary);
@@ -110,7 +111,7 @@ export default function Dashboard() {
   useEffect(() => {
     if (!stream.activeRun || stream.runStatus === "running") return;
     let cancelled = false;
-    fetch(`/api/runs/${stream.activeRun}/ledger?limit=1`)
+    apiFetch(`/api/runs/${stream.activeRun}/ledger?limit=1`)
       .then((r) => (r.ok ? r.json() : null))
       .then((body) => {
         if (!cancelled && body) setLedgerVerify((body as LedgerResponse).verify);
@@ -172,7 +173,7 @@ export default function Dashboard() {
   useEffect(() => {
     let cancelled = false;
     const load = () =>
-      fetch("/api/jobs")
+      apiFetch("/api/jobs")
         .then((r) => (r.ok ? r.json() : null))
         .then((body) => {
           if (!cancelled && body) setJobs(body.jobs as JobSummary[]);

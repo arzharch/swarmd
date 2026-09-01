@@ -740,6 +740,9 @@ dl.kv dd { margin: 0; text-align: right; font-family: var(--mono); font-variant-
 .conn.open i { background: var(--green); }
 .conn.connecting i { background: var(--amber); animation: pulse 1.2s ease-in-out infinite; }
 .conn.closed i { background: var(--red); }
+/* Amber, not red: nothing is broken. The stream is refused for a reason the
+   operator can fix from the field beside this dot. */
+.conn.unauthorized i { background: var(--amber); }
 
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
 

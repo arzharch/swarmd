@@ -35,7 +35,14 @@ from typing import Any
 # WebSocket` as a query parameter and the handshake fails with a 1008.
 # This module is only imported by `swarmd serve`, so requiring the optional
 # serve extra here costs nothing elsewhere.
-from fastapi import FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import (
+    FastAPI,
+    Header,
+    HTTPException,
+    Request,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 
@@ -272,6 +279,37 @@ def create_app(
                 status_code=503,
             )
         return JSONResponse({"status": "ready", "providers": status})
+
+    @app.get("/api/auth")
+    async def auth_state(request: Request) -> JSONResponse:
+        """Whether this control plane wants an operator token, and whether the
+        caller already has the right one.
+
+        The dashboard cannot discover either by reading: GETs are ungated, so
+        a browser with no token renders a full-looking page and only finds out
+        it cannot act when a run is refused 401. This endpoint lets it say so
+        up front, and lets a pasted token be checked without spending a run to
+        find out.
+
+        Neither field is a secret. That a door is locked is public; `token_ok`
+        only confirms what the caller itself supplied, and reveals nothing to
+        anyone who did not already hold the value.
+        """
+        # `getattr`: the hardening middleware sets this, and an app built
+        # without it (tests, embedded use) has no attribute at all rather than
+        # an empty one.
+        expected = getattr(app.state, "api_token", "")
+        supplied = middleware.extract_token(request.headers)
+        return JSONResponse(
+            {
+                "token_required": bool(expected),
+                "token_ok": (
+                    True
+                    if not expected
+                    else middleware.token_matches(supplied, expected)
+                ),
+            }
+        )
 
     @app.get("/metrics")
     async def prometheus_metrics() -> PlainTextResponse:

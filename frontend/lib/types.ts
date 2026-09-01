@@ -185,7 +185,14 @@ export interface LedgerResponse {
   };
 }
 
-export type ConnectionState = "connecting" | "open" | "closed";
+// "unauthorized" is separate from "closed" because the two need different
+// words on screen and different actions from the operator: one reconnects on
+// its own, the other never will until a token is supplied.
+export type ConnectionState =
+  | "connecting"
+  | "open"
+  | "closed"
+  | "unauthorized";
 
 /* --- service control ---------------------------------------------------- */
 

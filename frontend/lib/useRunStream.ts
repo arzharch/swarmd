@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { apiFetch, onTokenChange, streamUrl } from "./api";
 import type {
   Preflight,
   AgentState,
@@ -252,15 +253,23 @@ export function useRunStream() {
   const socketRef = useRef<WebSocket | null>(null);
   const attemptRef = useRef(0);
   const closedRef = useRef(false);
+  // Bumped when the operator token changes, which re-runs the effect below.
+  // The token is in the handshake URL, so a new one only takes effect on a
+  // new socket -- otherwise pasting the right token leaves the stream dead
+  // until a reload.
+  const [tokenEpoch, setTokenEpoch] = useState(0);
+
+  useEffect(() => onTokenChange(() => setTokenEpoch((n) => n + 1)), []);
 
   useEffect(() => {
     closedRef.current = false;
 
     const connect = () => {
       if (closedRef.current) return;
-      const protocol = window.location.protocol === "https:" ? "wss" : "ws";
-      const url = `${protocol}://${window.location.host}/api/stream`;
-      const socket = new WebSocket(url);
+      // Token in the URL because a browser cannot set a header on a
+      // handshake. Without it a gated control plane closes the socket with
+      // 1008 and the dashboard reconnects forever showing nothing.
+      const socket = new WebSocket(streamUrl());
       socketRef.current = socket;
       setConnection("connecting");
 
@@ -279,7 +288,15 @@ export function useRunStream() {
         }
       };
 
-      socket.onclose = () => {
+      socket.onclose = (event) => {
+        // 1008 is the policy close the control plane sends when the token is
+        // missing or wrong. Retrying it is pointless -- the next handshake
+        // carries the same token -- and a reconnect loop hides the reason
+        // behind a flickering "Connecting". Stop, and say which it is.
+        if (event.code === 1008) {
+          setConnection("unauthorized");
+          return;
+        }
         setConnection("closed");
         if (closedRef.current) return;
         const delay = Math.min(
@@ -298,7 +315,7 @@ export function useRunStream() {
       closedRef.current = true;
       socketRef.current?.close();
     };
-  }, []);
+  }, [tokenEpoch]);
 
   const submit = useCallback(
     async (
@@ -309,9 +326,8 @@ export function useRunStream() {
       agents: number | null,
       seedRogues: string,
     ) => {
-      const response = await fetch("/api/runs", {
+      const response = await apiFetch("/api/runs", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           task,
           profile,
@@ -324,8 +340,10 @@ export function useRunStream() {
         }),
       });
       if (!response.ok) {
-        const detail = await response.text();
-        throw new Error(`${response.status}: ${detail}`);
+        if (response.status === 401) {
+          throw new Error("operator token required — set it in the top bar");
+        }
+        throw new Error(`${response.status}: ${await response.text()}`);
       }
       return (await response.json()) as { run_id: string };
     },
