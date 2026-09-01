@@ -10,7 +10,8 @@ The single authoritative list of what is built and what is not, checked against
 written from memory. Every "done" has evidence; every gap says what is missing
 and what it blocks.
 
-One gap remains, and it needs your API keys rather than more code.
+One gap remains. It needed a training corpus and a change to what counts as
+one skill, both of which now exist; what is left is the measurement itself.
 
 ---
 
@@ -90,7 +91,7 @@ The CLI is the same operations without a browser, not a separate product.
 
 ## 5. The remaining gap
 
-### G-4 · The system solves tasks. Self-learning is measured, and NEGATIVE.
+### G-4 · The system solves tasks. The learning loop turns; whether it helps is now measurable
 **Blocks:** an unconditional QA sign-off.
 
 **Task solving works.** 8/8 nodes repeatably on live providers, 20% at task
@@ -154,16 +155,16 @@ output shape it produced, with no node name. The library was rebuilt and reads
 `"When a step calls for this: Return a list of all date strings found in the
 paragraph. Produce a JSON object with these fields: ..."`.
 
-#### And on 2026-09-01, the real blocker was measured
+#### And on 2026-09-01, the real blocker was measured -- then removed
 
 The re-measurement was attempted properly: train on `public`, measure on
 `custom` (disjoint sets), library built by a full ten-task session on live
-providers. It produced no number, and the reason is not quota.
+providers. It produced no number, and the reason was not quota.
 
-**The library cannot promote anything.** A skill reaches the human queue only
-when it is `promotable` — verified on `MIN_DISTINCT_TASKS = 2` distinct task
-shapes, which is the bar that makes "this approach transfers" answerable at
-all. The session's result:
+**The library could not promote anything.** A skill reaches the review queue
+only once it is `promotable` -- verified on `MIN_DISTINCT_TASKS = 2` distinct
+task shapes, the bar that makes "does this transfer?" answerable at all. The
+session's result:
 
 | | |
 |---|---|
@@ -173,27 +174,66 @@ all. The session's result:
 | promotable | **0** |
 | approved | **0** |
 
-Every one of the 22 carries evidence from exactly one shape. Nothing was ever
-queued, so nothing was approved, so the treatment arm had nothing to retrieve —
-and an eval in that state compares a configuration against itself.
+Nothing was ever queued, so nothing was approved, so the treatment arm had
+nothing to retrieve -- and an eval in that state compares a configuration
+against itself.
 
-**This is a corpus property, not a bug.** Promotion asks for the same approach
-to succeed on two *different* task shapes. The five training tasks have
-disjoint output shapes, so no approach was ever proposed twice. Merging
-proposals by wording does not help and was tried: grouping the 22 records by
-their abstracted name and pattern still yields zero approaches with two shapes,
-because the shapes themselves are all distinct. What the corpus needs is
-FAMILIES of tasks that call for the same kind of output — which sharpens the
-existing "volume: 50–200 tasks" item into a requirement it did not previously
-state.
+**Two independent causes, and neither alone explained it.** Both are now fixed;
+[ADR-014](adr/ADR-014.md) is the reasoning in full.
 
-**So G-4 is now precise.** It was "the re-measurement has not run, for want of
-quota". It is: *the learning loop cannot close on a 12-task suite, because the
-transfer bar and the corpus are incompatible.* Either the suite grows task
-families, or the bar is bypassed deliberately and the result is labelled as
-measuring retrieval rather than transfer. The bypass exists (`approve(...,
-force=True)` records itself in `approval_note`) and is an operator decision,
-not one to take silently while producing a number.
+*The corpus had no shared structure.* Promotion asks for one approach that
+worked on two DIFFERENT task shapes. The suite's twelve tasks have twelve
+disjoint output shapes, so no approach was ever proposed twice and the bar was
+unreachable at any sample size. A thousand mutually-unrelated tasks would have
+promoted exactly as many as twelve: none. This is what the "50-200 tasks" item
+had been getting wrong for days -- it is not a statistical argument, it is a
+structural precondition, and what the corpus needs is FAMILIES of tasks calling
+for the same kind of output. There is now a `train` arm of fifteen tasks in
+five families of three, and it is not evaluable: `SessionRequest.arms` accepts
+it, `EvalRequest.arms` does not, so measuring over the tasks a library was
+built from is unexpressible rather than merely discouraged.
+
+*And identity fragmented on wording.* `make_skill_id` hashes the instruction
+text, which is written by a model, so the same approach distilled from two runs
+minted a second record starting again from one shape. The first attempt to fix
+this was measured against the old corpus, showed nothing, and was reverted --
+correctly, because on a corpus where no two tasks share an approach, merging is
+provably insufficient. It is not unnecessary: with families in place it is
+load-bearing. Identity for evidence is now the abstracted artifact shape plus
+the kinds of check that graded it. The plan step is deliberately NOT in the
+key: plans are synthesised per task, so a key containing one can only ever
+match another proposal from the same task -- exactly the evidence the bar
+refuses to count.
+
+**The loop turns.** Fifteen tasks on the `train` arm, live providers, 667
+seconds:
+
+| | before | after |
+|---|---|---|
+| records stored | 33 | 33 |
+| distinct approaches | 33 | **10** |
+| reaching 2 task shapes | 0 | **2** |
+| approved | 0 | **2** |
+
+The two are `approach: produce diagnosis, fix` (evidence from the permissions
+and the timezone task) and `approach: produce duration_minutes, strategy`
+(evidence from two different rate-limit tasks) -- two different families, each
+confirmed by a task the other member never saw. Both were approved on their own
+evidence: `approval_note` is empty on both, meaning no `force`, no bypass. This
+is the first time in this project's history that a skill has cleared the bar.
+
+`swarmd skills merge` exists for libraries written before this: it replays
+stored records through `propose` -- the merge rule stays in one place -- reports
+what would collapse, and writes nothing without `--apply`.
+
+**What this does and does not establish.** It establishes that the mechanism
+can produce a reviewable, approved, retrievable skill from evidence rather than
+from a bypass. It does not yet say whether retrieving them helps: the ablation
+over the unseen `custom` arm is what answers that, and with only two approved
+skills aligned to two of the five custom tasks, the effect it can show is
+bounded. A null result at this size would mean "not enough library to move
+five tasks", not "skills do not help" -- and the honest fix for that is more
+training volume, which is now finally worth spending.
 
 **The re-measurement did not run**, because the day's provider budget was spent
 on the two that did:

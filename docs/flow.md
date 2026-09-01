@@ -2870,6 +2870,85 @@ right answer (13 minutes); `hold-logistics-1` passed 0 of 30 and produced a
 wrong one. Which is the honest reading of that criterion: the system takes an
 unseen task end to end. It does not reliably solve one.
 
+## 2026-09-01 - The learning loop turns
+
+G-4 has been open since this project could measure anything, always reported
+the same way: "no measured improvement". Every time, the reason turned out to
+be mechanical. Today it was answered as a design question rather than chased as
+a bug, and the reasoning is [ADR-014](adr/ADR-014.md).
+
+**The diagnosis.** A skill becomes reviewable only once it is `promotable`:
+verified on two DISTINCT task shapes. That bar is what makes "does this
+transfer?" a question with an answer -- one task's evidence, drawn twice, says
+nothing about a second task. Two independent preconditions have to hold before
+anything can clear it, and neither held.
+
+*The corpus had no shared structure.* Twelve tasks, twelve disjoint output
+shapes: a median repair, a colour-ordering puzzle, a pagination strategy. No
+approach distilled from one is ever proposed by another, so the bar is
+unreachable at any sample size. A thousand unrelated tasks would promote
+exactly as many as twelve. This is the thing the "50-200 tasks" item had been
+quietly getting wrong: it is not a statistical argument about confidence
+intervals, it is a structural precondition, and what the corpus needs is
+FAMILIES.
+
+*And identity fragmented on wording.* `make_skill_id` hashes the instruction,
+the instruction is written by a model, and the same approach comes back phrased
+differently every run -- so each phrasing minted a record starting again from
+one shape.
+
+**The part worth keeping.** The merge was tried first, alone, measured against
+the real library, and reverted: on a corpus where no two tasks share an
+approach, grouping records changes nothing. That measurement was right and the
+conclusion drawn from it was too narrow. It showed merging is INSUFFICIENT, not
+that it is unnecessary. With families in place it is load-bearing, and both
+changes had to land together.
+
+**What was built.** A `train` arm: fifteen tasks, five families of three, each
+family sharing an output shape and aligned with a KIND of work the custom arm
+also needs -- diagnosis-and-fix, checkability verdict, constrained enumeration,
+rate-limited planning, name normalisation -- and with none of its content. It
+is not evaluable, and that is enforced rather than observed: `SessionRequest`
+accepts `train`, `EvalRequest` does not, so measuring over the tasks a library
+was built from is unexpressible. A convention a person has to keep is exactly
+what failed here a few hours earlier.
+
+And an identity for evidence: the abstracted artifact shape plus the kinds of
+check that graded it. The plan step is deliberately not in the key, and that is
+the part that took a measurement to see -- plans are synthesised per task, so
+steps never recur, so a key containing one can only ever match another proposal
+from the SAME task. Which is precisely the evidence the bar refuses to count.
+The cost is stated rather than hidden: two steps of one task that produce the
+same shape under the same checks now merge, and the instruction kept is the one
+proposed first. They were already competing for one retrieval slot.
+
+**The result.** Fifteen tasks on `train`, live providers, 667 seconds, 33
+records:
+
+```
+records stored           : 33
+approaches after merging : 10
+reaching 2 task shapes   : 2      <- was 0, always, for the life of the project
+```
+
+`approach: produce diagnosis, fix`, confirmed by the permissions task and the
+timezone task. `approach: produce duration_minutes, strategy`, confirmed by two
+different rate-limit tasks. Two families, each approach verified by a task the
+other member never saw. Both approved on their own evidence -- `approval_note`
+empty on both, so no `force` and no bypass. The first skills in this project's
+history to clear the bar.
+
+`swarmd skills merge` handles libraries written before this: it replays stored
+records through `propose`, so the merge rule lives in one place, reports what
+would collapse, and writes nothing without `--apply`.
+
+**What this does not yet establish.** Whether retrieving those skills helps.
+The ablation over the unseen `custom` arm is what answers that, and with two
+approved skills aligned to two of the five custom tasks the effect it can show
+is bounded. A null at this size means "not enough library to move five tasks",
+not "skills do not help" -- and the fix for that is training volume, which is
+finally worth spending quota on.
+
 ## Next up
 
 - [x] Kernel, pipeline, harnesses, gates, HITL state machine, router
