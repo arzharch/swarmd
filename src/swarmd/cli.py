@@ -35,7 +35,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
+import shutil
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -387,6 +389,25 @@ def main(argv: list[str] | None = None) -> int:
         "restricts who can reach the port.",
     )
 
+    skills_cmd = sub.add_parser("skills", help="maintain a skill library")
+    skills_sub = skills_cmd.add_subparsers(dest="skills_command", required=True)
+    skills_merge = skills_sub.add_parser(
+        "merge",
+        help="collapse records that are the same approach worded differently",
+    )
+    skills_merge.add_argument("--skills", required=True, metavar="PATH")
+    skills_merge.add_argument(
+        "--out", default=None, metavar="PATH",
+        help="write here instead of in place. The input is never modified "
+        "without this being the explicit choice.",
+    )
+    skills_merge.add_argument(
+        "--apply", action="store_true",
+        help="actually write. Without it this reports what would collapse and "
+        "changes nothing, because a library is evidence and a migration that "
+        "runs before anyone has looked at it is a migration nobody checked.",
+    )
+
     approve = sub.add_parser("approve", help="approve a pending item (HITL)")
     approve.add_argument("request_id")
     approve.add_argument("--actor", default="cli-user")
@@ -491,6 +512,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.command in ("ledger", "run"):
         return _ledger_command(args)
 
+    if args.command == "skills":
+        return _skills_command(args)
     if args.command == "serve":
         return _serve_command(args)
 
@@ -1136,6 +1159,90 @@ def _ledger_command(args: argparse.Namespace) -> int:
 
     print(f"unknown subcommand for {args.command}")
     return 2
+
+
+def _skills_command(args: argparse.Namespace) -> int:
+    """Maintenance on a skill library. Currently one operation: merge.
+
+    A library written before ADR-014 has one record per PHRASING. The
+    instruction is written by a model, so the same approach distilled from two
+    runs never hashed the same, and each copy carried evidence from a single
+    task shape -- which is why `promotable` was unreachable and nothing was
+    ever queued for review. New proposals now land on the existing record; this
+    is how a library written before that gets the same treatment, without
+    re-running the sessions that paid for it.
+
+    Replayed through `propose` rather than rewritten as JSON: the merge rule
+    then lives in exactly one place, and a migration that reimplements it is a
+    second implementation to keep in step.
+    """
+    from swarmd.swarm.skills import SkillLibrary
+
+    source = SkillLibrary(args.skills)
+    records = source.all()
+    if not records:
+        print(f"{args.skills}: empty")
+        return 0
+
+    destination = args.out or args.skills
+    # ALWAYS replayed into a fresh library, never into the destination. A
+    # replay that opens the file it is reading loads the very records it is
+    # collapsing, so every proposal hits its own id and nothing merges -- and
+    # the run reports success having changed nothing.
+    with tempfile.TemporaryDirectory() as tmp:
+        staged = Path(tmp) / "skills.json"
+        merged = _replay(records, str(staged))
+        promotable = [s for s in merged.all() if s.promotable]
+
+        print(f"records in     : {len(records)}")
+        print(f"approaches out : {len(merged.all())}")
+        print(f"promotable     : {len(promotable)}")
+        for skill in promotable:
+            print(
+                f"  {skill.skill_id}  {len(skill.evidence_tasks)} shapes  "
+                f"{skill.name}"
+            )
+
+        if not args.apply:
+            print("\nnothing written. Re-run with --apply to keep this.")
+            return 0
+
+        if args.out is None:
+            backup = f"{args.skills}.pre-merge"
+            shutil.copyfile(args.skills, backup)
+            print(f"backup: {backup}")
+        shutil.copyfile(staged, destination)
+
+    print(f"\nwritten: {destination}")
+    return 0
+
+
+def _replay(records: list[Any], path: str) -> Any:
+    """Propose every stored record into a fresh library, in stored order.
+
+    Order matters and is preserved: when two phrasings merge, the instruction
+    kept is the one proposed first, so replaying in a different order would
+    keep different advice.
+    """
+    from swarmd.swarm.skills import SkillLibrary
+
+    library = SkillLibrary(path)
+    for record in records:
+        if record.retired:
+            # Carried across as-is. A retired record is a decision, and
+            # re-proposing it would revive it.
+            continue
+        for shape in record.evidence_tasks or ("",):
+            library.propose(
+                name=record.name,
+                task_pattern=record.task_pattern,
+                instruction=record.instruction,
+                run_id=record.provenance_run,
+                criterion_hash=record.provenance_criterion,
+                evidence_task=shape,
+                generality=record.generality,
+            )
+    return library
 
 
 def _serve_command(args: argparse.Namespace) -> int:
