@@ -858,3 +858,40 @@ def test_distillation_without_artifacts_describes_the_step_only():
     instruction = run._distil_instruction("summarise", node, outcomes)
     assert "write one paragraph" in instruction
     assert "JSON object" not in instruction
+
+
+def test_the_report_counts_nodes_and_agents_separately():
+    """`nodes_passed` counted AGENT OUTCOMES under a node's name, which
+    understated every run this system reported.
+
+    `results` holds one entry per agent, and a node is run by a pool. A
+    scheduling run read "7/8 nodes" when all four of its nodes were solved: one
+    pool of two had a single agent fail, which is a population search working
+    rather than a node going unsolved. The two numbers answer different
+    questions and are now both reported.
+    """
+    from swarmd.swarm.criteria import Candidate
+    from swarmd.swarm.run import RunResult
+    from swarmd.swarm.worker import WorkerResult
+
+    def outcome(node, passed):
+        return WorkerResult(
+            agent_id=f"a-{node}-{passed}",
+            node=node,
+            candidate=Candidate(output="{}", artifacts={}),
+            passed=passed,
+        )
+
+    result = RunResult(run_id="r", task="t")
+    result.results = [
+        outcome("alpha", True),
+        outcome("alpha", True),
+        outcome("beta", False),
+        outcome("beta", True),
+    ]
+
+    payload = result.to_dict()
+    assert payload["nodes_passed"] == 2, "both nodes were solved by someone"
+    assert payload["nodes_total"] == 2
+    assert payload["agents_passed"] == 3, "and one agent of four did not"
+    assert payload["agents_total"] == 4

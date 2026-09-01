@@ -805,7 +805,10 @@ def _print_run(
     if result.plan:
         print(f"plan={result.plan.content_hash()} "
               f"({len(result.plan.nodes)} nodes, width={result.plan.width})")
-    print(f"nodes_passed={len(result.passed)}/{len(result.results)}  "
+    # Nodes first, because that is the question -- did the plan get solved --
+    # and agents second, because a pool losing a member is normal.
+    print(f"nodes_passed={len(result.nodes_passed)}/{len(result.nodes_attempted)}  "
+          f"agents_passed={len(result.passed)}/{len(result.results)}  "
           f"contained={len(result.contained)}")
     print(f"integrity_hash={result.integrity_hash()}")
 

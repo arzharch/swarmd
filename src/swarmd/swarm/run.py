@@ -212,6 +212,16 @@ class RunResult:
         )
         return hashlib.sha256("|".join(payload).encode()).hexdigest()[:16]
 
+    @property
+    def nodes_attempted(self) -> set[str]:
+        """Distinct plan nodes some agent attempted."""
+        return {r.node for r in self.results}
+
+    @property
+    def nodes_passed(self) -> set[str]:
+        """Distinct plan nodes at least one uncontained agent solved."""
+        return {r.node for r in self.results if r.passed and not r.contained}
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "run_id": self.run_id,
@@ -220,8 +230,20 @@ class RunResult:
             "duration_s": round(self.duration_s, 2),
             "criterion": self.criterion.to_dict() if self.criterion else None,
             "plan": self.plan.to_dict() if self.plan else None,
-            "nodes_passed": len(self.passed),
-            "nodes_total": len(self.results),
+            # NODES, and separately the AGENTS that attempted them. These used
+            # to be the same number under the node name, which understated
+            # every run this system has ever reported: `results` holds one
+            # entry per AGENT OUTCOME, and a node is run by a pool. A schedule
+            # task read "7/8 nodes" when all four of its nodes were solved --
+            # one node's pool of two had a single agent fail, which is a
+            # population search working, not a node going unsolved.
+            #
+            # A node counts as passed when ANY of its agents passed and was not
+            # contained, because that is what the run then builds on.
+            "nodes_passed": len(self.nodes_passed),
+            "nodes_total": len(self.nodes_attempted),
+            "agents_passed": len(self.passed),
+            "agents_total": len(self.results),
             "contained": len(self.contained),
             "integrity_hash": self.integrity_hash(),
             "served_from": self.served_from,
