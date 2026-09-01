@@ -1,6 +1,10 @@
 # Production Readiness Review
 
-**Status:** v1.0 · **Updated:** 2026-08-28 · Reviewed before any production deploy
+**Status:** v1.1 · **Updated:** 2026-09-01 · Reviewed before any production deploy
+
+Section 11 is a dated re-review. Section 10's verdict stands as written on
+2026-08-28 and is not edited in place -- a review rewritten to match what was
+later found is a review nobody can check.
 
 A PRR is a checklist you fill in honestly or not at all. Items are marked
 **PASS**, **PARTIAL**, or **BLOCKED**, and the partials are the useful part —
@@ -145,3 +149,177 @@ The honest summary is that the *operational* work is further along than the
 measurements themselves need provider quota and time. That ordering was
 deliberate — building the curve before the thing that makes the curve
 trustworthy is how unfalsifiable claims get made.
+
+---
+
+## 11. Re-review, 2026-09-01
+
+Six roles, one question each, answered against the state of the tree rather
+than against section 10. Where a role's blocker from v1.0 no longer holds, it
+says so and why; where it holds, it says that too.
+
+### Product
+
+**Does it do the thing on the tin?** Partly, and the part that does not is
+now the only interesting one.
+
+The claim is: generic agents take a task nobody scoped for them, author their
+own success criterion, decompose it, solve it, and get better at it. The first
+four happen, on live providers, at $0.00, with every number traceable to a
+ledger row. Both held-out tasks ran end to end with no code change on
+2026-09-01 -- one produced the right answer on 15 of 20 nodes, one produced a
+wrong answer on 0 of 30. That is honestly "takes an unseen task end to end",
+not "solves it".
+
+The fifth -- gets better -- has never been measured, and until today nobody
+could say why. Now it can be said precisely: the skill library could not
+promote anything, for two structural reasons unrelated to quota (ADR-014).
+Fixed; the loop turns; the measurement itself is still outstanding.
+
+**Verdict: PARTIAL.** Ship-blocking for the improvement claim only. Everything
+else the product says it does, it demonstrably does.
+
+### QA
+
+**What would I refuse to sign?** Three things, down from four.
+
+1. **The learning claim.** Two approved skills exist for the first time, on
+   their own evidence. Whether retrieving them helps is unmeasured, and the
+   first attempt was stopped deliberately: an IDF index over two documents has
+   two distinct weights across 32 terms, so it ranks by term overlap and
+   offered a permissions-diagnosis skill to a colour-ordering puzzle. An
+   experiment on that index cannot discriminate.
+2. **Scale.** Every live run has been `smoke`. `standard` and `deep` are sized
+   against the measured budget and have never met a real provider.
+3. **Volume.** The success rate rests on single-digit task counts.
+
+Down from four because the ablation now compares two genuinely different
+configurations -- it did not, over HTTP, until 2026-09-01, and every eval ever
+started from the dashboard before that compared a configuration against itself.
+
+**What I will sign:** the test suite means something. 1,280 tests, and the ones
+added this week were each verified to fail against the code they pin by
+stashing it. Four accounting defects and four measurement defects were found by
+asking what the ledger contains rather than what the code returns.
+
+**Verdict: CONDITIONAL.** Sign for evaluation. Do not sign the improvement
+claim.
+
+### SRE
+
+**Would I carry the pager?** Not for production, and not for the reason v1.0
+gave.
+
+v1.0's blocker 3 -- egress 443-to-anywhere -- is **closed**: the NetworkPolicy
+now allows provider CIDRs, with the failure mode written next to it (a provider
+changing ranges looks like an outage). Blocker 2, no on-call rotation, stands
+unchanged: alerts plus one maintainer is not on-call, and no code fixes that.
+
+New since v1.0, and found by running the thing rather than reading it: a
+session was accepted, spent a task's provider quota, and only then discovered
+the approval store was unreachable, because that store is not touched until the
+first consolidation. `/readyz` now checks it and `POST /api/sessions` refuses
+before spending. That class of fault -- ready-looking service, dependency
+checked too late -- is exactly what a readiness probe is for.
+
+Also: port 8000 lands inside a Windows Hyper-V reserved range on at least one
+developer machine, and uvicorn dies at bind with `[winerror 10013]`. Documented
+in the README and the runbook rather than worked around.
+
+**Verdict: PARTIAL.** Fine for a single-operator evaluation deployment. Not
+production without a second person.
+
+### Security
+
+**What is the worst an outsider can do?** Unchanged and still bounded: burn
+provider quota, read prompts and artifacts in flight, corrupt the approval
+audit trail. ADR-013's compensating controls hold and are tested.
+
+One finding, and it is the good kind. The dashboard sent no operator token at
+all, so on a gated control plane every mutating request was refused 401 and the
+event stream closed 1008. That is a **usability** failure of a security control,
+not a hole -- the gate held; the browser simply could not pass it, and nothing
+in the UI could say so. Fixed, plus `GET /api/auth` so a locked control plane
+looks locked instead of looking healthy.
+
+Worth naming as an accepted risk: the two skills approved today were approved by
+the operator running this work. They met their evidence bar on their own -- both
+records carry an empty `approval_note`, so no `force` and no bypass -- but the
+human gate is only as strong as the human, and here that human is the same party
+that built the corpus.
+
+**Verdict: PASS for the stated threat model.** ADR-013 remains the right call
+for one principal.
+
+### AI engineering
+
+**Is the measurement apparatus trustworthy?** More than it was this morning,
+and that is not a compliment to this morning.
+
+Three ways it was producing numbers that described something other than what
+they claimed, all fixed today: an ablation whose arms were the same code over
+HTTP; a session that trained on the tasks the eval then measured; a success rate
+that counted runs stopped by capacity as failures, so a long sweep measured
+leftover quota and reported it as capability.
+
+The structural fix is the interesting one. Measuring over the training set is no
+longer discouraged, it is **unexpressible**: `SessionRequest.arms` accepts
+`train`, `EvalRequest.arms` does not. A convention a person has to keep is what
+failed here twice in one day.
+
+Remaining known-unknown: the retrieval index's minimum useful size. Two
+documents is demonstrably below it. Where the threshold sits is itself
+unmeasured, and now on the list as a measurement rather than an assumption.
+
+**Verdict: PARTIAL.** The apparatus is sound. The measurements are outstanding.
+
+### Backend
+
+**Would I take this codebase on?** Yes, with one reservation.
+
+Determinism is real and enforced -- sha256 everywhere `hash()` would have been,
+stdlib-only in the matching path, no model in any decision that has to be
+reproducible. Idempotency is a contract with tests rather than a header that is
+sometimes honoured. The ledger is genuinely append-only and every reported
+figure is a sum over it.
+
+The reservation is drift between the CLI and the service. Both are clients of
+the same code, tests covered the CLI, and two fixes landed on one side only --
+the eval's missing skill library sat unfixed in the control plane for four days
+after being fixed in the CLI, and every dashboard eval in that window was a
+null-result generator. The new tests pin both paths, but the pattern is worth
+watching: **two clients, one of them tested.**
+
+**Verdict: PASS with a watch item.**
+
+---
+
+## Go / no-go, 2026-09-01
+
+| | |
+|---|---|
+| **Evaluation deployment** | **GO** |
+| **Production deployment** | **NO-GO** — one maintainer, no on-call; nothing at `standard` scale has met a real provider |
+| **Publishing an improvement claim** | **NO-GO** — the measurement has not been taken |
+
+**Runbook:** [RUNBOOK.md](RUNBOOK.md), eleven alerts each with a confirm step
+and a first action, plus deploy and rollback exercised on a real k3s cluster.
+
+**Eval ready:** yes. Both arms, bootstrap CIs, paired on (task, seed), refuses
+an improvement figure without a control, refuses to start when the arms would
+be identical, and excludes runs that never reached the task.
+
+**Harness ready:** yes. `draft`, `fetch`, `llm`, `sandbox`, `store`, `verify`,
+with the sandbox containing escapes under chaos.
+
+**What it will not do:**
+
+- It will not tell you it is learning. It cannot yet, and it says so rather than
+  reporting a number that would read as one.
+- It will not run at `standard` or `deep` against real providers on today's
+  free-tier budget without pacing across slices.
+- It will not survive a second operator: there is one credential and no
+  accounts, by decision.
+- It will not spend money without being told to. `SWARMD_ALLOW_PAID` is off,
+  the ceiling is $0.05, and every live run so far has cost $0.00 -- which also
+  means the ceiling has never been exercised against paid traffic.
