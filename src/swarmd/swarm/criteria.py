@@ -457,6 +457,69 @@ class Criterion:
         """True when every check is one a degenerate candidate can satisfy."""
         return all(c.kind in TRIVIAL_KINDS for c in self.checks)
 
+    def contradictions(self) -> tuple[str, ...]:
+        """Checks that provably cannot all hold at once.
+
+        THE OTHER WAY A CRITERION IS BROKEN. `is_weak` catches one that accepts
+        everything; this catches one that accepts NOTHING, and `attack` cannot
+        find it by construction -- it tries degenerate candidates, and a
+        criterion no candidate can satisfy rejects those exactly as it rejects
+        correct work. Both readings look identical from outside.
+
+        THE ONE THAT HAPPENED. A held-out task asked for the number of boxes to
+        ship five orders. Two proposers disagreed about the answer, and the
+        consensus merge unioned their checks rather than noticing:
+
+            numeric_range  total_boxes  min=8 max=8
+            numeric_range  total_boxes  min=9 max=9
+
+        Eight is correct. Nothing can be both, so every worker failed every
+        attempt, on every run, forever -- and because the frozen criterion is
+        memoised, re-running the task replayed the same impossible target
+        rather than re-authoring it. Two live runs, 0/30 and 0/12 nodes, same
+        criterion hash.
+
+        Only PROVABLE conflicts are reported. A criterion demanding two
+        different key names may well be over-constrained, but that is a
+        judgement about intent; disjoint numeric ranges on one key is
+        arithmetic. Reported as strings so the caller can say what was wrong
+        rather than only that something was.
+        """
+        conflicts: list[str] = []
+        ranges: dict[str, list[tuple[float, float]]] = {}
+        for check in self.checks:
+            if check.kind != "numeric_range":
+                continue
+            key = str(check.params.get("key", ""))
+            low = check.params.get("min")
+            high = check.params.get("max")
+            if low is None or high is None:
+                continue
+            try:
+                bounds = (float(low), float(high))
+            except (TypeError, ValueError):
+                continue
+            if bounds[0] > bounds[1]:
+                conflicts.append(
+                    f"numeric_range on {key!r} has min {bounds[0]:g} above max "
+                    f"{bounds[1]:g}"
+                )
+                continue
+            ranges.setdefault(key, []).append(bounds)
+
+        for key, spans in ranges.items():
+            # The intersection of every range asserted for this key. Empty
+            # means the checks disagree about what the value may be, and no
+            # output can satisfy them together.
+            floor = max(span[0] for span in spans)
+            ceiling = min(span[1] for span in spans)
+            if floor > ceiling:
+                shown = ", ".join(f"[{a:g},{b:g}]" for a, b in sorted(spans))
+                conflicts.append(
+                    f"numeric_range checks on {key!r} cannot all hold: {shown}"
+                )
+        return tuple(conflicts)
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "description": self.description,

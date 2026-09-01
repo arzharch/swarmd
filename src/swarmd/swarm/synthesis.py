@@ -112,6 +112,12 @@ def attack(criterion: Criterion, task: str) -> AttackReport:
     # is a sample, not a proof, and the structural signal is stronger.
     if not breaches and criterion.is_weak():
         breaches.append("only_trivial_checks")
+    # And the opposite failure, which the attacks above cannot reach: a
+    # criterion nothing can satisfy rejects a degenerate candidate exactly as
+    # it rejects correct work, so it survives every attack while making the
+    # task unsolvable. Appended unconditionally rather than only when the
+    # attacks found nothing, because this is a proof rather than a sample.
+    breaches.extend(f"unsatisfiable: {c}" for c in criterion.contradictions())
     return AttackReport(not breaches, tuple(breaches))
 
 

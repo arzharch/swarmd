@@ -17,6 +17,7 @@ from swarmd.swarm.criteria import (
     CheckError,
     Criterion,
 )
+from swarmd.swarm.synthesis import attack
 
 
 def _crit(*checks: Check, description: str = "d") -> Criterion:
@@ -202,3 +203,74 @@ def test_one_substantive_check_makes_a_criterion_non_weak():
     assert not _crit(
         Check("output_nonempty", {}), Check("exit_code", {"expected": 0})
     ).is_weak()
+
+
+# --- the criterion that accepts nothing -------------------------------------
+
+
+def test_a_criterion_that_nothing_can_satisfy_is_refused():
+    """THE ONE THAT HAPPENED, on a held-out task, twice.
+
+    A warehouse task asked how many boxes ship five orders. Two proposers
+    disagreed about the answer and the consensus merge unioned their checks:
+    `total_boxes` had to be exactly 8 AND exactly 9. Eight is correct; nothing
+    is both. Every worker failed every attempt on every run -- 0/30 nodes, then
+    0/12 on a re-run with the same criterion hash, because a frozen criterion
+    is memoised and the impossible target was replayed rather than re-authored.
+
+    `attack` cannot find this. It tries degenerate candidates, and a criterion
+    nothing can satisfy rejects those exactly as it rejects correct work, so it
+    survives every attack while making the task unsolvable.
+    """
+    criterion = Criterion(
+        "boxes per order and in total",
+        (
+            Check("json_parses", {"required_keys": ["boxes_per_order", "total_boxes"]}),
+            Check("numeric_range", {"key": "total_boxes", "min": 8, "max": 8}),
+            Check("numeric_range", {"key": "total_boxes", "min": 9, "max": 9}),
+        ),
+    )
+
+    conflicts = criterion.contradictions()
+    assert len(conflicts) == 1
+    assert "total_boxes" in conflicts[0]
+
+    report = attack(criterion, "ship five orders in boxes of twelve")
+    assert not report.survived
+    assert any("unsatisfiable" in b for b in report.breaches)
+
+
+def test_overlapping_ranges_on_one_key_are_not_a_contradiction():
+    """Two checks narrowing the same value is ordinary: the intersection is
+    non-empty, so something can satisfy both. Only a proof counts."""
+    criterion = Criterion(
+        "a bounded total",
+        (
+            Check("numeric_range", {"key": "total", "min": 0, "max": 10}),
+            Check("numeric_range", {"key": "total", "min": 5, "max": 8}),
+        ),
+    )
+    assert criterion.contradictions() == ()
+
+
+def test_a_single_inverted_range_is_a_contradiction():
+    """min above max is unsatisfiable on its own, without needing a second
+    check to disagree with."""
+    criterion = Criterion(
+        "an impossible bound",
+        (Check("numeric_range", {"key": "total", "min": 9, "max": 4}),),
+    )
+    assert criterion.contradictions()
+
+
+def test_ranges_on_different_keys_never_conflict():
+    """The keys are independent values. Conflating them would refuse ordinary
+    criteria that bound two different numbers."""
+    criterion = Criterion(
+        "two totals",
+        (
+            Check("numeric_range", {"key": "boxes", "min": 8, "max": 8}),
+            Check("numeric_range", {"key": "orders", "min": 5, "max": 5}),
+        ),
+    )
+    assert criterion.contradictions() == ()
