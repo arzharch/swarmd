@@ -789,8 +789,10 @@ def test_an_identifier_naming_the_task_is_stripped_like_the_words_would_be():
     prevent.
     """
     source = (
-        "A stock count records 87 units while the ledger shows 92. Determine "
-        "which figures disagree and produce the reconciliation.",
+        (
+            "A stock count records 87 units while the ledger shows 92. "
+            "Determine which figures disagree and produce the reconciliation."
+        ),
     )
     stripped = strip_source_terms(
         "produce a JSON object with keys stock_count, ledger_count and discrepancy",
