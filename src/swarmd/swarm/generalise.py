@@ -38,9 +38,11 @@ from __future__ import annotations
 
 import functools
 import hashlib
+import json
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import Any
 
 # Ordered, longest-match-first. Order IS the semantics: `1.25 dollars` must be
 # MONEY rather than NUMBER followed by a word, and `2024-01-05` must be a DATE
@@ -1057,3 +1059,62 @@ def _claim_tokens(text: str) -> list[str]:
         token for token in _WORD.findall(without_slots)
         if token not in FUNCTION_WORDS and not token.isdigit()
     ]
+
+
+# ANATOMY: redact_answers
+#   A worked example demonstrates a SHAPE. A number in it is not shape -- it is
+#   the answer to the task the example came from, and a later worker asked to
+#   compute its own number is the last reader who should be shown one.
+#
+#   Found by reviewing a real candidate. The library offered
+#   `{"count": 60, "reasoning": "There are 5 runners ... 5! = 120 ..."}` for
+#   any counting task. The incoming-task literal guard does not catch it: a
+#   task about four books shares no literal with five runners, so the example
+#   would have been served, complete with a confident 60.
+#
+#   This is ADR-015's second finding -- a computed answer surviving
+#   abstraction -- reappearing in a channel that did not exist when it was
+#   written. Same class, same fix: take the numbers out.
+#
+#   NOT `abstract`, which is the obvious thing and is wrong here. Its QUOTED
+#   slot eats every JSON key and string value, so an exemplar comes back as
+#   `{<QUOTED>: <NUMBER> <QUOTED>: <QUOTED>}` -- structure destroyed, which is
+#   the one thing an exemplar exists to carry. This walks the parsed document
+#   and redacts only what a reader could mistake for their own answer.
+_NUMERIC_SLOTS = ("MONEY", "PERCENT", "DATE", "NUMBER")
+_REDACTED = "<NUMBER>"
+
+
+def redact_answers(text: str) -> str:
+    """A worked example with every number taken out, structure intact."""
+    try:
+        parsed = json.loads(text)
+    except (TypeError, ValueError):
+        return _redact_in_string(text)
+    return json.dumps(_redact_value(parsed), sort_keys=True)
+
+
+def _redact_value(value: Any) -> Any:
+    if isinstance(value, bool):
+        # A verdict, not a quantity. `true` is the shape of the answer and
+        # carries nothing a later task could copy as its own number.
+        return value
+    if isinstance(value, (int, float)):
+        return _REDACTED
+    if isinstance(value, str):
+        return _redact_in_string(value)
+    if isinstance(value, list):
+        return [_redact_value(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _redact_value(v) for k, v in value.items()}
+    return value
+
+
+def _redact_in_string(text: str) -> str:
+    """Numbers inside prose. The reasoning is the transferable part; the
+    arithmetic in it is one task's."""
+    out = text
+    for kind, pattern in SLOTS:
+        if kind in _NUMERIC_SLOTS:
+            out = pattern.sub(_REDACTED, out)
+    return out

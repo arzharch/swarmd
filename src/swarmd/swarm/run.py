@@ -37,6 +37,7 @@ from swarmd.swarm.generalise import (
     leaked_subject_terms,
     literal_map,
     rebind,
+    redact_answers,
     render_pattern,
     strip_source_terms,
     task_signature,
@@ -1818,7 +1819,11 @@ class SwarmRun:
             if not payload:
                 continue
             try:
-                return json.dumps(payload, sort_keys=True, default=str)
+                # REDACTED, not raw. The artifact is a worked example, and a
+                # number in it is the answer to the task it came from -- the
+                # one thing a later worker computing its own number must not
+                # be shown. Structure survives; arithmetic does not.
+                return redact_answers(json.dumps(payload, sort_keys=True, default=str))
             except (TypeError, ValueError):
                 # An artifact that will not serialise is not one a later
                 # prompt can carry. Skipped, not repaired.

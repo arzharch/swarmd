@@ -130,3 +130,47 @@ def test_the_reviewer_is_shown_the_worked_example(tmp_path) -> None:
         return str(request.item.get("exemplar", ""))
 
     assert asyncio.run(go()) == ARTIFACT
+
+
+class TestAnswersAreRedacted:
+    """A worked example demonstrates a shape. A number in it is an answer.
+
+    Found reviewing a real candidate: the library was ready to offer
+    `{"count": 60, "reasoning": "There are 5 runners ... 5! = 120 ..."}` to any
+    counting task. The incoming-task literal guard does not catch that -- a
+    task about four books shares no literal with five runners -- so a worker
+    asked to compute its own number would have been handed a confident 60.
+    """
+
+    def test_a_computed_answer_does_not_survive(self) -> None:
+        from swarmd.swarm.generalise import redact_answers
+
+        out = redact_answers(
+            '{"count": 60, "reasoning": "There are 5 runners, 5! = 120 orders"}'
+        )
+        for answer in ("60", "5", "120"):
+            assert answer not in out
+        # ...and the METHOD does survive, which is the whole point.
+        assert "runners" in out and "orders" in out
+
+    def test_structure_without_numbers_is_untouched(self) -> None:
+        from swarmd.swarm.generalise import redact_answers
+
+        shape = '{"checkable": false, "missing_information": ["service_scope"]}'
+        assert redact_answers(shape) == shape
+
+    def test_a_boolean_verdict_is_not_a_quantity(self) -> None:
+        from swarmd.swarm.generalise import redact_answers
+
+        assert '"checkable": false' in redact_answers('{"checkable": false}')
+
+    def test_nested_numbers_are_reached(self) -> None:
+        from swarmd.swarm.generalise import redact_answers
+
+        out = redact_answers('{"rows": [{"total": 42}], "note": "sum was 42"}')
+        assert "42" not in out
+
+    def test_text_that_is_not_json_is_still_redacted(self) -> None:
+        from swarmd.swarm.generalise import redact_answers
+
+        assert "17" not in redact_answers("the total came to 17 units")
