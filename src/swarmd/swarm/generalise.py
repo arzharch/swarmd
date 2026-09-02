@@ -611,7 +611,7 @@ def content_tokens(text: str) -> list[str]:
     acceptable at any generality.
     """
     without_slots = _PLACEHOLDER.sub(" ", text)
-    without_slots = re.sub(r"\bslot_[a-z]+\b", " ", without_slots.lower())
+    without_slots = re.sub(r"(?<![a-z])slot_[a-z]+", " ", without_slots.lower())
     return [
         token
         for token in _WORD.findall(without_slots)
@@ -996,73 +996,64 @@ def rebind(text: str, mapping: tuple[tuple[str, str], ...]) -> str:
 #   word is domain vocabulary. It keeps what more than one task attested and
 #   drops what only one did.
 #
-#   Method words and function words are kept unconditionally. They are the
-#   vocabulary the abstraction already treats as task-independent, so
-#   intersecting them would only shred the sentence without removing anything
-#   a task contributed.
-_SEGMENT = re.compile(r"[A-Za-z][A-Za-z0-9_-]*|[^A-Za-z]+")
-_DANGLING = re.compile(r"\s+([,.;:])")
-_REPEATED_COMMA = re.compile(r",(\s*,)+")
-_SENTENCE = re.compile(r"[^.!?]*[.!?]|[^.!?]+")
+#   Method vocabulary is NOT exempt. Whether both tasks described the work the
+#   same way is the question being asked, and a method word only one of them
+#   used is that task's account of the work rather than the approach.
 
 
-def corroborate(variants: Sequence[str]) -> str:
-    """Keep only the words EVERY variant of this advice used.
+def corroborated_terms(variants: Sequence[str]) -> list[str]:
+    """The vocabulary EVERY variant of this advice used, in first-seen order.
 
     `variants` are instructions distilled independently for the same approach
-    from different task shapes. With fewer than two there is nothing to
-    corroborate and the text is returned unchanged -- deliberately, because
-    a single variant intersected with itself would look verified and is not.
+    from different task shapes. Fewer than two means there is nothing to
+    corroborate: an empty list, and the caller serves the single wording
+    unchanged -- deliberately, because a wording intersected with itself would
+    look verified and is not.
+
+    WHY A LIST AND NOT A REWRITTEN SENTENCE. Filtering one wording's words and
+    keeping its grammar produces text neither task wrote. Measured on the first
+    real pair -- a timezone-filter step and an HTTP-header step distilled to
+    the same approach -- it gave `"<>-check the `` from the <> (if any) with
+    the `<>` values from the <>."`: the contamination was gone and so was the
+    meaning, leaving punctuation around holes. An intersection is a SET, and
+    presenting it as one is the honest shape. The caller labels it as such.
+
+    Placeholders (`<TERM>`, `<PATH>`) are excluded on both sides. A placeholder
+    marks where ONE task's literal stood, so it is the definition of what
+    cannot be corroborated. Function words are excluded because they carry no
+    claim about method; method vocabulary is NOT excluded, because whether both
+    tasks described the work the same way is exactly the question.
     """
-    kept_variants = [v for v in variants if v.strip()]
-    if len(kept_variants) < 2:
-        return kept_variants[0].strip() if kept_variants else ""
+    kept = [v for v in variants if v.strip()]
+    if len(kept) < 2:
+        return []
 
     attested: set[str] | None = None
-    for variant in kept_variants:
-        stems = {_stem(token) for token in content_tokens(variant)}
+    for variant in kept:
+        stems = {_stem(token) for token in _claim_tokens(variant)}
         attested = stems if attested is None else (attested & stems)
     assert attested is not None
 
-    # Sentence by sentence, because a sentence that loses every word carrying
-    # meaning should GO rather than survive as a string of connectives. That
-    # case is the "structured parts only" instruction ADR-015 describes: the
-    # advice keeps the shape two tasks proved and drops the prose one task
-    # supplied.
-    out = [
-        rebuilt
-        for sentence in _SENTENCE.findall(kept_variants[0])
-        if (rebuilt := _corroborate_sentence(sentence, attested))
+    out: list[str] = []
+    seen: set[str] = set()
+    for token in _claim_tokens(kept[0]):
+        stem = _stem(token)
+        if stem in attested and stem not in seen:
+            seen.add(stem)
+            out.append(token)
+    return out
+
+
+def _claim_tokens(text: str) -> list[str]:
+    """Words that make a claim about the work: no placeholders, no connectives.
+
+    `content_tokens` drops method vocabulary as well, because it exists to
+    measure how much of an instruction was the task restated. Corroboration
+    asks the opposite question and needs the method words in.
+    """
+    without_slots = _PLACEHOLDER.sub(" ", text)
+    without_slots = re.sub(r"(?<![a-z])slot_[a-z]+", " ", without_slots.lower())
+    return [
+        token for token in _WORD.findall(without_slots)
+        if token not in FUNCTION_WORDS and not token.isdigit()
     ]
-    return " ".join(out).strip()
-
-
-def _corroborate_sentence(sentence: str, attested: set[str]) -> str:
-    kept: list[str] = []
-    substantive = False
-    for segment in _SEGMENT.findall(sentence):
-        if not segment[:1].isalpha():
-            kept.append(segment)
-            continue
-        lowered = segment.lower()
-        if lowered in METHOD_LEXICON or _stem(lowered) in attested:
-            substantive = True
-        elif lowered not in FUNCTION_WORDS:
-            continue
-        elif not substantive:
-            # A connective with nothing yet in front of it is debris left by
-            # the word that was dropped -- "and to collect" out of "probes and
-            # monitoring to collect". Function words earn their place by
-            # joining things that survived, not by being harmless.
-            continue
-        kept.append(segment)
-    if not substantive:
-        return ""
-    # Removing a word leaves the punctuation that separated it. Tidied rather
-    # than left, because this string is read by a human at the approval gate
-    # and written into a worker prompt, and both are worse for the debris.
-    text = "".join(kept)
-    text = _REPEATED_COMMA.sub(",", text)
-    text = _DANGLING.sub(r"\1", text)
-    text = re.sub(r"[ \t]+", " ", text)
-    return text.strip().lstrip(" ,;:-").strip()

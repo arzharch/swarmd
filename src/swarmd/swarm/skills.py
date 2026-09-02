@@ -51,7 +51,7 @@ from swarmd.swarm.generalise import (
     METHOD_LEXICON,
     _stem,
     abstract,
-    corroborate,
+    corroborated_terms,
     render_pattern,
     shared_literals,
 )
@@ -220,9 +220,9 @@ class Skill:
         """What a worker is actually shown, and what a reviewer approves.
 
         NOT `instruction`, which is one task's wording of the approach and is
-        kept verbatim because it is half of the content address. This is that
-        wording with every prose word no OTHER contributing task also used
-        removed -- the verification step ADR-015 named as missing.
+        kept verbatim because it is half of the content address. This reports
+        only the vocabulary a SECOND, differently-shaped task also used -- the
+        verification step ADR-015 named as missing.
 
         Domain-as-method contamination is one task's vocabulary by
         construction: `probes`, `monitoring`, `stock levels` reach the library
@@ -233,9 +233,17 @@ class Skill:
         or did not, in which case it goes. Deterministic, no threshold, no
         classifier, and nothing tuned on a sample.
 
-        Falls back to the stored instruction when there is only one variant,
-        or when the format is not the distiller's. Both are honest: a single
-        variant corroborated against itself would look verified and is not.
+        WHY THE TERMS ARE LISTED RATHER THAN LEFT IN A SENTENCE. Keeping one
+        wording's grammar and deleting its unattested words produces text
+        neither task wrote. The first real pair -- a timezone-filter step and
+        an HTTP-header step, distilled to the same approach -- gave
+        `"<>-check the `` from the <> (if any) ..."`: contamination gone,
+        meaning gone with it. An intersection is a set; saying so is the
+        honest shape, and the worker is told what it is looking at.
+
+        Falls back to the stored instruction when there is only one wording,
+        or when the format is not the distiller's. Both are honest: a wording
+        corroborated against itself would look verified and is not.
         """
         parts = split_instruction(self.instruction)
         if parts is None or len(self.evidence_instructions) < 2:
@@ -251,15 +259,24 @@ class Skill:
         ))
         if len(prose) < 2:
             return self.instruction
-        prefix, _, tail = parts
-        agreed = corroborate(prose)
+        _, _, tail = parts
+        agreed = corroborated_terms(prose)
         if not agreed:
-            # Nothing in the prose survived two tasks. The advice keeps the
-            # part that is generated from structure and says nothing else --
-            # the "structured parts only" instruction ADR-015 describes,
-            # arrived at by evidence rather than chosen up front.
+            # Nothing survived two tasks. The advice keeps the part generated
+            # from structure and says nothing else -- the "structured parts
+            # only" instruction ADR-015 describes, reached by evidence rather
+            # than chosen up front.
             return tail.strip() or self.instruction
-        return f"{prefix}{agreed} {tail}".rstrip() if tail else f"{prefix}{agreed}"
+        # len(prose), not len(evidence_tasks). A shape can accrue without a
+        # recorded wording -- `record_evidence` carries only a fingerprint --
+        # and a shape that contributed no wording corroborated nothing. Saying
+        # "3 tasks agreed" on the strength of 2 wordings is the same kind of
+        # overclaim this whole mechanism exists to remove.
+        head = (
+            f"{CORROBORATED_PREFIX}{len(prose)} differently-shaped tasks "
+            f"described this approach with: {', '.join(agreed)}."
+        )
+        return f"{head} {tail}".rstrip() if tail else head
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -365,6 +382,12 @@ MAX_NAME_CHARS = 120
 # writes them and `Skill.served_instruction` splits on them.
 INSTRUCTION_PREFIX = "When a step calls for this: "
 INSTRUCTION_SHAPE_CLAUSE = " Produce a JSON object whose values are of these kinds: "
+
+# How corroborated advice introduces itself. A worker reading a list of terms
+# has to know it IS a list of terms and not a garbled sentence, and a reviewer
+# has to see at a glance that the record was verified rather than merely
+# distilled.
+CORROBORATED_PREFIX = "When a step calls for work of this kind: "
 
 
 def split_instruction(instruction: str) -> tuple[str, str, str] | None:

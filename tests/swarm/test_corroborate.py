@@ -11,8 +11,9 @@ from __future__ import annotations
 
 import pytest
 
-from swarmd.swarm.generalise import corroborate
+from swarmd.swarm.generalise import corroborated_terms
 from swarmd.swarm.skills import (
+    CORROBORATED_PREFIX,
     INSTRUCTION_PREFIX,
     INSTRUCTION_SHAPE_CLAUSE,
     Skill,
@@ -56,6 +57,13 @@ def test_domain_vocabulary_only_one_task_used_is_not_served() -> None:
     assert "figures" in served.lower()
 
 
+def test_corroborated_advice_says_what_it_is() -> None:
+    """A worker reading a term list must not read it as a mangled sentence."""
+    served = skill(UPTIME, LEDGER).served_instruction
+    assert served.startswith(CORROBORATED_PREFIX)
+    assert "2 differently-shaped tasks" in served
+
+
 def test_the_structured_tail_is_never_corroborated_away() -> None:
     served = skill(UPTIME, LEDGER).served_instruction
     assert INSTRUCTION_SHAPE_CLAUSE.strip() in served
@@ -70,6 +78,13 @@ def test_a_single_variant_is_served_verbatim() -> None:
 def test_a_repeated_wording_is_not_two_variants() -> None:
     """`merge_identity` replays one instruction once per accrued shape."""
     assert skill(UPTIME, UPTIME).served_instruction == UPTIME
+
+
+def test_the_count_reported_is_wordings_not_shapes() -> None:
+    """A shape that contributed no wording corroborated nothing."""
+    s = skill(UPTIME, LEDGER)
+    s.evidence_tasks = (*s.evidence_tasks, "a-third-shape-with-no-wording")
+    assert "2 differently-shaped tasks" in s.served_instruction
 
 
 def test_prose_that_survives_nothing_falls_back_to_structure_only() -> None:
@@ -94,9 +109,24 @@ def test_split_instruction_refuses_to_guess() -> None:
     assert tail.startswith("Produce a JSON object")
 
 
-@pytest.mark.parametrize("variants", [[], [""], ["   "]])
-def test_corroborate_handles_nothing_to_corroborate(variants: list[str]) -> None:
-    assert corroborate(variants) == ""
+@pytest.mark.parametrize("variants", [[], [""], ["   "], ["only one"]])
+def test_nothing_to_corroborate_yields_no_terms(variants: list[str]) -> None:
+    assert corroborated_terms(variants) == []
+
+
+def test_placeholders_are_never_corroborated() -> None:
+    """A placeholder marks where ONE task's literal stood."""
+    terms = corroborated_terms(
+        ["check the <TERM> against <PATH>", "check the <TERM> against <NUMBER>"]
+    )
+    assert terms == ["check"]
+
+
+def test_terms_keep_the_order_of_the_first_wording() -> None:
+    terms = corroborated_terms(
+        ["sort the rows then sum the values", "sum the values after you sort rows"]
+    )
+    assert terms == ["sort", "rows", "sum", "values"]
 
 
 def test_a_second_shape_records_its_own_wording(tmp_path) -> None:
