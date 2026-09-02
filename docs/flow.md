@@ -3449,6 +3449,98 @@ which allowances it could not count -- it excludes rate-kind providers by
 design, which was a rounding error when they were a sliver of the pool and a
 wrong prediction once Mistral became the largest allowance in it.
 
+## 2026-09-03 - G-4 answered: no measured improvement, and the review that earned its keep
+
+**The ablation ran.** Five tasks from the `custom` arm, which the training
+corpus deliberately excludes (ADR-014), three repeats, both arms, 5 agents,
+30 runs, 2,032 seconds, $0.00.
+
+```
+  treatment   solved 3/15   20.0%  CI[0.00, 0.40]   nodes 41.5%   18.0k tokens
+  control     solved 2/15   13.3%  CI[0.00, 0.33]   nodes 39.6%   21.4k tokens
+  paired delta +0.067       CI[-0.20, +0.33]        pairs 15
+
+  VERDICT: no measured improvement -- intervals overlap
+```
+
+The harness refused to call +0.067 a positive. That is the whole reason it
+exists, and it is the first time it has been asked the question with all four
+null-result generators fixed, a corpus that can promote, a library built
+entirely after the contamination fixes, and a human review that rejected two
+of three candidates.
+
+**Three details that matter more than the headline.**
+
+*Treatment was WORSE at pass@1* -- 20% against control's 40% -- and only
+overtakes at pass@2 (60/40). On five tasks that is one versus two, so it is
+noise; it is noise pointing the wrong way, and burying it would be the exact
+dishonesty this file exists to prevent.
+
+*Containments doubled*: 8 in treatment, 4 in control, mostly network egress
+(`subprocess`+`curl`, `requests.get`). Either n=15 noise or the worked example
+nudges agents toward shell-and-fetch. Nobody has priced it. Recorded as an open
+question rather than explained away.
+
+*Treatment used fewer tokens* -- 18.0k against 21.4k mean. Retrieval fired and
+shortened the work; it did not make it land.
+
+**The honest reading: a one-skill library cannot move a five-task eval.** That
+is what "not enough evidence" looks like when it is measured instead of argued.
+
+### The review is what found the two real defects
+
+Three candidates reached the gate. Approving all three would have looked
+better and would have been wrong.
+
+`count, reasoning` was approved -- the only one whose exemplar carries method
+(permutation symmetry, halving). `additional_information_required, checkable,
+missing_information, verdict` was REJECTED: a near-duplicate of an approach
+already held, competing for the same retrieval slot, corroborated to the single
+word `produce`, and its own artifact showed two keys holding identical content.
+Two stale requests from a library that no longer exists were rejected as stale,
+and the CLI correctly recorded the decision while warning the library was out of
+sync rather than pretending it applied.
+
+Reading those candidates found two defects in the exemplar mechanism built
+hours earlier:
+
+**A worked example was carrying a computed answer.** `{"count": 60,
+"reasoning": "There are 5 runners ... 5! = 120 ..."}` would have been served to
+any counting task, because a task about four books shares no literal with five
+runners. This is ADR-015's second finding -- a computed answer surviving
+abstraction -- reappearing in a channel that did not exist when it was written.
+Numbers are now redacted at storage AND at serve time, so a library written by
+an older build is covered too. `abstract` is the obvious tool and the wrong
+one: its QUOTED slot eats every JSON key, returning `{<QUOTED>: <NUMBER>}` and
+destroying the one thing an exemplar carries.
+
+**The literal guard was inert for the only input it ever sees.** `abstract`
+captures a quoted span INCLUDING its quotes, and every value in a JSON exemplar
+is quoted, so `"/var/log/app.log"` never matched the bare path in a task.
+Nothing was ever withheld. Both sides are now compared in the same form.
+
+The gate earned its keep before it approved anything.
+
+### Also today
+
+The CLI would spend a full session's quota and then drop every promotable
+candidate on the floor when the approval store was unreachable -- `_distill`
+swallows a store failure so an optional step cannot fail a run that already
+succeeded, which is right, and means a clean exit with an empty queue. The
+server has refused to start such a session for weeks. The CLI did not. Third
+instance of the same drift in two days, after the Mistral consent gate and the
+`/api/sessions` check; the probe now lives in `hitl/stores.py` and both clients
+call it.
+
+### Where this stops
+
+**Volume is not being pursued.** More train passes would grow the library and
+the ablation could be re-run, and that is the only route to an improvement
+claim. It is a deliberate stop, not an unfinished item: the mechanisms are
+built, tested and reviewed, and the measurement they enable returned a
+non-result at this library size. Anyone who wants the claim can supply
+credentials and turn the handle.
+
 ## Next up
 
 - [x] Kernel, pipeline, harnesses, gates, HITL state machine, router
