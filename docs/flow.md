@@ -3574,9 +3574,11 @@ credentials and turn the handle.
       2026-09-01: a `train` arm of 15 in 5 families, plus an identity that
       lets two phrasings of one approach be one record. 2 skills approved on
       their own evidence, where every previous session produced 0
-- [ ] Volume, now that it can pay off: 5 families of 3 promoted 2 approaches.
-      More families and more members per family is what turns 2 into a
-      library big enough to move a five-task eval
+- [x] Volume: taken as far as it is going to be taken. 24-task corpus, five
+      passes, 31 records all carrying worked examples, 3 past the evidence bar,
+      1 approved on review. STOPPED BY DECISION 2026-09-03, not by a blocker:
+      the mechanisms are built and the measurement they enable returned a
+      non-result at this library size
 - [x] The ablation actually compares two different things (it did not before)
 - [x] pass@k and node pass rate reported and traceable
 - [x] Re-measure learning: the node-anchor fix was never the blocker. The
@@ -3584,7 +3586,14 @@ credentials and turn the handle.
       was quota (ADR-014); the ablation over the unseen `custom` arm runs
       on a library with approved skills for the first time
 - [ ] The learning curve: 50-200 tasks with the control arm, then and only then
-      generate BENCHMARKS.md and make an improvement claim
+      generate BENCHMARKS.md and make an improvement claim. NOT PURSUED --
+      G-4 was answered on 2026-09-03 with "no measured improvement" at one
+      approved skill, and this is the work that would be needed to change that
+      answer. Left for whoever supplies their own credentials
+- [x] G-4 answered. 30 runs on the unseen `custom` arm, treatment 3/15 against
+      control 2/15, paired delta +0.067 with CI [-0.20, +0.33]. A closed
+      measurement reporting a non-result, which is the outcome the harness was
+      built to be able to report
 - [x] Product posture: operator token, edge allowlist, rate limits, JSON logs
       with redaction, SECURITY.md, ADR-013
 - [x] Narrow the egress NetworkPolicy to provider CIDRs -- done in
