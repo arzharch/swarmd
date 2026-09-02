@@ -953,17 +953,14 @@ def create_app(
 async def _approval_store_error(app: FastAPI) -> str:
     """Empty string when the approval store answers, the reason when it does not.
 
-    Cheap enough for a readiness probe: one `SELECT` against an already-open
-    pool, or a SQLite read.
+    Thin wrapper: the probe itself lives in `hitl.stores` so the CLI runs the
+    same one. It did not, and a CLI session spent quota and dropped every
+    promotable candidate without saying so.
     """
-    from swarmd.hitl.stores import build_approval_store
+    del app
+    from swarmd.hitl.stores import approval_store_error
 
-    try:
-        store = build_approval_store(os.environ.get("DATABASE_URL"))
-        await store.list_pending()
-    except Exception as exc:  # noqa: BLE001 - any failure to reach it is the answer
-        return f"{type(exc).__name__}: {exc}"
-    return ""
+    return await approval_store_error(os.environ.get("DATABASE_URL"))
 
 
 def _default_provider_factory() -> Any:

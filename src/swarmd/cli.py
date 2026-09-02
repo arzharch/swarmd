@@ -981,7 +981,7 @@ async def _session_command(args: argparse.Namespace) -> int:
     from examples.tasks.suite import suite
     from swarmd.harnesses.sandbox import SandboxHarness
     from swarmd.hitl.approvals import ApprovalManager
-    from swarmd.hitl.stores import build_approval_store
+    from swarmd.hitl.stores import approval_store_error, build_approval_store
     from swarmd.router.pool import ProviderPool
     from swarmd.swarm.run import SwarmRun
     from swarmd.swarm.session import SwarmSession
@@ -995,6 +995,22 @@ async def _session_command(args: argparse.Namespace) -> int:
         return 2
 
     library = SkillLibrary(args.skills)
+    # BEFORE spending anything. `_distill` deliberately swallows a store
+    # failure so an optional step cannot fail a run that already succeeded --
+    # which means an unreachable approval store looks like a clean session
+    # with an empty queue, and the whole point of the session was to fill that
+    # queue. The server refuses to start one for this reason; this is the same
+    # refusal, in the client that was missing it.
+    store_error = asyncio.run(approval_store_error())
+    if store_error:
+        print(
+            f"approval store unreachable: {store_error}\n"
+            "A session distils skills that a human must approve, and a store "
+            "that cannot be reached drops every candidate silently. Start it "
+            "(`docker compose up -d postgres`), or unset DATABASE_URL to use "
+            "the SQLite store."
+        )
+        return 2
     approvals = ApprovalManager(build_approval_store())
     sandbox = SandboxHarness()
     use_skills = not args.no_skills

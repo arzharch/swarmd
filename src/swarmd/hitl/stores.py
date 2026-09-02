@@ -311,6 +311,28 @@ def _pg_row_to_request(row: Any) -> ApprovalRequest:
     )
 
 
+async def approval_store_error(url: str | None = None) -> str:
+    """Empty string when the approval store answers, the reason when it does not.
+
+    Cheap enough for a readiness probe and for a preflight: one `SELECT`
+    against an already-open pool, or a SQLite read.
+
+    Lives here rather than in `server/app.py` because BOTH clients need it and
+    only one had it. A session started from the CLI spent provider quota, ran
+    to completion, and silently dropped every promotable candidate on the floor
+    -- `_distill` catches a store failure and emits `skill_skipped` so that a
+    successful run is not failed by an optional step, which is right, and means
+    the operator sees a clean exit and an empty queue. The server refuses to
+    start such a session. The CLI did not.
+    """
+    try:
+        store = build_approval_store(url or os.environ.get("DATABASE_URL"))
+        await store.list_pending()
+    except Exception as exc:  # noqa: BLE001 - any failure to reach it is the answer
+        return f"{type(exc).__name__}: {exc}"
+    return ""
+
+
 def build_approval_store(url: str | None = None, path: str | Path | None = None) -> Any:
     """Pick a backend: Postgres when DATABASE_URL is set, SQLite otherwise.
 
