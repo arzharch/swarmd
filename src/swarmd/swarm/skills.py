@@ -198,8 +198,45 @@ class Skill:
         The question the human queue asks. A candidate below this bar is kept
         and accrues evidence; it is simply not worth a reviewer's attention
         yet, because there is nothing in it a second task has confirmed.
+
+        TWO CONDITIONS, and the second is what lets the identity key be loose.
+        `approach_key` groups records by artifact shape, which merges tasks
+        sharing a type signature and no method at all -- measured, four of
+        eight such groups had NOTHING in common. Those merges are caught here:
+        a record whose wordings corroborate to nothing has no transferable
+        advice to review, whatever its evidence count says. Without this the
+        looser key would fill the queue with records whose served advice is
+        the boilerplate and nothing else.
+
+        Records with fewer than two READABLE wordings skip the second test --
+        they predate ADR-016, accrued through `record_evidence`, which carries
+        only a fingerprint, or were written by hand rather than distilled.
+        Refusing those would retire a library for a field it was never written
+        with, and `served_instruction` falls back for exactly the same cases.
         """
-        return len(self.evidence_tasks) >= MIN_DISTINCT_TASKS
+        if len(self.evidence_tasks) < MIN_DISTINCT_TASKS:
+            return False
+        if len(self._distilled_prose()) < MIN_DISTINCT_TASKS:
+            return True
+        return bool(self.corroborated)
+
+    def _distilled_prose(self) -> list[str]:
+        """The distinct prose spans of the wordings this record has kept.
+
+        Distinct, because `merge_identity` replays one instruction once per
+        accrued shape: a repeated string is one wording, and corroborating it
+        against itself would claim a verification that never happened.
+        """
+        return list(dict.fromkeys(
+            split[1]
+            for variant in self.evidence_instructions
+            if (split := split_instruction(variant)) is not None
+        ))
+
+    @property
+    def corroborated(self) -> list[str]:
+        """The method vocabulary every recorded wording used. See ADR-016."""
+        return corroborated_terms(self._distilled_prose())
 
     @property
     def success_rate(self) -> float:
@@ -252,15 +289,11 @@ class Skill:
         # instruction once per shape it had accrued, so a migrated library can
         # hold the same string several times -- and corroborating a string
         # against itself claims a verification that never happened.
-        prose = list(dict.fromkeys(
-            split[1]
-            for variant in self.evidence_instructions
-            if (split := split_instruction(variant)) is not None
-        ))
-        if len(prose) < 2:
+        prose = self._distilled_prose()
+        if len(prose) < MIN_DISTINCT_TASKS:
             return self.instruction
         _, _, tail = parts
-        agreed = corroborated_terms(prose)
+        agreed = self.corroborated
         if not agreed:
             # Nothing survived two tasks. The advice keeps the part generated
             # from structure and says nothing else -- the "structured parts
@@ -288,7 +321,7 @@ def make_skill_id(name: str, instruction: str) -> str:
     return hashlib.sha256(payload.encode()).hexdigest()[:12]
 
 
-def approach_key(name: str, task_pattern: str) -> str:
+def approach_key(name: str, task_pattern: str, instruction: str = "") -> str:
     """Identity for "the same approach", independent of wording and of the plan.
 
     WHY NOT `make_skill_id`. That hashes the instruction TEXT, and the
@@ -324,6 +357,30 @@ def approach_key(name: str, task_pattern: str) -> str:
     check kinds gave 38 approaches and 3 that cleared the evidence bar; keying
     on the name alone gave 34 and 5. Fewer records, more of them answerable.
 
+    AND THE NAME IS NOT IN IT EITHER, which reverses THAT on a second
+    measurement. The name is `produce ` plus the artifact's KEY NAMES, and key
+    names are chosen by a worker for one task's criterion -- `diagnosis, fix`
+    against `problem, fixed_query_filter, records_found` for two runs of the
+    same diagnose-and-repair work. On a 38-record library distilled entirely
+    after the ADR-016 fixes, name identity produced **38 approaches, every one
+    a singleton**. Nothing could ever accumulate evidence.
+
+    What actually recurs is the artifact SHAPE with the names taken off: how
+    many fields, of which kinds. On the same library that gives 28 approaches
+    and 8 holding more than one record -- and the group that matters,
+    `(int+str, 3 fields)`, is the constrained-permutation family, whose two
+    members corroborate to `compute, number, valid, positions, middle,
+    integer`. Real shared method vocabulary, unreachable under name identity
+    because the three members had named their fields differently.
+
+    WHY A LOOSER KEY IS SAFE NOW AND WAS NOT BEFORE. A shape key merges records
+    that share a type signature and nothing else -- four of those eight groups
+    corroborate to ZERO terms, because the tasks genuinely had no method in
+    common. Before ADR-016 that was poisoning: one task's prose was served to
+    the other. Now an empty intersection is caught by `promotable`, which
+    refuses a record whose wordings agree on nothing. The bad merges never
+    reach a human, and the good ones finally can.
+
     THE COST, stated because it is real: two different steps of one task merge
     when they produce the same artifact shape, and the instruction kept is the
     one proposed first. Those records were already competing for the same
@@ -338,13 +395,42 @@ def approach_key(name: str, task_pattern: str) -> str:
     tasks propose the same approach, which needs a corpus whose tasks share
     output shapes -- the `train` arm. See ADR-014.
     """
-    # `task_pattern` is accepted and deliberately unused. See below; the
+    # `task_pattern` is accepted and deliberately unused. See above; the
     # signature keeps it so a future key can take it back without touching
     # every call site.
     del task_pattern
 
-    shape = sorted(set(tokenize(index_text(name))))
-    return hashlib.sha256(" ".join(shape).encode()).hexdigest()[:12]
+    shape = artifact_shape(name, instruction)
+    if shape is None:
+        # No shape to key on -- an instruction from an older build, or a
+        # candidate distilled from a step that produced nothing structured.
+        # Fall back to the name rather than collapsing every such record into
+        # one bucket, which is the failure mode a loose key has.
+        shape = " ".join(sorted(set(tokenize(index_text(name)))))
+    return hashlib.sha256(shape.encode()).hexdigest()[:12]
+
+
+def artifact_shape(name: str, instruction: str) -> str | None:
+    """`"<field count>:<sorted value kinds>"`, or None if it cannot be read.
+
+    The artifact the step produced, with the KEY NAMES removed -- which is what
+    `name` carries and what makes it useless as an identity. Both halves come
+    from text this system generated itself (`_distil_name`, `_distil_instruction`
+    in `run.py`), so this parses a known format rather than guessing at prose.
+    """
+    parts = split_instruction(instruction)
+    if parts is None:
+        return None
+    tail = parts[2]
+    marker = INSTRUCTION_SHAPE_CLAUSE.strip()
+    if not tail.startswith(marker):
+        return None
+    kinds_text = tail[len(marker):].split(".", 1)[0]
+    kinds = sorted({k.strip() for k in kinds_text.split(",") if k.strip()})
+    if not kinds:
+        return None
+    fields = [f for f in name.split(":", 1)[-1].split(",") if f.strip()]
+    return f"{len(fields)}:{','.join(kinds)}"
 
 
 # A distilled instruction has to be an INSTRUCTION. The distiller reads model
@@ -684,7 +770,7 @@ class SkillLibrary:
             # record that already holds some, rather than on a second copy
             # starting again from one shape -- which is what put `promotable`
             # out of reach entirely (ADR-014).
-            existing = self._same_approach(name, pattern)
+            existing = self._same_approach(name, pattern, instruction)
         if existing is not None:
             # The NEW wording travels with the new fingerprint. This is the
             # whole input to `served_instruction`: without it a second shape
@@ -722,18 +808,18 @@ class SkillLibrary:
             self.save()
         return skill
 
-    def _same_approach(self, name: str, pattern: str) -> Skill | None:
+    def _same_approach(self, name: str, pattern: str, instruction: str) -> Skill | None:
         """An existing, non-retired record for this approach, or None.
 
         Retired records are skipped deliberately: reviving a pruned approach
         through the back door of a re-proposal would undo a decision somebody
         made, and `retired_reason` would then describe a live skill.
         """
-        key = approach_key(name, pattern)
+        key = approach_key(name, pattern, instruction)
         for skill in self._skills.values():
             if skill.retired:
                 continue
-            if approach_key(skill.name, skill.task_pattern) == key:
+            if approach_key(skill.name, skill.task_pattern, skill.instruction) == key:
                 return skill
         return None
 
@@ -885,11 +971,11 @@ class SkillLibrary:
                 )
 
         surviving = {
-            approach_key(skill.name, skill.task_pattern): skill
+            approach_key(skill.name, skill.task_pattern, skill.instruction): skill
             for skill in library.all()
         }
         for record in records:
-            key = approach_key(record.name, record.task_pattern)
+            key = approach_key(record.name, record.task_pattern, record.instruction)
             target = surviving.get(key)
 
             if record.retired and target is None:
