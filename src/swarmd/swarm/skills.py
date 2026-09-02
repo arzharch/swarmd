@@ -171,6 +171,25 @@ class Skill:
     # it, and what only one of them said came from that one task. See
     # `served_instruction`. Defaulted for libraries written before this field.
     evidence_instructions: tuple[str, ...] = ()
+    # A WORKED EXAMPLE: the artifact a passing agent actually produced, as
+    # JSON, and the abstract fingerprint of the task it came from.
+    #
+    # Every other field here is an abstraction, which is why this one looks
+    # like a violation of the module's own rule and is not. The rule exists
+    # because a distilled INSTRUCTION containing `3 pens at 1.25 = 3.75` is one
+    # task's answer wearing a method's grammar. An exemplar makes no such
+    # claim: it is labelled as another task's answer, and `exemplar_for`
+    # refuses to serve it to any task that shares a literal with it.
+    #
+    # Stored because prose does not transfer. Measured on 49 records from a
+    # 24-task corpus: six approaches cleared the evidence bar and five of them
+    # corroborated to a single generic word, at 38 records and again at 49.
+    # Every system that reports transferable skills stores something with a
+    # contract -- executable code (Voyager), an abstracted action template
+    # (Agent Workflow Memory), or the successful trajectory itself as a
+    # few-shot example (ExpeL). This is the third.
+    exemplar: str = ""
+    exemplar_task: str = ""
     # How much of the ORIGINATING step was method vocabulary rather than the
     # task's own words, before literals were stripped. A reviewer signal, not a
     # gate: a low score says "this step was mostly the task restated", which is
@@ -219,6 +238,27 @@ class Skill:
         if len(self._distilled_prose()) < MIN_DISTINCT_TASKS:
             return True
         return bool(self.corroborated)
+
+    def exemplar_for(self, task: str) -> str:
+        """The worked example, unless serving it to THIS task would leak.
+
+        The guard is literal-level and exact, not a similarity score: if the
+        exemplar and the incoming task share any literal -- a number, a price,
+        a date, a quoted string -- the exemplar is withheld. That is the case
+        the no-literal rule was written for, where a worker is handed values
+        that look like the ones it is supposed to derive.
+
+        A DIFFERENT task's literals are not that case. They are visibly not
+        this task's values, the criterion block above them names the keys this
+        worker must produce, and grading checks what it produced rather than
+        what it was shown. Withholding those too is what left prose as the only
+        permitted unit of learning, and prose does not transfer.
+        """
+        if not self.exemplar:
+            return ""
+        if shared_literals(self.exemplar, task):
+            return ""
+        return self.exemplar
 
     def _distilled_prose(self) -> list[str]:
         """The distinct prose spans of the wordings this record has kept.
@@ -454,6 +494,12 @@ def artifact_shape(name: str, instruction: str) -> str | None:
 # overfitting by another name.
 PRUNE_MIN_USES = 5
 PRUNE_MIN_SUCCESS_RATE = 0.3
+
+# A worked example goes into a worker prompt, which is token cost on a
+# quota-bound system, and into an approval record a human reads. Bounded for
+# both reasons; a truncated artifact still shows its shape, which is the part
+# that transfers.
+MAX_EXEMPLAR_CHARS = 600
 
 MIN_INSTRUCTION_CHARS = 8
 MAX_INSTRUCTION_CHARS = 2_000
@@ -747,6 +793,7 @@ class SkillLibrary:
         evidence_task: str = "",
         source_task: str = "",
         generality: float = 0.0,
+        exemplar: str = "",
     ) -> Skill:
         """Record a candidate. It is NOT usable until a human approves it.
 
@@ -776,7 +823,15 @@ class SkillLibrary:
             # whole input to `served_instruction`: without it a second shape
             # confirms that the approach transfers but leaves no way to tell
             # which words were the approach and which were the first task.
-            if self._add_evidence(existing, evidence_task, instruction.strip()):
+            added = self._add_evidence(existing, evidence_task, instruction.strip())
+            if exemplar and not existing.exemplar:
+                # FIRST one wins, and it is never replaced. A skill's exemplar
+                # is part of what a human approved; swapping it afterwards
+                # would serve text nobody reviewed.
+                existing.exemplar = exemplar[:MAX_EXEMPLAR_CHARS]
+                existing.exemplar_task = evidence_task
+                added = True
+            if added:
                 self.save()
             return existing
         skill = Skill(
@@ -788,6 +843,8 @@ class SkillLibrary:
             provenance_criterion=criterion_hash,
             evidence_tasks=(evidence_task,) if evidence_task else (),
             evidence_instructions=(instruction.strip(),) if evidence_task else (),
+            exemplar=exemplar[:MAX_EXEMPLAR_CHARS],
+            exemplar_task=evidence_task if exemplar else "",
             generality=round(generality, 4),
         )
         self._skills[skill_id] = skill

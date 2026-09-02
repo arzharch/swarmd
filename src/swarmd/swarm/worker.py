@@ -141,7 +141,7 @@ def graded_block(criterion: Criterion | None) -> str:
     )
 
 
-def skills_block(skills: Sequence[Skill]) -> str:
+def skills_block(skills: Sequence[Skill], task: str = "") -> str:
     """The retrieved advice, and NOT the label it is filed under.
 
     A skill's name is derived from the artifact keys of the task it came from
@@ -163,9 +163,27 @@ def skills_block(skills: Sequence[Skill]) -> str:
     """
     if not skills:
         return ""
-    return "APPROACHES THAT WORKED BEFORE (use if applicable):\n" + "\n".join(
-        f"- {s.served_instruction}" for s in skills
-    )
+    lines: list[str] = []
+    carries_example = False
+    for skill in skills:
+        lines.append(f"- {skill.served_instruction}")
+        worked = skill.exemplar_for(task) if task else ""
+        if worked:
+            # A WORKED EXAMPLE, and labelled as one. The framing is
+            # load-bearing: unlabelled, an artifact reads as a template to fill
+            # in, and what that produces is a worker emitting another task's
+            # keys -- the failure `graded_block` exists to prevent.
+            # `exemplar_for` has already withheld this if it shares any literal
+            # with the task above.
+            lines.append(f"  A DIFFERENT task's step of this kind produced: {worked}")
+            carries_example = True
+    header = "APPROACHES THAT WORKED BEFORE (use if applicable)"
+    if carries_example:
+        header += (
+            ". Any example below came from ANOTHER task -- its keys and values "
+            "are not yours, and your criterion above says what yours must be"
+        )
+    return f"{header}:\n" + "\n".join(lines)
 
 
 def failures_block(failures: Sequence[str]) -> str:
@@ -192,7 +210,9 @@ def build_run_system(*, base: str, task: str, criterion: Criterion | None) -> st
     return "\n\n".join(parts)
 
 
-def build_node_system(run_system: str, skills: Sequence[Skill]) -> str:
+def build_node_system(
+    run_system: str, skills: Sequence[Skill], task: str = ""
+) -> str:
     """The run-stable layer plus the skills retrieved for ONE node.
 
     Skills sit here, not in the volatile block, because every agent in a
@@ -206,7 +226,7 @@ def build_node_system(run_system: str, skills: Sequence[Skill]) -> str:
     the retrieved text; the query is still `task + node.instruction`, and the
     skills a node is offered are exactly the ones it was offered before.
     """
-    block = skills_block(skills)
+    block = skills_block(skills, task)
     return f"{run_system}\n\n{block}" if block else run_system
 
 
@@ -243,7 +263,7 @@ def system_for(
     run_system = context.run_system or build_run_system(
         base=context.system, task=task, criterion=context.criterion
     )
-    return build_node_system(run_system, skills)
+    return build_node_system(run_system, skills, task)
 
 
 def build_node_prefix(
@@ -455,7 +475,7 @@ class GenericWorker:
         parts = [f"TASK: {task}", f"STEP: {node.name}", f"REQUIRED: {node.instruction}"]
         for block in (
             graded_block(getattr(self.context, "criterion", None)),
-            skills_block(skills),
+            skills_block(skills, task),
             failures_block(failures),
         ):
             if block:

@@ -1804,6 +1804,28 @@ class SwarmRun:
         return shapes
 
     @staticmethod
+    def _exemplar(outcomes: list[Any]) -> str:
+        """The artifact of the FIRST passing agent, as compact JSON.
+
+        First rather than best: they all passed the same frozen criterion, so
+        there is no "best" to pick, and any tie-break invented here would be
+        this system grading its own work -- the thing ADR-009 exists to stop.
+        Internal bookkeeping keys are dropped; they are not the contract.
+        """
+        for outcome in outcomes:
+            artifacts = getattr(outcome.candidate, "artifacts", None) or {}
+            payload = {k: v for k, v in artifacts.items() if not k.startswith("_")}
+            if not payload:
+                continue
+            try:
+                return json.dumps(payload, sort_keys=True, default=str)
+            except (TypeError, ValueError):
+                # An artifact that will not serialise is not one a later
+                # prompt can carry. Skipped, not repaired.
+                continue
+        return ""
+
+    @staticmethod
     def _step_text(plan_node: PlanNode | None, node: str) -> str:
         """The step as written. Falls back to the node name only when the plan
         no longer holds the node -- a resumed run whose plan was regenerated."""
@@ -2042,6 +2064,14 @@ class SwarmRun:
                     criterion_hash=result.criterion.hash,
                     evidence_task=task_key,
                     source_task=task,
+                    # The artifact that actually passed, kept whole. Prose is
+                    # what the rest of this pipeline distils and prose was
+                    # measured not to transfer -- 49 records from a 24-task
+                    # corpus produced six approaches past the evidence bar, five
+                    # of which corroborated to a single generic word. A worked
+                    # example has a contract prose does not, and every system
+                    # that reports transferable skills keeps one (ADR-017).
+                    exemplar=self._exemplar(outcomes),
                     # Measured on the step BEFORE stripping. Afterwards it is
                     # 1.0 by construction, which would record a constant and
                     # call it a signal. Pre-strip it answers the question a
