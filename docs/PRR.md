@@ -374,6 +374,38 @@ the judged cases) and refusing to ship a threshold tuned on four samples.
 intended. The watch item is drift between the CLI and the service: two clients
 of one contract, and fixes have twice landed on only one side.
 
+### Addendum, 2026-09-03: the measurement ran
+
+The ablation this section said was outstanding has been run. Five tasks from the
+`custom` arm (excluded from training by construction), three repeats, both arms,
+5 agents, 30 runs, $0.00:
+
+```
+  treatment   solved 3/15   20.0%  CI[0.00, 0.40]   nodes 41.5%
+  control     solved 2/15   13.3%  CI[0.00, 0.33]   nodes 39.6%
+  paired delta +0.067       CI[-0.20, +0.33]
+
+  VERDICT: no measured improvement
+```
+
+**The claim below stands unchanged, now on evidence rather than on absence of
+evidence.** The distinction matters for a reader deciding what this system is:
+"we have not measured it" and "we measured it and it did not move" are different
+statements, and only the second is a result.
+
+Two findings recorded against the mechanism rather than for it: treatment was
+worse at pass@1 (20% against 40%), and containments doubled (8 against 4, mostly
+network egress). Both are within noise at n=15. Both point the wrong way, and
+the second is an open safety question about the worked-example mechanism added
+the same day.
+
+**Review discipline held.** Three candidates reached the gate; one was approved.
+Reading the rejects found two defects in the exemplar path -- a computed answer
+being served to any task of the same shape, and a literal guard that was inert
+against JSON because `abstract` captures quoted spans with their quotes. Both
+fixed, both pinned by tests. The gate found them before the reviewer approved
+anything, which is the argument for having it.
+
 ### The improvement claim is deliberately not made
 
 The learning loop turns -- skills promote on real evidence, get retrieved,
