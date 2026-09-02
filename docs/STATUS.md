@@ -70,7 +70,7 @@ The CLI is the same operations without a browser, not a separate product.
 | 8 | Red-team organ | **PASS** — `--seed-rogues all` runs in CI; all five patterns handled, attribution checked |
 | 9 | Skills, economy, consolidation, curriculum, supervisor | **PASS** — library grows, human gate holds, state survives restart, supervisor patches and reverts |
 | 10 | Evaluation harness | **PASS** — both arms with CIs; BENCHMARKS.md refuses simulated data |
-| 11 | Hardening and honest documentation | **PARTIAL** — docs complete (PRR, SECURITY, SLO, RUNBOOK, CAPACITY, 15 ADRs); the full-system chaos run at acceptance scale landed on live providers 2026-09-01 (25/25 nodes, 9 agents killed and resumed, $0.00). What remains is the learning measurement itself (G-4) |
+| 11 | Hardening and honest documentation | **PASS, 2026-09-03** — docs complete (PRR, SECURITY, SLO, RUNBOOK, CAPACITY, 17 ADRs); the full-system chaos run at acceptance scale landed on live providers 2026-09-01 (25/25 nodes, 9 agents killed and resumed, $0.00); the G-4 ablation ran 2026-09-03 and returned a measured non-result |
 
 ---
 
@@ -78,7 +78,7 @@ The CLI is the same operations without a browser, not a separate product.
 
 | # | Criterion | State |
 |---|---|---|
-| 1 | All SPEC phase gates pass | **PARTIAL** — only Phase 11's live run outstanding |
+| 1 | All SPEC phase gates pass | **PASS, 2026-09-03** — Phase 11's only outstanding item was the G-4 measurement. It ran: 30 runs over the unseen `custom` arm, verdict "no measured improvement". A closed measurement, not an open gate |
 | 2 | A held-out task runs end to end with no code change | **PASS mechanically, 2026-09-01** — both holdout tasks ran on live providers with no code change: frozen criterion, plan, graded nodes, $0.00, zero simulated ledger rows. Neither passed every node (`hold-schedule-1` solved 4 of 4 nodes with the right answer, 15 of 20 agents; `hold-logistics-1` solved 0 of 6, blocked by a criterion requiring `total_boxes` to be both 8 and 9 -- refused at freeze since 2026-09-01, and the task now solves 7 of 7 nodes) |
 | 3 | Chaos at 0.2 across every stage; integrity hashes match | **PASS** — verified at 0.9 in CI, and in the swarm loop at 0.3 |
 | 4 | All five seeded rogues detected and contained | **PASS** — four caught by their own detector; one blocked by the frozen criterion before any detector saw it, reported as its own outcome rather than counted as a catch |
@@ -202,6 +202,38 @@ identical output would only prove the work was deterministic, not that it was
 recovered instead of repeated.
 
 ---
+
+## 5a. G-4, closed 2026-09-03
+
+The ablation ran on the `custom` arm, which the training corpus excludes by
+construction (ADR-014). Five tasks, three repeats, both arms, 5 agents, 30 runs,
+2,032 seconds, $0.00.
+
+```
+  treatment   solved 3/15   20.0%  CI[0.00, 0.40]   nodes 41.5%   18.0k tokens
+  control     solved 2/15   13.3%  CI[0.00, 0.33]   nodes 39.6%   21.4k tokens
+  paired delta +0.067       CI[-0.20, +0.33]        pairs 15
+
+  VERDICT: no measured improvement -- intervals overlap
+```
+
+**This closes G-4 as a measurement, not as a win.** The loop distils, merges
+identities, corroborates advice across task shapes, carries a worked example,
+puts candidates to a human, and prunes what fails in use. All of that is built,
+tested and exercised on live providers. What it does not do, at a library of one
+approved skill, is beat the control arm outside the confidence interval.
+
+Two things are recorded rather than smoothed over:
+
+- **Treatment was worse at pass@1** (20% against 40%), overtaking only at
+  pass@2. One task versus two, so noise -- pointing the wrong way.
+- **Containments doubled**, 8 against 4, mostly network egress. Either noise at
+  n=15 or the worked example nudges agents toward shell-and-fetch. Open.
+
+**Volume is not being pursued, by decision.** More passes would grow the library
+and the ablation could be re-run; that is the only route to an improvement
+claim. The mechanisms are built and the measurement they enable came back null
+at this size, so the claim stays unmade and `BENCHMARKS.md` stays ungenerated.
 
 ## 5. The remaining gap
 
