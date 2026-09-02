@@ -263,7 +263,7 @@ class Skill:
         # later task of the same shape. Idempotent -- there is nothing left to
         # redact in an exemplar stored after the fix.
         safe = redact_answers(self.exemplar)
-        if shared_literals(safe, task):
+        if shared_literals(_unquoted(safe), task):
             return ""
         return safe
 
@@ -360,6 +360,43 @@ class Skill:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+def _unquoted(exemplar: str) -> str:
+    """A JSON exemplar as plain text, so its literals can be compared at all.
+
+    THE BUG THIS FIXES. `shared_literals` scans with `abstract`, whose QUOTED
+    slot matches a whole quoted span INCLUDING the quotes. Every value in a
+    JSON exemplar is quoted, so a path stored as `"/var/log/app.log"` produced
+    the literal `"/var/log/app.log"` while the same path in a task produced
+    `/var/log/app.log` -- different strings, empty intersection, guard silent.
+    Since every exemplar this system stores is JSON, the guard was inert for
+    the only input it ever sees.
+
+    Rendering keys and string values as bare text puts both sides of the
+    comparison in the same form. Falls back to the raw text for anything that
+    does not parse, which is the conservative direction: more literals found,
+    not fewer.
+    """
+    try:
+        parsed = json.loads(exemplar)
+    except (TypeError, ValueError):
+        return exemplar
+    parts: list[str] = []
+
+    def walk(value: Any) -> None:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                parts.append(str(key))
+                walk(item)
+        elif isinstance(value, list):
+            for item in value:
+                walk(item)
+        elif isinstance(value, str):
+            parts.append(value)
+
+    walk(parsed)
+    return " ".join(parts)
 
 
 def make_skill_id(name: str, instruction: str) -> str:

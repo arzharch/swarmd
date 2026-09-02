@@ -15,6 +15,13 @@ from swarmd.swarm.skills import MAX_EXEMPLAR_CHARS, Skill, SkillLibrary
 from swarmd.swarm.worker import skills_block
 
 ARTIFACT = '{"invalid": 6, "total": 24, "valid": 18}'
+# What a worker actually sees: every number gone, structure kept. Serving is
+# where redaction is applied, so a library written before that guard existed
+# cannot leak one task's answer into a later task's prompt.
+SERVED_ARTIFACT = '{"invalid": "<NUMBER>", "total": "<NUMBER>", "valid": "<NUMBER>"}'
+# A literal that redaction does NOT remove, because it is not a quantity a
+# reader could mistake for their own answer.
+PATHED = '{"log": "/var/log/app.log", "verdict": "stale"}'
 
 
 def a_skill(**over) -> Skill:
@@ -32,13 +39,26 @@ def a_skill(**over) -> Skill:
 
 def test_an_exemplar_is_served_to_a_task_that_shares_no_literal() -> None:
     served = a_skill().exemplar_for("How many ways can four books be shelved?")
-    assert served == ARTIFACT
+    assert served == SERVED_ARTIFACT
 
 
 def test_an_exemplar_is_withheld_from_a_task_that_shares_a_literal() -> None:
-    """The case the no-literal rule was written for: a worker handed values
-    that look like the ones it is supposed to derive."""
-    assert a_skill().exemplar_for("Given 24 items, how many are valid?") == ""
+    """The guard's remaining job, now that numbers never reach it.
+
+    Redaction removes every quantity before this test runs, so a shared NUMBER
+    can no longer trigger it -- and does not need to, because there is nothing
+    numeric left to leak. What the guard still catches is the literal kinds
+    redaction deliberately keeps: paths, URLs, quoted strings.
+    """
+    pathed = a_skill(exemplar=PATHED)
+    assert pathed.exemplar_for("Why can nothing write to /var/log/app.log?") == ""
+    assert pathed.exemplar_for("Why can nothing write to the audit sink?") != ""
+
+
+def test_a_shared_number_no_longer_needs_the_guard() -> None:
+    """Belt and braces, in that order: redaction is the defence, not the guard."""
+    served = a_skill().exemplar_for("Given 24 items, how many are valid?")
+    assert "24" not in served
 
 
 def test_no_exemplar_means_no_claim() -> None:
@@ -49,7 +69,7 @@ def test_the_prompt_labels_an_example_as_another_task_s(tmp_path) -> None:
     block = skills_block([a_skill()], "How many ways can four books be shelved?")
     assert "A DIFFERENT task's step of this kind produced" in block
     assert "its keys and values are not yours" in block
-    assert ARTIFACT in block
+    assert SERVED_ARTIFACT in block
 
 
 def test_a_block_without_an_example_does_not_warn_about_one() -> None:
@@ -61,6 +81,7 @@ def test_a_block_built_without_a_task_serves_no_example() -> None:
     """No task text means the leak guard cannot run, so nothing is served."""
     block = skills_block([a_skill()])
     assert ARTIFACT not in block
+    assert SERVED_ARTIFACT not in block
 
 
 def test_the_first_exemplar_is_the_one_that_stays(tmp_path) -> None:
@@ -174,3 +195,20 @@ class TestAnswersAreRedacted:
         from swarmd.swarm.generalise import redact_answers
 
         assert "17" not in redact_answers("the total came to 17 units")
+
+
+def test_a_quoted_literal_is_compared_in_the_same_form_as_the_task() -> None:
+    """The guard was inert for the only input it ever sees.
+
+    `abstract`'s QUOTED slot captures a quoted span WITH its quotes, and every
+    value in a JSON exemplar is quoted -- so `"/var/log/app.log"` never matched
+    the bare `/var/log/app.log` in a task, and nothing was ever withheld.
+    """
+    pathed = a_skill(exemplar=PATHED)
+    assert pathed.exemplar_for("Why can nothing write to /var/log/app.log?") == ""
+
+
+def test_an_unparseable_exemplar_errs_toward_withholding() -> None:
+    """Raw text is scanned as-is: more literals found, not fewer."""
+    broken = a_skill(exemplar="not json at all: /var/log/app.log")
+    assert broken.exemplar_for("Why can nothing write to /var/log/app.log?") == ""
