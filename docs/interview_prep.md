@@ -2458,3 +2458,143 @@ another, which is worth knowing before trusting it in review. A reviewer
 reading the instruction catches these; a reviewer reading the score does not,
 and anything that automated approval on it would have admitted all three
 rejects.
+
+
+---
+
+## Section 16: G-4, answered (answerable NOW)
+
+**Q: You spent weeks on a self-improving agent system. Did it improve?**
+
+No, and the measurement says so rather than my judgement. Five tasks the
+training corpus deliberately excludes, three repeats, both arms, 5 agents, 30
+runs:
+
+```
+  treatment   solved 3/15   20.0%  CI[0.00, 0.40]   nodes 41.5%   18.0k tokens
+  control     solved 2/15   13.3%  CI[0.00, 0.33]   nodes 39.6%   21.4k tokens
+  paired delta +0.067       CI[-0.20, +0.33]
+
+  VERDICT: no measured improvement -- intervals overlap
+```
+
+The interesting part is that this is the first time the question was actually
+asked. For weeks the same sentence came out of four mechanisms that had nothing
+to do with learning: both arms built without a library, the control plane doing
+the same for four more days, the session training on the tasks the eval
+measured, and capacity-stopped runs counted as failures. All four fixed, and the
+loop still could not promote a skill -- for two structural reasons, not
+empirical ones (ADR-014).
+
+So "no measured improvement" has meant four different things at four different
+times, and only the last one is a result.
+
+**Q: Why not report +6.7% as a small win?**
+
+Because the paired interval is `[-0.20, +0.33]`. A delta whose interval spans
+zero by that margin is a coin, and calling it a win is how a number that
+predicts nothing ends up in a README. The harness refuses on interval overlap
+rather than on my reading of it, which is the point: the rule is in the code,
+not in the author.
+
+There is also a detail pointing the other way that I would rather state than be
+asked about. **Treatment was worse at pass@1** -- 20% against control's 40% --
+and only overtakes at pass@2. On five tasks that is one versus two, so it is
+noise; it is noise in the wrong direction, and a result summary that omitted it
+would be dishonest by selection.
+
+**Q: What would you need to make the claim?**
+
+Volume. One approved skill cannot move a five-task eval. The path is more
+training passes, more candidates past the evidence bar, review, re-ablate --
+and the honest reason it stops here is that the mechanisms are built and the
+measurement they enable came back null at this library size. Continuing would
+be spending someone else's tokens to move a number I have no evidence will move.
+
+**Q: Something in that ablation should worry you. What?**
+
+Containments doubled: 8 in treatment against 4 in control, mostly network
+egress -- `subprocess` plus `curl`, `requests.get`. Two readings, and I cannot
+separate them at n=15. Either it is noise, or the worked example nudges agents
+toward shell-and-fetch patterns, in which case the mechanism I added has a
+safety cost nobody priced.
+
+I am recording it as an open question. The alternative -- explaining it away as
+noise because the explanation is available -- is exactly how a real signal gets
+lost.
+
+**Q: You added worked examples the same day. Why, and what does the literature
+say?**
+
+Because prose was measured not to transfer. On a 24-task corpus: 38 records gave
+2 approaches past the evidence bar with zero shared method words; 49 records
+gave 6, five of which corroborated to a single generic word. Volume moved the
+count and not the quality. Two workers given different tasks calling for the
+same method describe it in almost entirely different words, and no prompt fixes
+that.
+
+Everyone who reports transferable skills stores something with a contract.
+Voyager stores executable code, verified by running it. Agent Workflow Memory
+stores abstracted action templates induced from trajectories. ExpeL stores the
+successful trajectory itself as a few-shot example. swarmd stored free-form
+natural-language advice -- the one representation with no contract -- and then
+tried to prove it generalised.
+
+The reason it ended up there is worth admitting: this project's own rule that no
+literal may survive into anything a later run reads. Correct in origin, a skill
+once contained `3 pens at 1.25 = 3.75` and served it as method. But it also
+banned the concrete worked example, and with no code stored either, prose was
+the only unit left. The weakest one, by elimination.
+
+**Q: How do you serve a concrete example without leaking the answer?**
+
+Two guards, and the review found both were needed because I got each one wrong
+first.
+
+The guard I designed was literal-level: withhold the example if it shares any
+literal with the incoming task. Reviewing a real candidate showed that is not
+enough. The library was ready to serve `{"count": 60, "reasoning": "There are 5
+runners ... 5! = 120 ..."}` to any counting task, because a task about four
+books shares no literal with five runners. That is ADR-015's computed-answer
+finding reappearing in a channel that did not exist when it was written.
+
+So numbers are redacted at storage and again at serve time -- the second because
+a library written by an older build still holds raw artifacts. `abstract` is the
+obvious tool and the wrong one: its QUOTED slot eats every JSON key, returning
+`{<QUOTED>: <NUMBER>}` and destroying the structure the example exists to carry.
+Redaction walks the parsed document and takes out only quantities.
+
+Then the guard itself turned out to be inert. `abstract` captures a quoted span
+INCLUDING its quotes, and every value in a JSON exemplar is quoted, so
+`"/var/log/app.log"` never matched the bare path in a task and nothing was ever
+withheld. Both sides are now rendered the same way before comparison.
+
+**Q: Three candidates reached the gate. How many did you approve?**
+
+One. That is the answer I would want from someone I was hiring.
+
+`count, reasoning` was approved: the only one whose exemplar carries method --
+total permutations, symmetry, halve -- with the answers redacted out.
+
+`additional_information_required, checkable, missing_information, verdict` was
+rejected on three grounds: it is a near-duplicate of an approach already held,
+so two skills compete for one retrieval slot with nothing to choose between
+them; its two contributing tasks corroborated to the single word `produce`; and
+its own artifact shows two keys carrying identical content, which is a shape you
+do not want propagated into every future prompt.
+
+Two stale requests, belonging to a library that no longer exists, were rejected
+as stale -- and the CLI recorded the decision while warning the library was out
+of sync, rather than pretending it had applied.
+
+The tempting move was to approve all three so the treatment arm had something to
+retrieve. That is precisely the failure the gate exists to prevent, and this
+repository has already done it once: a blanket approval admitted a skill with
+generality 0.25.
+
+**Q: What is the one-sentence version?**
+
+The learning loop is built, instrumented, reviewed and measured, and what it
+measures is that a one-skill library does not beat no library on five unseen
+tasks -- which is a result, obtained by refusing four separate opportunities to
+report something more flattering.
