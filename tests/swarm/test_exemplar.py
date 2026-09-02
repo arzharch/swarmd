@@ -94,3 +94,39 @@ def test_an_exemplar_is_bounded(tmp_path) -> None:
         exemplar="x" * (MAX_EXEMPLAR_CHARS * 3),
     )
     assert len(skill.exemplar) == MAX_EXEMPLAR_CHARS
+
+
+def test_the_reviewer_is_shown_the_worked_example(tmp_path) -> None:
+    """The gate decides what a human sees, and the example is the evidence.
+
+    Corroborated prose reduces to a couple of generic words. A reviewer asked
+    "does this approach transfer?" needs the artifact, or they are approving a
+    word list.
+    """
+    import asyncio
+
+    from swarmd.hitl.approvals import ApprovalManager
+    from swarmd.hitl.skill_gate import SkillGate
+    from swarmd.hitl.stores import build_approval_store
+
+    library = SkillLibrary(tmp_path / "skills.json")
+    library.propose(
+        name="approach: produce count, reasoning",
+        task_pattern="count slot_number slot_term",
+        instruction="When a step calls for this: separate valid from invalid.",
+        evidence_task="shape-a",
+        exemplar=ARTIFACT,
+    )
+    gate = SkillGate(
+        ApprovalManager(build_approval_store(path=tmp_path / "approvals.db")), library
+    )
+
+    async def go() -> str:
+        _, request = await gate.submit(
+            name="approach: produce count, reasoning",
+            task_pattern="count slot_number slot_term",
+            instruction="When a step calls for this: separate valid from invalid.",
+        )
+        return str(request.item.get("exemplar", ""))
+
+    assert asyncio.run(go()) == ARTIFACT

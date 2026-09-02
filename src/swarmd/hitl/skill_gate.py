@@ -120,6 +120,12 @@ class SkillGate:
                 # second task shape has corroborated the advice.
                 "instruction": skill.served_instruction[:600],
                 "instruction_as_distilled": skill.instruction[:600],
+                # THE WORKED EXAMPLE, because it is the part that carries the
+                # method (ADR-017). Corroborated prose reduces to a couple of
+                # generic words -- `compute, number` -- and a reviewer asked
+                # whether THAT transfers has almost nothing to go on. The
+                # artifact shows what the step actually produced.
+                "exemplar": skill.exemplar,
                 "provenance_run": run_id,
                 "provenance_criterion": criterion_hash,
                 "verified_successes": evidence,
