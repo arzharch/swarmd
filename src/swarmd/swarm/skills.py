@@ -52,6 +52,7 @@ from swarmd.swarm.generalise import (
     _stem,
     abstract,
     corroborated_terms,
+    redact_answers,
     render_pattern,
     shared_literals,
 )
@@ -256,9 +257,15 @@ class Skill:
         """
         if not self.exemplar:
             return ""
-        if shared_literals(self.exemplar, task):
+        # Redacted at storage time AND here. Belt and braces, for one concrete
+        # reason: a library written before that guard existed still holds raw
+        # artifacts, and it would serve one task's computed answer to every
+        # later task of the same shape. Idempotent -- there is nothing left to
+        # redact in an exemplar stored after the fix.
+        safe = redact_answers(self.exemplar)
+        if shared_literals(safe, task):
             return ""
-        return self.exemplar
+        return safe
 
     def _distilled_prose(self) -> list[str]:
         """The distinct prose spans of the wordings this record has kept.
