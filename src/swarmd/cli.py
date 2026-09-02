@@ -1215,10 +1215,19 @@ def _skills_command(args: argparse.Namespace) -> int:
                 f"that was approved is not the wording kept; re-review them"
             )
         for skill in promotable:
+            # The CORROBORATED terms, not the name. The name is the artifact's
+            # field names from whichever task proposed first, and a reviewer
+            # deciding whether an approach transfers needs to see what the
+            # contributing tasks actually agreed on -- which is also what a
+            # worker will be shown. A record whose terms read as one task's
+            # subject matter is the rejection this listing exists to enable.
+            terms = skill.corroborated
+            summary = ", ".join(terms) if terms else "<structure only>"
             print(
                 f"  {skill.skill_id}  {len(skill.evidence_tasks)} shapes  "
                 f"{skill.name}"
             )
+            print(f"      corroborated: {summary}")
 
         if not args.apply:
             print("\nnothing written. Re-run with --apply to keep this.")
