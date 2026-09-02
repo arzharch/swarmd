@@ -1001,7 +1001,7 @@ async def _session_command(args: argparse.Namespace) -> int:
     # with an empty queue, and the whole point of the session was to fill that
     # queue. The server refuses to start one for this reason; this is the same
     # refusal, in the client that was missing it.
-    store_error = asyncio.run(approval_store_error())
+    store_error = await approval_store_error()
     if store_error:
         print(
             f"approval store unreachable: {store_error}\n"
