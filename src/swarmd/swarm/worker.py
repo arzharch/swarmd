@@ -35,6 +35,27 @@ from swarmd.swarm.redteam import Action, RedTeam
 from swarmd.swarm.skills import Skill, SkillLibrary
 from swarmd.task import Checkpoint
 
+
+class BrowserHITLRequested(Exception):
+    """Raised by the worker when a browser session parks for a human.
+
+    Caught by ``SwarmRun._execute`` to persist the HITL request and park the
+    run — exactly the same mechanism as a ration pause but triggered by the
+    agent rather than by the provider.  The exception carries the agent_id,
+    node name, and the reason the agent gave so the dashboard can display
+    a meaningful prompt to the operator.
+
+    The run stores the pending ``hitl_input`` dict and the node name in the
+    run's durable state so a resume after human input re-runs ONLY the parked
+    node with the credentials/data provided.
+    """
+
+    def __init__(self, agent_id: str, node: str, reason: str) -> None:
+        super().__init__(f"agent {agent_id} on node {node!r} needs a human: {reason}")
+        self.agent_id = agent_id
+        self.node = node
+        self.reason = reason
+
 logger = logging.getLogger(__name__)
 
 WORKER_SYSTEM = (
@@ -293,6 +314,14 @@ class WorkerContext:
     redteam: RedTeam | None = None
     skills: SkillLibrary | None = None
     sandbox: Any = None
+    # Browser harness (BrowserHarness | None). When set, agents that emit a
+    # ```browser block are run there instead of the Python sandbox.  The harness
+    # enforces domain allowlists, red-team observation, and HITL parking.
+    browser_harness: Any = None
+    # Human-provided input for HITL resume.  Injected by SwarmRun when an
+    # operator approves a parked browser HITL request.  The GuardedPage makes
+    # it available as session.hitl_input inside the agent script.
+    hitl_input: dict[str, Any] | None = None
     run_id: str = ""
     # The worker system prompt. An INPUT rather than a constant because the
     # supervisor rewrites it between runs: a prompt that cannot be replaced
@@ -724,11 +753,63 @@ class GenericWorker:
 
         The simulated provider never surfaced this because it replied with bare
         JSON, which is the one shape where source and answer coincide.
+
+        BROWSER SCRIPTS. A ```browser fenced block is routed to BrowserHarness
+        instead of the Python sandbox. If the browser session signals a HITL
+        request (``session.request_human(reason)``) this method raises
+        ``BrowserHITLRequested`` — caught by ``SwarmRun._execute`` which parks
+        the run and queues an ApprovalManager request.
         """
+        ctx = self.context
+
+        # -- browser script path -------------------------------------------
+        browser_code = _extract_browser_code(text)
+        if browser_code and ctx.browser_harness is not None:
+            self._think(
+                "executing_browser",
+                f"{len(browser_code)} chars in the browser harness",
+            )
+            result = await ctx.browser_harness.run_script(
+                browser_code,
+                agent_id=self.agent_id,
+                run_id=ctx.run_id,
+                hitl_input=ctx.hitl_input or {},
+            )
+            if result.hitl_request:
+                # The script parked. Surface this as a distinct exception so
+                # the run layer can queue an ApprovalManager request without
+                # treating this as a worker failure.
+                self._think(
+                    "browser_hitl",
+                    f"parked: {result.hitl_request[:200]}",
+                )
+                raise BrowserHITLRequested(
+                    self.agent_id, node.name, result.hitl_request
+                )
+
+            artifacts = dict(result.artifacts)
+            # CoT: surface every browser action so the dashboard can render
+            # the full step-by-step trace.
+            for action in result.actions:
+                self._think(
+                    f"browser_{action.kind}",
+                    f"{action.detail[:120]} → {action.outcome}",
+                )
+            if result.error:
+                artifacts["_browser_error"] = result.error
+
+            answer = json.dumps(artifacts, sort_keys=True, default=str) if artifacts else text
+            return Candidate(
+                output=answer,
+                source=text,
+                artifacts=artifacts,
+            )
+
+        # -- python sandbox path -------------------------------------------
         code = _extract_code(text)
-        if code and self.context.sandbox is not None:
+        if code and ctx.sandbox is not None:
             self._think("executing_code", f"{len(code)} chars in the sandbox")
-            result = await self.context.sandbox.run_python(code)
+            result = await ctx.sandbox.run_python(code)
             artifacts = dict(result.artifacts)
             if result.violation:
                 artifacts["_violation"] = result.violation
@@ -881,5 +962,30 @@ def _extract_code(text: str) -> str:
         language = block[:first_newline].strip().lower()
         body = block[first_newline + 1 :]
         if language in {"", "python", "py"} and body.strip():
+            return body
+    return ""
+
+
+def _extract_browser_code(text: str) -> str:
+    """Pull a ``browser`` fenced block out of a response.
+
+    Agents indicate they want to use the browser harness by wrapping their
+    Playwright script in a ```browser fence.  This is distinct from a plain
+    Python fence so the materialise path can route it correctly without
+    inspecting the content (which would be ambiguous for scripts that happen
+    to import playwright).
+    """
+    fence = "```"
+    if fence not in text:
+        return ""
+    parts = text.split(fence)
+    for i in range(1, len(parts), 2):
+        block = parts[i]
+        first_newline = block.find("\n")
+        if first_newline == -1:
+            continue
+        language = block[:first_newline].strip().lower()
+        body = block[first_newline + 1:]
+        if language == "browser" and body.strip():
             return body
     return ""

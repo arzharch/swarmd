@@ -69,6 +69,7 @@ from swarmd.swarm.synthesis import (
 )
 from swarmd.swarm.worker import (
     WORKER_SYSTEM,
+    BrowserHITLRequested,
     GenericWorker,
     NodePrefix,
     WorkerContext,
@@ -1548,6 +1549,10 @@ class SwarmRun:
             redteam=self.redteam,
             skills=self.skills,
             sandbox=self.sandbox,
+            # Browser harness: attached by the server after construction.
+            # Uses getattr so a run created without it (tests, CLI) simply gets
+            # None and falls through to the sandbox / plain-text path.
+            browser_harness=getattr(self, "browser_harness", None),
             run_id=self.run_id,
             max_repairs=self.profile.max_repairs,
             system=base_system,
@@ -1687,9 +1692,45 @@ class SwarmRun:
                         )
                         continue
 
-                    outcome = await worker.execute(
-                        task, node, checkpoint=carried, prefix=prefix_for(name)
-                    )
+                    try:
+                        outcome = await worker.execute(
+                            task, node, checkpoint=carried, prefix=prefix_for(name)
+                        )
+                    except BrowserHITLRequested as hitl:
+                        # The agent's browser script called session.request_human().
+                        # Park this agent's node as "waiting_human" in the run
+                        # state and surface it to the approval queue.
+                        self._emit(
+                            "browser_hitl_requested",
+                            agent_id=hitl.agent_id,
+                            node=hitl.node,
+                            reason=hitl.reason,
+                        )
+                        if self.approvals is not None:
+                            try:
+                                await self.approvals.submit(
+                                    {
+                                        "kind": "browser_hitl",
+                                        "agent_id": hitl.agent_id,
+                                        "node": hitl.node,
+                                        "run_id": self.run_id,
+                                        "reason": hitl.reason,
+                                    },
+                                    stage="browser_hitl",
+                                )
+                            except Exception as exc:  # noqa: BLE001
+                                logger.warning(
+                                    "could not queue HITL request: %s", exc
+                                )
+                        # Return a synthetic parked result for this agent.
+                        return WorkerResult(
+                            agent_id=account.agent_id,
+                            node=name,
+                            candidate=empty_candidate(),
+                            passed=False,
+                            failures=(f"browser_hitl: {hitl.reason[:200]}",),
+                            thoughts=list(worker.thoughts),
+                        )
                     carried = outcome.checkpoint
                     break
                 metrics.record_gate(

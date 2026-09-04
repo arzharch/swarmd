@@ -406,7 +406,11 @@ def create_app(
 
     def _build_run(request: RunRequest) -> tuple[SwarmRun, str]:
         """Construct the run. Nothing here starts work or spends quota."""
+        import os
+
         from swarmd.chaos import ChaosHook
+        from swarmd.harnesses.browser import BrowserHarness
+        from swarmd.harnesses.browser_store import build_browser_audit_store
         from swarmd.harnesses.sandbox import SandboxHarness
         from swarmd.swarm.skills import SkillLibrary
 
@@ -414,6 +418,30 @@ def create_app(
             provider = app.state.provider_factory()
         except RuntimeError as exc:
             raise HTTPException(503, f"no provider capacity: {exc}") from exc
+
+        # Browser audit store — persists every agent browser session to
+        # Postgres (when DATABASE_URL is set) or SQLite for local dev.
+        # Build it lazily so missing playwright does not prevent the server
+        # from starting for non-browser tasks.
+        try:
+            browser_audit = build_browser_audit_store()
+        except Exception:  # noqa: BLE001
+            browser_audit = None
+
+        # Domain allowlist: comma-separated URL prefixes the browser may visit.
+        # Empty means unrestricted (fine for local dev, lock down in prod).
+        raw_allowlist = os.environ.get("SWARMD_BROWSER_ALLOWLIST", "")
+        allowlist: frozenset[str] = (
+            frozenset(p.strip() for p in raw_allowlist.split(",") if p.strip())
+            if raw_allowlist.strip()
+            else frozenset()
+        )
+
+        browser_harness = BrowserHarness(
+            domain_allowlist=allowlist,
+            headless=True,
+            audit_store=browser_audit,
+        )
 
         run = SwarmRun(
             provider,
@@ -440,6 +468,10 @@ def create_app(
             # stays a constructor invariant instead of a 500.
             memo=None if request.profile == "eval" else app.state.memo,
         )
+        # Attach browser harness to the run's worker context via a post-init
+        # hook.  SwarmRun._execute builds the WorkerContext; we pass the
+        # harness in as a run attribute that _execute reads.
+        run.browser_harness = browser_harness  # type: ignore[attr-defined]
         app.state.registry.record(
             run.run_id,
             {
