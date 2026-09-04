@@ -526,10 +526,6 @@ export function ParkedPanel() {
 
   useEffect(() => {
     load();
-    // Polled rather than driven by the event stream: a run parked before this
-    // browser was open emitted its pause event to nobody.
-    const timer = setInterval(load, 15000);
-    return () => clearInterval(timer);
   }, [load]);
 
   const resume = (runId: string) =>

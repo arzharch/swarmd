@@ -182,10 +182,8 @@ export default function Dashboard() {
         })
         .catch(() => undefined);
     load();
-    const timer = setInterval(load, 4000);
     return () => {
       cancelled = true;
-      clearInterval(timer);
     };
   }, []);
 
