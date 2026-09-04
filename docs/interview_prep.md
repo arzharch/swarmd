@@ -2598,3 +2598,176 @@ The learning loop is built, instrumented, reviewed and measured, and what it
 measures is that a one-skill library does not beat no library on five unseen
 tasks -- which is a result, obtained by refusing four separate opportunities to
 report something more flattering.
+
+---
+
+## Browser Automation, HITL Pauses, and Audit Sessions
+
+*(Added 2026-09-04 — commits 49facb6, 003023b, 46abebb, 8b52cd4)*
+
+### What was built
+
+Four atomic changes:
+
+1. **Remove polling** (49facb6). page.tsx and control.tsx each had a setInterval that
+   hit /api/jobs and /api/runs/resumable every few seconds. Removed. The
+   dashboard's live source is the WebSocket; polling on top of it was cost with no benefit.
+
+2. **Fix operator token delivery over WebSocket** ( 03023b). The Next.js dev proxy drops
+   query parameters on WebSocket upgrades. The token was sent as ?token=XYZ and arriving
+   as nothing. Fix: send the token simultaneously as a Sec-WebSocket-Protocol header
+   (the only header a browser is allowed to set on a WS handshake). The backend's
+   extract_token() now reads that header as a fallback after Authorization and
+   X-Swarmd-Token.
+
+3. **BrowserHarness** (46abebb). harnesses/browser.py + harnesses/browser_store.py.
+
+4. **Worker/run/server wiring** (8b52cd4). GenericWorker, SwarmRun._execute, and
+   pp._build_run all updated.
+
+---
+
+### BrowserHarness design — questions you will be asked
+
+**Q: Why a GuardedPage instead of giving agents a raw Playwright Page?**
+
+Because the raw Page has no hook for containment. A GuardedPage interposes on
+every goto, click, ill, evaluate, and screenshot call. Before executing
+anything, it:
+
+1. Checks the domain against the allowlist (SWARMD_BROWSER_ALLOWLIST).
+2. Appends a BrowserAction log entry (ts, kind, detail, outcome).
+3. Lets the action execute.
+4. Updates the entry's outcome field.
+
+A rogue agent that navigates to an exfiltration endpoint is therefore blocked at
+the harness layer, and the action appears in the audit trail with outcome=blocked
+regardless of whether the real Playwright page was ever called. The same mechanism
+that catches a sandbox policy violation catches a domain violation, using the same
+RedTeam.observe() hook.
+
+**Q: How does an agent signal it needs a human?**
+
+It calls session.request_human(reason). Inside the harness this raises
+_HITLRequested — a private exception that never escapes the exec() sandbox.
+The harness catches it, appends a BrowserAction(kind="hitl"), and returns a
+BrowserResult with hitl_request=reason and ok=False.
+
+The caller (GenericWorker._materialise) sees esult.hitl_request is non-empty
+and raises BrowserHITLRequested(agent_id, node, reason) — a public exception.
+This propagates to SwarmRun._execute, which:
+
+- Emits a rowser_hitl_requested stream event (visible on the dashboard).
+- Calls ApprovalManager.submit({"kind": "browser_hitl", ...}, stage="browser_hitl").
+- Returns a synthetic failed WorkerResult with ailures=("browser_hitl: ...",).
+
+The run does not stop. Other agents and other nodes continue. Only the one agent
+whose session hit the wall parks itself via the ApprovalManager queue.
+
+**Q: What is the difference between a browser HITL and a ration pause?**
+
+A ration pause is provider-initiated: the token budget is spent, the pacer fires,
+and the entire run waits. A browser HITL is agent-initiated: one agent's session
+needs credentials or a CAPTCHA, and it parks itself while the rest of the run
+continues. They use the same ApprovalManager infrastructure and the same
+append-only audit trail, but the scope is different — one agent versus the entire run.
+
+**Q: Why exec() with a restricted builtins dict instead of a subprocess?**
+
+Playwright's sync API must run in the same thread as the Playwright instance.
+Spawning a subprocess would require passing the Playwright state across a process
+boundary, which Playwright does not support. The restriction is achieved by
+replacing __builtins__ in the exec namespace with a whitelist of ~45 names that
+excludes __import__, open, exec, eval, compile, reakpoint, and all os/
+subprocess/socket access. The agent's script cannot import playwright directly
+because there is no __import__ in its namespace. It can only use what the harness
+explicitly provides.
+
+The threat model text in rowser.py is explicit about what this is NOT: it is
+not a kernel-level sandbox. Domain allowlisting + restricted builtins + RedTeam
+observation is the containment stack for a trusted operator's agent. For genuinely
+untrusted code you want a seccomp container on top of this.
+
+**Q: How are browser sessions stored and why Postgres?**
+
+rowser_store.py has two backends: SqliteBrowserAuditStore (local dev, WAL
+mode, no extra infrastructure) and PostgresBrowserAuditStore (asyncpg, lazy
+pool, used when DATABASE_URL is set).
+
+Schema:
+
+`
+browser_sessions(session_id PK, run_id, agent_id, created_ts,
+                 duration_s, ok, hitl_request, error, artifacts JSONB)
+
+browser_actions(id BIGSERIAL PK, session_id FK, ts,
+                kind, detail, outcome, data)
+`
+
+Indexed on un_id and gent_id (for filtering by run or agent), on kind (for
+aggregate queries like "how many navigations vs clicks across all runs"), and on
+created_ts WHERE hitl_request != '' (for the dashboard HITL queue without a full
+table scan).
+
+The reason for Postgres in addition to SQLite: eval replay and aggregate queries.
+A sweep that runs 200 browser tasks produces 200 session rows and thousands of
+action rows. Answering "which domains did treatment-arm agents visit that
+control-arm agents did not?" requires a JOIN across sessions and actions. SQLite
+handles it, but Postgres is where the rest of the approval audit trail already
+lives, and a query that crosses databases is a query nobody runs.
+
+**Q: How does a browser run show its chain of thought on the dashboard?**
+
+Every BrowserAction that GuardedPage records is re-emitted by _materialise
+as a _think() CoT step:
+
+`python
+for action in result.actions:
+    self._think(f"browser_{action.kind}", f"{action.detail} ? {action.outcome}")
+`
+
+_think() appends to worker.thoughts, which is serialised into WorkerResult.thoughts,
+which is emitted as individual 	hought events via SwarmRun._emit. The dashboard
+already renders these in the agent detail panel. A browser run therefore shows the
+full navigation trace — rowser_navigate https://linkedin.com/in/... ? ok,
+rowser_click button[aria-label='Connect'] ? ok — without any changes to the
+frontend, because the CoT pipeline was already there.
+
+**Q: Why `rowser as a fence language instead of `python with an import?**
+
+Routing by import inspection is fragile: a script might import playwright only
+conditionally, or never import it but still use a session object passed in from
+outside. Fence language is unambiguous: the model decides which harness it wants
+by choosing the fence. _extract_browser_code() looks for exactly language ==
+"browser" before _extract_code() looks for python/py. The two checks are
+independent and the order matters — a rowser block never accidentally runs
+in the Python sandbox.
+
+**Q: What is the domain allowlist and when would you set it?**
+
+SWARMD_BROWSER_ALLOWLIST is a comma-separated list of URL prefixes. Any
+navigation whose URL does not start with one of the prefixes raises a
+PermissionError inside GuardedPage.goto(), which lands in the action log as
+outcome=blocked and surfaces as a criterion failure on that agent.
+
+In local dev: leave it empty (unrestricted). In production, set it to the sites
+the task actually needs: https://linkedin.com/,https://www.google.com/. An agent
+that tries to navigate to an exfiltration endpoint gets a PermissionError and a
+locked audit entry. The red-team does not need to know about domains — the harness
+enforces before the red-team even sees the action.
+
+**Q: What happens if playwright is not installed?**
+
+BrowserHarness.run_script() imports playwright.sync_api inside the thread
+function (deferred, never at module import). If it is missing, the thread raises
+RuntimeError("playwright is not installed. Install with: uv add playwright ...").
+The server catches this as a node error — the same path as any other
+BrowserResult with error set — and the agent fails gracefully without crashing
+the run. Non-browser tasks are completely unaffected.
+
+**Q: One-sentence version?**
+
+The browser harness gives agents a contained, fully audited window into the web,
+with human-in-the-loop pause when credentials are needed, the same approval
+queue and audit trail the rest of the system already uses, and every navigation
+step surfaced as a chain-of-thought event on the dashboard.

@@ -3631,3 +3631,153 @@ credentials and turn the handle.
       word before they may grade anything
 - [ ] Unify the kernel Runtime and the swarm executor: they share the Checkpoint
       contract but not the loop
+
+---
+
+## Phase 8 — Browser Automation, HITL Pauses, Audit Sessions
+
+*(2026-09-04 | commits 49facb6 → 8b52cd4)*
+
+### Motivation
+
+Operators want agents to browse the web: search LinkedIn, follow links, fill forms, extract data. The existing sandbox runs Python in a subprocess with rlimit guards — it cannot render JavaScript or navigate URLs. We need a second harness with the same containment guarantees and an audit trail replayable as eval fixtures.
+
+Additionally: the operator token was not reaching the backend over WebSocket (Next.js proxy drops `?token=XYZ` on upgrade), and the dashboard was polling the API every few seconds at idle.
+
+### What changed
+
+#### 1. Remove polling (`49facb6`)
+
+`page.tsx` and `control.tsx` each ran a `setInterval` hitting `/api/jobs` and `/api/runs/resumable`. Removed. The WebSocket at `/api/stream` is the live source.
+
+#### 2. WebSocket token delivery (`003023b`)
+
+```diff
+- new WebSocket(url)
++ new WebSocket(url, token ? [token] : [])
+```
+
+The browser's only way to add a custom header to a WebSocket handshake is via the subprotocol list. `extract_token()` now falls back to reading `sec-websocket-protocol` after `Authorization` / `X-Swarmd-Token`.
+
+#### 3. BrowserHarness (`46abebb`)
+
+Files: `src/swarmd/harnesses/browser.py`, `src/swarmd/harnesses/browser_store.py`
+
+**Execution model:**
+
+```
+BrowserHarness.run_script(code, ...)
+  └─ ThreadPoolExecutor (one thread per session)
+       └─ sync_playwright()
+            └─ browser.new_context()
+                 └─ GuardedPage wraps the raw Page
+                      ├─ goto(url)        → domain allowlist check → log → execute
+                      ├─ click(selector)  → log → execute
+                      ├─ fill(sel, val)   → log (value redacted) → execute
+                      ├─ evaluate(js)     → log → execute
+                      ├─ inner_text(sel)  → execute → log
+                      └─ request_human(r) → raise _HITLRequested(r)
+```
+
+exec namespace: `{"__builtins__": _safe_builtins(), "json": json, "session": guarded}` — whitelist of ~45 names, no `__import__`, no `open`, no `os`.
+
+**Persistence (browser_store.py):**
+
+```
+browser_sessions(session_id PK, run_id, agent_id, created_ts, duration_s,
+                 ok, hitl_request, error, artifacts JSONB)
+browser_actions(id BIGSERIAL PK, session_id FK, ts, kind, detail, outcome, data)
+```
+
+Indices: `run_id`, `agent_id`, `kind`, partial on `hitl_request != ''`. Factory: `build_browser_audit_store()` → Postgres if `DATABASE_URL`, else SQLite.
+
+#### 4. Wiring: worker → run → server (`8b52cd4`)
+
+**worker.py:**
+
+| What | Effect |
+|---|---|
+| `BrowserHITLRequested` exception | carries agent_id, node, reason |
+| `WorkerContext.browser_harness` | passed in by SwarmRun |
+| `WorkerContext.hitl_input` | human data on resume |
+| `_materialise` detects ` ```browser ` fence | routes to BrowserHarness before sandbox |
+| `_extract_browser_code()` | distinct from `_extract_code()` |
+
+**run.py:**
+
+```python
+# inside run_agent():
+try:
+    outcome = await worker.execute(task, node, ...)
+except BrowserHITLRequested as hitl:
+    self._emit("browser_hitl_requested", ...)
+    await self.approvals.submit({"kind": "browser_hitl", ...})
+    return WorkerResult(..., passed=False, failures=("browser_hitl: ...",))
+```
+
+Only the parked agent fails. The rest of the level continues.
+
+**app.py:**
+
+```python
+browser_audit = build_browser_audit_store()
+allowlist = frozenset(SWARMD_BROWSER_ALLOWLIST.split(","))
+browser_harness = BrowserHarness(allowlist, headless=True, audit_store=browser_audit)
+run.browser_harness = browser_harness   # read by _execute via getattr
+```
+
+### Data flow: browser task end-to-end
+
+```
+Operator submits task
+  └─ WorkerContext{browser_harness=BrowserHarness}
+       └─ model returns ```browser script
+            └─ _materialise detects ```browser fence
+                 └─ BrowserHarness.run_script()
+                      ├─ [OK]   BrowserResult{artifacts={...}}
+                      │    ├─ each BrowserAction → _think() → dashboard CoT
+                      │    └─ artifacts → Candidate → criterion grades
+                      └─ [HITL] BrowserResult{hitl_request="Need LinkedIn password"}
+                           └─ raises BrowserHITLRequested
+                                └─ ApprovalManager.submit(kind=browser_hitl)
+                                     └─ stream: browser_hitl_requested event
+                                          └─ operator approves with credentials
+                                               └─ re-run node with hitl_input
+```
+
+### Chain of Thought surfacing
+
+```python
+for action in result.actions:
+    self._think(f"browser_{action.kind}", f"{action.detail} → {action.outcome}")
+```
+
+Every navigation step becomes a `thought` event on the WebSocket stream. The dashboard renders these in the existing agent detail panel — no frontend changes needed.
+
+### Threat model layers
+
+| Layer | Mechanism | Blocks |
+|---|---|---|
+| exec namespace | `_safe_builtins()` — no `__import__` | direct playwright import, os, subprocess |
+| Navigation | `GuardedPage.goto()` allowlist | domains outside `SWARMD_BROWSER_ALLOWLIST` |
+| JS injection | RedTeam.observe() on `browser_js_eval` | DOM exfiltration via `page.evaluate` |
+| Credentials in logs | `fill()` redacts value | passwords in audit trail |
+| Credential injection | `session.hitl_input` (dict) | credentials never in script text |
+| Container | network-isolated container (recommended for prod) | everything above |
+
+### Alternatives considered
+
+**Why not run the browser in a subprocess?** Playwright's sync API must share a thread with its own event loop. Subprocess IPC would require serialising the Playwright state, which is not supported. The exec + restricted builtins approach gives equivalent code isolation for a trusted operator.
+
+**Why a separate ```browser fence instead of detecting playwright imports?** Routing by import inspection is fragile (conditional imports, session object passed in). Fence language is unambiguous — the model declares its intent. Two-character difference, zero ambiguity.
+
+**Why attach browser_harness to the run post-construction instead of a constructor param?** `SwarmRun.__init__` has a long and stable signature. Adding optional fields there for every new harness is a different kind of coupling. `getattr(self, "browser_harness", None)` in `_execute` means the constructor is unchanged and tests that don't set the attribute get `None` silently, which is the right default.
+
+### Install
+
+```bash
+uv add "playwright>=1.47" --optional browser
+uv run playwright install chromium
+# Optional: lock down domains
+export SWARMD_BROWSER_ALLOWLIST="https://linkedin.com/,https://www.google.com/"
+```
