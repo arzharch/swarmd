@@ -40,6 +40,9 @@ serve = [
 postgres = [
     "asyncpg>=0.30",
 ]
+browser = [
+    "playwright>=1.47",
+]
 
 [build-system]
 requires = ["uv_build>=0.7,<1.0"]
