@@ -266,10 +266,13 @@ export function useRunStream() {
 
     const connect = () => {
       if (closedRef.current) return;
-      // Token in the URL because a browser cannot set a header on a
-      // handshake. Without it a gated control plane closes the socket with
-      // 1008 and the dashboard reconnects forever showing nothing.
-      const socket = new WebSocket(streamUrl());
+      // Token in the URL and as a subprotocol. A browser cannot set a header
+      // on a handshake, and Next.js proxies sometimes drop query parameters.
+      // The backend accepts the token from both the query parameter and the
+      // sec-websocket-protocol header.
+      const url = streamUrl();
+      const token = operatorToken();
+      const socket = new WebSocket(url, token ? [token] : []);
       socketRef.current = socket;
       setConnection("connecting");
 

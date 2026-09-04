@@ -196,7 +196,12 @@ def extract_token(headers: Any) -> str | None:
     if auth.lower().startswith("bearer "):
         return auth[7:]
     supplied = headers.get("x-swarmd-token")
-    return str(supplied) if supplied else None
+    if supplied:
+        return str(supplied)
+    protocols = str(headers.get("sec-websocket-protocol") or "")
+    if protocols:
+        return protocols.split(",")[0].strip()
+    return None
 
 
 def install(app: Any, *, token: str | None = None, rate_limit: RateLimit | None = None) -> Any:
